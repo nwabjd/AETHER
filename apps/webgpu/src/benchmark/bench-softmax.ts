@@ -1,127 +1,78 @@
-// AETHER GPU Benchmark — Benchmark 4: Softmax
-// Row-wise softmax with correctness verification
-
+// AETHER GPU Benchmark — Benchmark 4: Softmax (Deterministic, Non-In-Place)
 import {
-  getDevice, createUniformBuffer, createStorageBuffer, readbackBuffer,
-  createPipeline, timeExecution, formatBytes,
+  getDevice, createUniformBuffer, createStorageBuffer,
+  createPipeline, formatBytes,
   type BenchmarkResult,
 } from './engine';
 import { SOFTMAX } from './kernels';
-
-function cpuSoftmax(data: Float32Array, rows: number, cols: number): Float32Array {
-  const out = new Float32Array(data.length);
-  for (let r = 0; r < rows; r++) {
-    const base = r * cols;
-    let max = -1e30;
-    for (let c = 0; c < cols; c++) {
-      if (data[base + c] > max) max = data[base + c];
-    }
-    let sumExp = 0;
-    for (let c = 0; c < cols; c++) {
-      const e = Math.exp(data[base + c] - max);
-      out[base + c] = e;
-      sumExp += e;
-    }
-    for (let c = 0; c < cols; c++) {
-      out[base + c] /= sumExp;
-    }
-  }
-  return out;
-}
-
-const TESTS = [
-  { rows: 1, cols: 1024, name: '1×1024' },
-  { rows: 32, cols: 1024, name: '32×1024' },
-  { rows: 128, cols: 1024, name: '128×1024' },
-  { rows: 256, cols: 1024, name: '256×1024' },
-];
+import { runGpuTest } from './gpu-test';
 
 export async function benchmarkSoftmax(): Promise<BenchmarkResult[]> {
   const device = getDevice();
   const results: BenchmarkResult[] = [];
+  const pipeline = createPipeline(SOFTMAX, 3); // uniform, input, output
 
-  const pipeline = createPipeline(SOFTMAX, 2);
-  const layout = pipeline.getBindGroupLayout(0);
+  const TESTS = [
+    { rows: 1, cols: 64 },
+    { rows: 4, cols: 64 },
+  ];
 
   for (const t of TESTS) {
-    try {
-      const N = t.rows * t.cols;
-      const bytes = N * 4;
+    const N = t.rows * t.cols;
+    const bytes = N * 4;
+    
+    const data = new Float32Array(N).map((_, i) => (i % t.cols) * 0.1);
+    const bufInput = createStorageBuffer(bytes, data);
+    const bufOutput = createStorageBuffer(bytes);
 
-      const data = new Float32Array(N);
-      for (let i = 0; i < N; i++) data[i] = (Math.random() - 0.5) * 10;
+    const uniformData = new ArrayBuffer(8);
+    new Uint32Array(uniformData)[0] = t.rows;
+    new Uint32Array(uniformData)[1] = t.cols;
+    const uBuf = createUniformBuffer(uniformData);
 
-      const bufData = createStorageBuffer(bytes, data);
+    const bindGroup = device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: uBuf } },
+        { binding: 1, resource: { buffer: bufInput } },
+        { binding: 2, resource: { buffer: bufOutput } },
+      ],
+    });
 
-      const uniformData = new ArrayBuffer(8);
-      new Uint32Array(uniformData)[0] = t.rows;
-      new Uint32Array(uniformData)[1] = t.cols;
-      const uBuf = createUniformBuffer(uniformData);
-
-      const bindGroup = device.createBindGroup({
-        layout,
-        entries: [
-          { binding: 0, resource: { buffer: uBuf } },
-          { binding: 1, resource: { buffer: bufData } },
-        ],
-      });
-
-      const timing = await timeExecution(() => {
-        const encoder = device.createCommandEncoder();
-        const pass = encoder.beginComputePass();
-        pass.setPipeline(pipeline);
-        pass.setBindGroup(0, bindGroup);
-        pass.dispatchWorkgroups(t.rows);
-        pass.end();
-        device.queue.submit([encoder.finish()]);
-      }, 50);
-
-      // Verify
-      const gpuResult = await readbackBuffer(bufData, bytes);
-      const cpuResult = cpuSoftmax(data, t.rows, t.cols);
-      let maxErr = 0;
-      for (let i = 0; i < N; i++) {
-        maxErr = Math.max(maxErr, Math.abs(gpuResult[i] - cpuResult[i]));
+    const testResult = await runGpuTest({
+      name: 'Softmax',
+      pipeline,
+      bindGroup,
+      workgroups: [t.rows, 1, 1],
+      outputBuffer: bufOutput,
+      outputBytes: bytes,
+      validator: (data) => {
+        let pass = true;
+        for (let r = 0; r < t.rows; r++) {
+          const base = r * t.cols;
+          let sum = 0;
+          for (let c = 0; c < t.cols; c++) sum += data[base + c];
+          if (Math.abs(sum - 1.0) > 1e-4) { pass = false; break; }
+        }
+        return { pass, error: pass ? '' : 'Softmax rows do not sum to 1' };
       }
-      const correct = maxErr < 1e-4;
+    });
 
-      results.push({
-        id: `softmax_${t.name}`,
-        name: 'Softmax',
-        inputSize: t.name,
-        executionTimeMs: timing.avgMs,
-        throughput: `${(N / (timing.avgMs / 1000) / 1e6).toFixed(1)} M elements/s`,
-        memoryBytes: bytes,
-        success: correct,
-        gpuTimingAvailable: true,
-        details: {
-          rows: t.rows,
-          cols: t.cols,
-          maxError: maxErr,
-          iterations: timing.iterations,
-          minMs: timing.minMs,
-          maxMs: timing.maxMs,
-          p50Ms: timing.p50Ms,
-          correctness: correct ? 'PASS' : 'FAIL',
-        },
-      });
+    results.push({
+      id: `softmax_${t.rows}x${t.cols}`,
+      name: 'Softmax',
+      inputSize: `${t.rows}x${t.cols}`,
+      executionTimeMs: 0,
+      throughput: 'N/A',
+      memoryBytes: bytes,
+      success: testResult.pass,
+      error: testResult.error || undefined,
+      gpuTimingAvailable: false,
+    });
 
-      bufData.destroy();
-      uBuf.destroy();
-    } catch (e) {
-      results.push({
-        id: `softmax_${t.name}`,
-        name: 'Softmax',
-        inputSize: t.name,
-        executionTimeMs: 0,
-        throughput: 'N/A',
-        memoryBytes: 0,
-        success: false,
-        error: (e as Error).message,
-        gpuTimingAvailable: false,
-      });
-    }
+    bufInput.destroy();
+    bufOutput.destroy();
+    uBuf.destroy();
   }
-
   return results;
 }

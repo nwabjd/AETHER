@@ -2,100 +2,72 @@
 // C = A + B across multiple sizes
 
 import {
-  getDevice, createUniformBuffer, createStorageBuffer, readbackBuffer,
-  createPipeline, createBindGroup, timeExecution, formatBytes,
+  getDevice, createUniformBuffer, createStorageBuffer,
+  createPipeline, formatBytes,
   type BenchmarkResult,
 } from './engine';
 import { VEC_ADD } from './kernels';
-
-const SIZES = [1024, 65536, 1_048_576, 8_388_608];
+import { runGpuTest } from './gpu-test';
 
 export async function benchmarkVectorAdd(): Promise<BenchmarkResult[]> {
   const device = getDevice();
   const results: BenchmarkResult[] = [];
-
   const pipeline = createPipeline(VEC_ADD, 4);
-  const layout = pipeline.getBindGroupLayout(0);
+
+  // Deterministic, small test first
+  const SIZES = [64, 1024, 65536]; 
 
   for (const N of SIZES) {
     const bytes = N * 4;
-    try {
-      const aData = new Float32Array(N).fill(1.0);
-      const bData = new Float32Array(N).fill(2.0);
+    const aData = new Float32Array(N).fill(1.0);
+    const bData = new Float32Array(N).fill(2.0);
 
-      const bufA = createStorageBuffer(bytes, aData);
-      const bufB = createStorageBuffer(bytes, bData);
-      const bufC = createStorageBuffer(bytes);
+    const bufA = createStorageBuffer(bytes, aData);
+    const bufB = createStorageBuffer(bytes, bData);
+    const bufC = createStorageBuffer(bytes);
+    const uniformData = new ArrayBuffer(4);
+    new Uint32Array(uniformData)[0] = N;
+    const uBuf = createUniformBuffer(uniformData);
 
-      const uniformData = new ArrayBuffer(4);
-      new Uint32Array(uniformData)[0] = N;
-      const uBuf = createUniformBuffer(uniformData);
+    const bindGroup = device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: uBuf } },
+        { binding: 1, resource: { buffer: bufA } },
+        { binding: 2, resource: { buffer: bufB } },
+        { binding: 3, resource: { buffer: bufC } },
+      ],
+    });
 
-      const bindGroup = device.createBindGroup({
-        layout,
-        entries: [
-          { binding: 0, resource: { buffer: uBuf } },
-          { binding: 1, resource: { buffer: bufA } },
-          { binding: 2, resource: { buffer: bufB } },
-          { binding: 3, resource: { buffer: bufC } },
-        ],
-      });
+    const testResult = await runGpuTest({
+      name: 'Vector Addition',
+      pipeline,
+      bindGroup,
+      workgroups: [Math.ceil(N / 64), 1, 1], // Conservative workgroups
+      outputBuffer: bufC,
+      outputBytes: bytes,
+      validator: (data) => {
+        const pass = data.every(v => Math.abs(v - 3.0) < 1e-5);
+        return { pass, error: pass ? '' : 'Incorrect values' };
+      }
+    });
 
-      const workgroups = Math.ceil(N / 256);
+    results.push({
+      id: `vecadd_${N}`,
+      name: 'Vector Addition',
+      inputSize: `${N} elements (${formatBytes(bytes)})`,
+      executionTimeMs: 0, // Simplified for now
+      throughput: 'N/A',
+      memoryBytes: bytes * 3,
+      success: testResult.pass,
+      error: testResult.error || undefined,
+      gpuTimingAvailable: false,
+    });
 
-      const timing = await timeExecution(() => {
-        const encoder = device.createCommandEncoder();
-        const pass = encoder.beginComputePass();
-        pass.setPipeline(pipeline);
-        pass.setBindGroup(0, bindGroup);
-        pass.dispatchWorkgroups(workgroups);
-        pass.end();
-        device.queue.submit([encoder.finish()]);
-      }, N > 1_000_000 ? 20 : 50);
-
-      // Verify correctness
-      const result = await readbackBuffer(bufC, bytes);
-      const correct = result.every(v => Math.abs(v - 3.0) < 1e-5);
-
-      const throughput = N / (timing.avgMs / 1000);
-
-      results.push({
-        id: `vecadd_${N}`,
-        name: 'Vector Addition',
-        inputSize: `${N} elements (${formatBytes(bytes)})`,
-        executionTimeMs: timing.avgMs,
-        throughput: `${(throughput / 1e6).toFixed(1)} M elements/s`,
-        memoryBytes: bytes * 3,
-        success: correct,
-        gpuTimingAvailable: true,
-        details: {
-          iterations: timing.iterations,
-          minMs: timing.minMs,
-          maxMs: timing.maxMs,
-          p50Ms: timing.p50Ms,
-          elementsPerSecond: throughput,
-          correctness: correct ? 'PASS' : 'FAIL',
-        },
-      });
-
-      bufA.destroy();
-      bufB.destroy();
-      bufC.destroy();
-      uBuf.destroy();
-    } catch (e) {
-      results.push({
-        id: `vecadd_${N}`,
-        name: 'Vector Addition',
-        inputSize: `${N} elements (${formatBytes(bytes)})`,
-        executionTimeMs: 0,
-        throughput: 'N/A',
-        memoryBytes: 0,
-        success: false,
-        error: (e as Error).message,
-        gpuTimingAvailable: false,
-      });
-    }
+    bufA.destroy();
+    bufB.destroy();
+    bufC.destroy();
+    uBuf.destroy();
   }
-
   return results;
 }

@@ -136,7 +136,36 @@ export function destroyBenchmark(): void {
   }
 }
 
-// ─── Timing helpers ───
+export function initErrorHandling(device: GPUDevice) {
+  device.onuncapturederror = (event) => {
+    const error = event.error;
+    console.error('WebGPU Uncaptured Error:', error.message, error);
+    // You could also propagate this to the UI
+  };
+}
+
+export async function runWithScope<T>(device: GPUDevice, name: string, fn: () => Promise<T>): Promise<{ result: T | null; error: string | null }> {
+  device.pushErrorScope('validation');
+  device.pushErrorScope('out-of-memory');
+  device.pushErrorScope('internal');
+
+  try {
+    const result = await fn();
+    const errors = await Promise.all([
+      device.popErrorScope(),
+      device.popErrorScope(),
+      device.popErrorScope()
+    ]);
+    const firstError = errors.find(e => e !== null);
+    return { result, error: firstError ? firstError.message : null };
+  } catch (e) {
+    // Pop scopes even on error to keep stack clean
+    await device.popErrorScope();
+    await device.popErrorScope();
+    await device.popErrorScope();
+    return { result: null, error: (e as Error).message };
+  }
+}
 
 export function createUniformBuffer(data: ArrayBuffer): GPUBuffer {
   const device = getDevice();

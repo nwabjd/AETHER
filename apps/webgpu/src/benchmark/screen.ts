@@ -10,8 +10,10 @@ import { benchmarkRMSNorm } from './bench-rmsnorm';
 import { benchmarkAttention } from './bench-attention';
 import { benchmarkMemory } from './bench-memory';
 import { benchmarkSustained } from './bench-sustained';
-import { runAllTests } from './tests';
+import { testVecAdd, testMatmul, testConv2D, testSoftmax, testRMSNorm, testAttention } from './tests';
 import { saveResults, getAllRuns, exportJSON, downloadJSON, clearAllRuns } from './results-store';
+
+
 
 let _container: HTMLElement | null = null;
 let _running = false;
@@ -102,11 +104,28 @@ async function runQuickBenchmark() {
     // Correctness tests first
     log('', '');
     log('── CORRECTNESS TESTS ──', 'info');
-    const tests = await runAllTests();
-    for (const t of tests) {
-      log(`  ${t.pass ? '✓' : '✗'} ${t.name}: ${t.details} (max err: ${t.maxError.toExponential(2)})`, t.pass ? 'ok' : 'err');
+    
+    const testFunctions = [
+      { name: 'Vector Add', fn: testVecAdd },
+      { name: 'Matmul', fn: testMatmul },
+      { name: 'Conv2D', fn: testConv2D },
+      { name: 'Softmax', fn: testSoftmax },
+      { name: 'RMSNorm', fn: testRMSNorm },
+      { name: 'Attention', fn: testAttention },
+    ];
+    
+    let allPass = true;
+    for (const t of testFunctions) {
+      try {
+        const res = await t.fn();
+        log(`  ${res.pass ? '✓' : '✗'} ${res.name}: ${res.details || ''} (max err: ${res.maxError.toExponential(2)})`, res.pass ? 'ok' : 'err');
+        if (!res.pass) allPass = false;
+      } catch (e) {
+        log(`  ✗ ${t.name}: FAILED WITH ERROR: ${(e as Error).message}`, 'err');
+        allPass = false;
+      }
     }
-    const allPass = tests.every(t => t.pass);
+    
     log(`  ${allPass ? 'ALL TESTS PASSED' : 'SOME TESTS FAILED'}`, allPass ? 'ok' : 'err');
 
     // Quick benchmarks: VecAdd 1M, Matmul 128+256, Softmax small, RMSNorm small
@@ -188,9 +207,22 @@ async function runFullBenchmark() {
     // Correctness tests
     log('', '');
     log('── CORRECTNESS TESTS ──', 'info');
-    const tests = await runAllTests();
-    for (const t of tests) {
-      log(`  ${t.pass ? '✓' : '✗'} ${t.name}: ${t.details} (max err: ${t.maxError.toExponential(2)})`, t.pass ? 'ok' : 'err');
+    const testFunctions = [
+      { name: 'Vector Add', fn: testVecAdd },
+      { name: 'Matmul', fn: testMatmul },
+      { name: 'Conv2D', fn: testConv2D },
+      { name: 'Softmax', fn: testSoftmax },
+      { name: 'RMSNorm', fn: testRMSNorm },
+      { name: 'Attention', fn: testAttention },
+    ];
+    
+    for (const t of testFunctions) {
+      try {
+        const res = await t.fn();
+        log(`  ${res.pass ? '✓' : '✗'} ${res.name}: ${res.details || ''} (max err: ${res.maxError.toExponential(2)})`, res.pass ? 'ok' : 'err');
+      } catch (e) {
+        log(`  ✗ ${t.name}: FAILED WITH ERROR: ${(e as Error).message}`, 'err');
+      }
     }
 
     const benchmarks = [
@@ -296,11 +328,25 @@ async function runCorrectnessTests() {
   try {
     log('═══ CORRECTNESS TESTS ═══', 'info');
     await initBenchmark();
-    const tests = await runAllTests();
+    const testFunctions = [
+      { name: 'Vector Add', fn: testVecAdd },
+      { name: 'Matmul', fn: testMatmul },
+      { name: 'Conv2D', fn: testConv2D },
+      { name: 'Softmax', fn: testSoftmax },
+      { name: 'RMSNorm', fn: testRMSNorm },
+      { name: 'Attention', fn: testAttention },
+    ];
+    
     let allPass = true;
-    for (const t of tests) {
-      log(`${t.pass ? '✓' : '✗'} ${t.name}: ${t.details} — max error: ${t.maxError.toExponential(2)}`, t.pass ? 'ok' : 'err');
-      if (!t.pass) allPass = false;
+    for (const t of testFunctions) {
+      try {
+        const res = await t.fn();
+        log(`${res.pass ? '✓' : '✗'} ${res.name}: ${res.details || ''} (max err: ${res.maxError.toExponential(2)})`, res.pass ? 'ok' : 'err');
+        if (!res.pass) allPass = false;
+      } catch (e) {
+        log(`✗ ${t.name}: FAILED WITH ERROR: ${(e as Error).message}`, 'err');
+        allPass = false;
+      }
     }
     log('', '');
     log(allPass ? 'ALL TESTS PASSED' : 'SOME TESTS FAILED', allPass ? 'ok' : 'err');
@@ -392,10 +438,10 @@ export function render(el: HTMLElement) {
     </div>
 
     <div class="btn-row">
-      <button class="btn" id="btn-quick">⚡ QUICK BENCHMARK</button>
-      <button class="btn" id="btn-full">FULL BENCHMARK</button>
+      <button class="btn" id="btn-correctness">✓ CORRECTNESS ONLY</button>
+      <button class="btn btn-outline" id="btn-quick">⚡ QUICK BENCHMARK</button>
+      <button class="btn btn-outline" id="btn-full">FULL BENCHMARK</button>
       <button class="btn btn-outline" id="btn-sustained">SUSTAINED (270s)</button>
-      <button class="btn btn-outline" id="btn-tests">✓ TESTS ONLY</button>
     </div>
 
     <div class="btn-row">
@@ -420,10 +466,11 @@ export function render(el: HTMLElement) {
   el.querySelector('#btn-quick')?.addEventListener('click', runQuickBenchmark);
   el.querySelector('#btn-full')?.addEventListener('click', runFullBenchmark);
   el.querySelector('#btn-sustained')?.addEventListener('click', runSustainedBenchmark);
-  el.querySelector('#btn-tests')?.addEventListener('click', runCorrectnessTests);
+  el.querySelector('#btn-correctness')?.addEventListener('click', runCorrectnessTests);
   el.querySelector('#btn-export')?.addEventListener('click', exportBenchmarkJSON);
   el.querySelector('#btn-history')?.addEventListener('click', showHistory);
   el.querySelector('#btn-clear')?.addEventListener('click', clearHistory);
+
 
   // Suppress unhandled errors from benchmark to prevent crash dialogs
   const errorHandler = (e: Event) => { e.preventDefault(); };

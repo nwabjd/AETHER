@@ -10,7 +10,7 @@ struct Uniforms { N: u32 };
 @group(0) @binding(2) var<storage, read> B: array<f32>;
 @group(0) @binding(3) var<storage, read_write> C: array<f32>;
 
-@compute @workgroup_size(256)
+@compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let i = gid.x;
   if (i >= u.N) { return; }
@@ -40,7 +40,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 `;
 
-// ─── 2D Convolution ───
+// ─── 2D Convolution (simplified, 1 invocation per output pixel) ───
 
 export const CONV2D = /* wgsl */ `
 struct Uniforms { N: u32, C: u32, H: u32, W: u32, F: u32, FH: u32, FW: u32, OH: u32, OW: u32 };
@@ -49,61 +49,64 @@ struct Uniforms { N: u32, C: u32, H: u32, W: u32, F: u32, FH: u32, FW: u32, OH: 
 @group(0) @binding(2) var<storage, read> kernel: array<f32>;
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
 
-@compute @workgroup_size(8, 8)
+@compute @workgroup_size(1, 1, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let n = gid.x;
   let f = gid.y;
-  if (n >= u.N || f >= u.F) { return; }
-  for (var oh = 0u; oh < u.OH; oh++) {
-    for (var ow = 0u; ow < u.OW; ow++) {
-      var sum: f32 = 0.0;
-      for (var c = 0u; c < u.C; c++) {
-        for (var fh = 0u; fh < u.FH; fh++) {
-          for (var fw = 0u; fw < u.FW; fw++) {
-            let ih = oh + fh;
-            let iw = ow + fw;
-            let in_idx = ((n * u.C + c) * u.H + ih) * u.W + iw;
-            let k_idx = ((f * u.C + c) * u.FH + fh) * u.FW + fw;
-            sum += input[in_idx] * kernel[k_idx];
-          }
-        }
+  let out_pos = gid.z;
+  let oh = out_pos / u.OW;
+  let ow = out_pos % u.OW;
+
+  if (n >= u.N || f >= u.F || oh >= u.OH || ow >= u.OW) { return; }
+
+  var sum: f32 = 0.0;
+  for (var c = 0u; c < u.C; c++) {
+    for (var fh = 0u; fh < u.FH; fh++) {
+      for (var fw = 0u; fw < u.FW; fw++) {
+        let ih = oh + fh;
+        let iw = ow + fw;
+        let in_idx = ((n * u.C + c) * u.H + ih) * u.W + iw;
+        let k_idx = ((f * u.C + c) * u.FH + fh) * u.FW + fw;
+        sum += input[in_idx] * kernel[k_idx];
       }
-      let out_idx = ((n * u.F + f) * u.OH + oh) * u.OW + ow;
-      output[out_idx] = sum;
     }
   }
+  let out_idx = ((n * u.F + f) * u.OH + oh) * u.OW + ow;
+  output[out_idx] = sum;
 }
 `;
 
-// ─── Softmax (row-wise) ───
+// ─── Softmax (row-wise) - separate input/output ───
 
 export const SOFTMAX = /* wgsl */ `
 struct Uniforms { rows: u32, cols: u32 };
 @group(0) @binding(0) var<uniform> u: Uniforms;
-@group(0) @binding(1) var<storage, read_write> data: array<f32>;
+@group(0) @binding(1) var<storage, read> input: array<f32>;
+@group(0) @binding(2) var<storage, read_write> output: array<f32>;
 
-@compute @workgroup_size(256)
+@compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let row = gid.x;
   if (row >= u.rows) { return; }
   let base = row * u.cols;
   var max_val: f32 = -1e30;
   for (var j: u32 = 0u; j < u.cols; j++) {
-    if (data[base + j] > max_val) { max_val = data[base + j]; }
+    if (input[base + j] > max_val) { max_val = input[base + j]; }
   }
   var sum_exp: f32 = 0.0;
   for (var j: u32 = 0u; j < u.cols; j++) {
-    let e = exp(data[base + j] - max_val);
-    data[base + j] = e;
+    let e = exp(input[base + j] - max_val);
+    output[base + j] = e;
     sum_exp += e;
   }
   for (var j: u32 = 0u; j < u.cols; j++) {
-    data[base + j] /= sum_exp;
+    output[base + j] /= sum_exp;
   }
 }
 `;
 
-// ─── RMSNorm ───
+
+// ─── RMSNorm - single-pass approach (for now) ───
 
 export const RMS_NORM = /* wgsl */ `
 struct Uniforms { N: u32, eps: f32 };
@@ -112,10 +115,8 @@ struct Uniforms { N: u32, eps: f32 };
 @group(0) @binding(2) var<storage, read> weight: array<f32>;
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
 
-@compute @workgroup_size(256)
+@compute @workgroup_size(1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let i = gid.x;
-  if (i >= 1u) { return; }
   var sum_sq: f32 = 0.0;
   for (var j: u32 = 0u; j < u.N; j++) {
     sum_sq += input[j] * input[j];
