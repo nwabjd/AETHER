@@ -8,8 +8,10 @@ import * as VideoTest from './screens/video-test';
 import * as Diagnostics from './screens/diagnostics';
 import * as TensorBench from './screens/tensor-bench';
 import * as WebGPUDiag from './screens/webgpu-diagnostics';
+import * as GPUBench from './benchmark/screen';
 
 const screens = [
+  { id: 'gpubench', label: 'GPU Bench', module: GPUBench },
   { id: 'device', label: 'Device Test', module: DeviceTest },
   { id: 'webgpudiag', label: 'WebGPU Diag', module: WebGPUDiag },
   { id: 'model', label: 'Model Test', module: ModelTest },
@@ -19,14 +21,14 @@ const screens = [
   { id: 'diag', label: 'Diagnostics', module: Diagnostics },
 ];
 
-let currentScreen = 'device';
+let currentScreen = 'gpubench';
 
 function getScreenIdFromHash(): string {
   const hash = window.location.hash.replace('#', '');
   if (screens.some(s => s.id === hash)) return hash;
   // Map old routes
   if (hash === 'diagnostics/webgpu' || hash === 'webgpu') return 'webgpudiag';
-  return 'device';
+  return 'gpubench';
 }
 
 function navigateTo(id: string) {
