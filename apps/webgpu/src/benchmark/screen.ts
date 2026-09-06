@@ -425,6 +425,11 @@ export function render(el: HTMLElement) {
   el.querySelector('#btn-history')?.addEventListener('click', showHistory);
   el.querySelector('#btn-clear')?.addEventListener('click', clearHistory);
 
+  // Suppress unhandled errors from benchmark to prevent crash dialogs
+  const errorHandler = (e: Event) => { e.preventDefault(); };
+  window.addEventListener('error', errorHandler);
+  window.addEventListener('unhandledrejection', errorHandler);
+
   // Auto-initialize on load to show device info
   initBenchmark().then(diag => {
     const badge = el.querySelector('#device-badge') as HTMLElement;

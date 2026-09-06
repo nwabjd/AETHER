@@ -8,7 +8,7 @@ import {
 } from './engine';
 import { MATMUL } from './kernels';
 
-const SIZES = [128, 256, 512, 1024];
+const SIZES = [128, 256, 512];
 
 // CPU reference for correctness
 function cpuMatmul(A: Float32Array, B: Float32Array, M: number, N: number, K: number): Float32Array {

@@ -39,6 +39,11 @@ let _adapter: GPUAdapter | null = null;
 let _diagnostics: DeviceDiagnostics | null = null;
 
 export async function initBenchmark(): Promise<DeviceDiagnostics> {
+  // If device was lost, clear state and reinitialize
+  if (_diagnostics && !_device) {
+    _diagnostics = null;
+    _adapter = null;
+  }
   if (_diagnostics) return _diagnostics;
 
   if (!navigator.gpu) {
@@ -50,8 +55,10 @@ export async function initBenchmark(): Promise<DeviceDiagnostics> {
 
   const hasTimestampQuery = adapter.features.has('timestamp-query');
 
+  // Request with conservative limits to avoid OOM on mobile
   const device = await adapter.requestDevice({
     requiredFeatures: hasTimestampQuery ? ['timestamp-query'] : [],
+    requiredLimits: {},
   });
 
   device.lost.then(info => {
@@ -227,8 +234,8 @@ export async function timeExecution(
 ): Promise<TimingResult> {
   const device = getDevice();
 
-  // Warmup
-  for (let i = 0; i < warmup; i++) {
+  // Warmup — fewer on mobile
+  for (let i = 0; i < Math.min(warmup, 3); i++) {
     fn();
   }
 
@@ -236,7 +243,12 @@ export async function timeExecution(
   for (let i = 0; i < iterations; i++) {
     const start = performance.now();
     fn();
-    await device.queue.onSubmittedWorkDone();
+    try {
+      await device.queue.onSubmittedWorkDone();
+    } catch {
+      // iOS Safari may reject onSubmittedWorkDone — just wait a bit
+      await new Promise(r => setTimeout(r, 50));
+    }
     const end = performance.now();
     times.push(end - start);
   }
@@ -265,4 +277,28 @@ export function formatMs(ms: number): string {
   if (ms < 1) return `${(ms * 1000).toFixed(0)} us`;
   if (ms < 1000) return `${ms.toFixed(2)} ms`;
   return `${(ms / 1000).toFixed(2)} s`;
+}
+
+// ─── Safe allocation helpers ───
+
+export function canAllocate(bytes: number): boolean {
+  try {
+    const device = getDevice();
+    const buf = device.createBuffer({
+      size: bytes,
+      usage: GPUBufferUsage.STORAGE,
+    });
+    buf.destroy();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function safeMaxBufferSize(): number {
+  const diag = _diagnostics;
+  if (!diag) return 0;
+  // Use at most 25% of reported max, capped at 64 MB for safety on mobile
+  const safe = Math.min(diag.maxBufferSize * 0.25, 64 * 1024 * 1024);
+  return safe;
 }

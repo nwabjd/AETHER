@@ -24,7 +24,6 @@ const TESTS = [
   { N: 1024, name: 'N=1024' },
   { N: 4096, name: 'N=4096 (typical LLM hidden)' },
   { N: 8192, name: 'N=8192 (large hidden)' },
-  { N: 16384, name: 'N=16384' },
 ];
 
 export async function benchmarkRMSNorm(): Promise<BenchmarkResult[]> {

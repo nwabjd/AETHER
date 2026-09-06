@@ -33,8 +33,7 @@ const TESTS = [
   { rows: 1, cols: 1024, name: '1×1024' },
   { rows: 32, cols: 1024, name: '32×1024' },
   { rows: 128, cols: 1024, name: '128×1024' },
-  { rows: 512, cols: 1024, name: '512×1024' },
-  { rows: 1024, cols: 1024, name: '1024×1024' },
+  { rows: 256, cols: 1024, name: '256×1024' },
 ];
 
 export async function benchmarkSoftmax(): Promise<BenchmarkResult[]> {

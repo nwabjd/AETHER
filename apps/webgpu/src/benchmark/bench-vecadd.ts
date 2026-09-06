@@ -8,7 +8,7 @@ import {
 } from './engine';
 import { VEC_ADD } from './kernels';
 
-const SIZES = [1024, 65536, 1_048_576, 16_777_216, 67_108_864];
+const SIZES = [1024, 65536, 1_048_576, 8_388_608];
 
 export async function benchmarkVectorAdd(): Promise<BenchmarkResult[]> {
   const device = getDevice();
@@ -51,7 +51,7 @@ export async function benchmarkVectorAdd(): Promise<BenchmarkResult[]> {
         pass.dispatchWorkgroups(workgroups);
         pass.end();
         device.queue.submit([encoder.finish()]);
-      }, 50);
+      }, N > 1_000_000 ? 20 : 50);
 
       // Verify correctness
       const result = await readbackBuffer(bufC, bytes);
