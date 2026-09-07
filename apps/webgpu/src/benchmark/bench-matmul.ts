@@ -7,6 +7,7 @@ import {
   type BenchmarkResult,
 } from './engine';
 import { MATMUL } from './kernels';
+import { MATMUL_BINDINGS } from './bindings';
 
 const SIZES = [128, 256, 512];
 
@@ -29,7 +30,7 @@ export async function benchmarkMatmul(): Promise<BenchmarkResult[]> {
   const device = getDevice();
   const results: BenchmarkResult[] = [];
 
-  const pipeline = createPipeline(MATMUL, 4);
+  const pipeline = createPipeline(MATMUL, MATMUL_BINDINGS);
   const layout = pipeline.getBindGroupLayout(0);
 
   for (const N of SIZES) {

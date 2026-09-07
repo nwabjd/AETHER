@@ -8,6 +8,7 @@ import {
   type BenchmarkResult,
 } from './engine';
 import { MATMUL } from './kernels';
+import { MATMUL_BINDINGS } from './bindings';
 
 interface SustainedSample {
   second: number;
@@ -35,7 +36,7 @@ export async function benchmarkSustained(
   const M = N, K = N;
   const flops = 2 * M * N * K;
 
-  const pipeline = createPipeline(MATMUL, 4);
+  const pipeline = createPipeline(MATMUL, MATMUL_BINDINGS);
   const layout = pipeline.getBindGroupLayout(0);
 
   const aData = new Float32Array(M * K).fill(1.0);

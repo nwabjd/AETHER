@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build && node scripts/verify-build.mjs",
+    "test": "node --experimental-strip-types scripts/regression-layout.test.ts",
     "preview": "vite preview"
   },
   "devDependencies": {

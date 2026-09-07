@@ -2,6 +2,12 @@
 // Real timing using performance.now() + queue.onSubmittedWorkDone()
 // All measurements are from actual execution, never theoretical
 
+import {
+  createBindGroupLayoutForBindings,
+  assertBindingCount,
+  type StorageAccess,
+} from './layout';
+
 export interface BenchmarkResult {
   id: string;
   name: string;
@@ -232,25 +238,53 @@ export async function readbackBuffer(src: GPUBuffer, size: number): Promise<Floa
   return data;
 }
 
-export function createPipeline(code: string, bindings: number): GPUComputePipeline {
-  const device = getDevice();
-  const layout = device.createBindGroupLayout({
-    entries: Array.from({ length: bindings }, (_, i) => ({
-      binding: i,
-      visibility: GPUShaderStage.COMPUTE,
-      buffer: i === 0
-        ? { type: 'uniform' as const }
-        : { type: 'storage' as const },
-    })),
-  });
+export interface PipelineDiagnostics {
+  bindingTypes: readonly StorageAccess[];
+  compilationMessages: readonly GPUCompilationMessage[];
+  pipelineLayoutInspected: boolean;
+}
 
-  return device.createComputePipeline({
+// Creates a compute pipeline from an explicit per-binding storage-access list.
+// Binding index i is laid out as bindingTypes[i] — e.g. 'read-only-storage'
+// for `var<storage, read>` and 'storage' for `var<storage, read_write>`.
+// A generic { type: 'storage' } default for every input binding is invalid
+// when the shader only requests read access on iOS Safari, so the layout is
+// always created from the declared access, never inferred from position.
+export function createPipeline(
+  code: string,
+  bindingTypes: readonly StorageAccess[],
+  onDiagnostics?: (diag: PipelineDiagnostics) => void
+): GPUComputePipeline {
+  const device = getDevice();
+  if (bindingTypes.length === 0) {
+    throw new Error('createPipeline: bindingTypes must be non-empty (uniform / read-only-storage / storage)');
+  }
+
+  const layout = createBindGroupLayoutForBindings(device, bindingTypes);
+  const module = device.createShaderModule({ code });
+  const pipeline = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [layout] }),
     compute: {
-      module: device.createShaderModule({ code }),
+      module,
       entryPoint: 'main',
     },
   });
+
+  // Capture shader compilation information where available. This is a
+  // diagnostic aid only — it never substitutes for the explicit layout above.
+  const emit = (compilationMessages: readonly GPUCompilationMessage[]) =>
+    onDiagnostics?.({ bindingTypes, compilationMessages, pipelineLayoutInspected: true });
+
+  if (typeof module.getCompilationInfo === 'function') {
+    void module
+      .getCompilationInfo()
+      .then((info) => emit(info.messages))
+      .catch(() => emit([]));
+  } else {
+    emit([]);
+  }
+
+  return pipeline;
 }
 
 export function createBindGroup(
@@ -258,6 +292,20 @@ export function createBindGroup(
   entries: GPUBindGroupEntry[]
 ): GPUBindGroup {
   const device = getDevice();
+  const layout = pipeline.getBindGroupLayout(0);
+  return device.createBindGroup({ layout, entries });
+}
+
+// Validates that the number of entries matches the pipeline's binding types
+// before creating the bind group — a mismatch fails fast with a clear message
+// instead of surfacing as an obscure iOS GPU validation error later.
+export function createBindGroupForPipeline(
+  pipeline: GPUComputePipeline,
+  bindingTypes: readonly StorageAccess[],
+  entries: GPUBindGroupEntry[]
+): GPUBindGroup {
+  const device = getDevice();
+  assertBindingCount(bindingTypes, entries, 'createBindGroupForPipeline');
   const layout = pipeline.getBindGroupLayout(0);
   return device.createBindGroup({ layout, entries });
 }

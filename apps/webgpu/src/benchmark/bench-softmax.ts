@@ -5,12 +5,13 @@ import {
   type BenchmarkResult,
 } from './engine';
 import { SOFTMAX } from './kernels';
+import { SOFTMAX_BINDINGS } from './bindings';
 import { runGpuTest } from './gpu-test';
 
 export async function benchmarkSoftmax(): Promise<BenchmarkResult[]> {
   const device = getDevice();
   const results: BenchmarkResult[] = [];
-  const pipeline = createPipeline(SOFTMAX, 3); // uniform, input, output
+  const pipeline = createPipeline(SOFTMAX, SOFTMAX_BINDINGS);
 
   const TESTS = [
     { rows: 1, cols: 64 },

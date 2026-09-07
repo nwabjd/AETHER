@@ -9,6 +9,8 @@
 // Expected:  every cell = 64 · 1.0 · 0.5 = 32.0.
 
 import { MATMUL } from './kernels';
+import { createBindGroupLayoutForBindings } from './layout';
+import { MATMUL_BINDINGS } from './bindings';
 import {
   acquireStandaloneDevice,
   guarded,
@@ -90,14 +92,10 @@ export async function runStandaloneMatmul(): Promise<StandaloneResult> {
     handle.device.queue.writeBuffer(uBuf, 0, uData);
 
     result.stage = 'create-pipeline';
-    const layout = handle.device.createBindGroupLayout({
-      entries: [
-        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
-        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-        { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-      ],
-    });
+    // Same layout utility as the engine's createPipeline: uniform,
+    // read-only-storage, read-only-storage, storage — kept here so the
+    // standalone check exercises the exact shared binding layout.
+    const layout = createBindGroupLayoutForBindings(handle.device, MATMUL_BINDINGS);
     const pipeline = handle.device.createComputePipeline({
       layout: handle.device.createPipelineLayout({ bindGroupLayouts: [layout] }),
       compute: {

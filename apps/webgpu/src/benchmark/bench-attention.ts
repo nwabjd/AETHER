@@ -5,12 +5,13 @@ import {
   type BenchmarkResult,
 } from './engine';
 import { ATTENTION } from './kernels';
+import { ATTENTION_BINDINGS } from './bindings';
 import { runGpuTest } from './gpu-test';
 
 export async function benchmarkAttention(): Promise<BenchmarkResult[]> {
   const device = getDevice();
   const results: BenchmarkResult[] = [];
-  const pipeline = createPipeline(ATTENTION, 6);
+  const pipeline = createPipeline(ATTENTION, ATTENTION_BINDINGS);
 
   // Very small: batch=1, seq=4, dim=4
   const batch = 1, seq = 4, dim = 4;

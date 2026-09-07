@@ -5,12 +5,13 @@ import {
   type BenchmarkResult,
 } from './engine';
 import { RMS_NORM } from './kernels';
+import { RMS_NORM_BINDINGS } from './bindings';
 import { runGpuTest } from './gpu-test';
 
 export async function benchmarkRMSNorm(): Promise<BenchmarkResult[]> {
   const device = getDevice();
   const results: BenchmarkResult[] = [];
-  const pipeline = createPipeline(RMS_NORM, 4);
+  const pipeline = createPipeline(RMS_NORM, RMS_NORM_BINDINGS);
 
   const SIZES = [8, 128, 512];
 

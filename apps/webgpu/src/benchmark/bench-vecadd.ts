@@ -7,12 +7,13 @@ import {
   type BenchmarkResult,
 } from './engine';
 import { VEC_ADD } from './kernels';
+import { VEC_ADD_BINDINGS } from './bindings';
 import { runGpuTest } from './gpu-test';
 
 export async function benchmarkVectorAdd(): Promise<BenchmarkResult[]> {
   const device = getDevice();
   const results: BenchmarkResult[] = [];
-  const pipeline = createPipeline(VEC_ADD, 4);
+  const pipeline = createPipeline(VEC_ADD, VEC_ADD_BINDINGS);
 
   // Deterministic, small test first
   const SIZES = [64, 1024, 65536]; 

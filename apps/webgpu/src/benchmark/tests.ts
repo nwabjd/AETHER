@@ -2,12 +2,16 @@
 // Automated verification of every kernel against CPU reference
 
 import {
-  getDevice, createUniformBuffer, createStorageBuffer, readbackBuffer,
-  createPipeline,
+  createUniformBuffer, createStorageBuffer,
+  createPipeline, createBindGroupForPipeline,
 } from './engine';
 import {
   VEC_ADD, MATMUL, CONV2D, SOFTMAX, RMS_NORM, ATTENTION,
 } from './kernels';
+import {
+  VEC_ADD_BINDINGS, MATMUL_BINDINGS, CONV2D_BINDINGS,
+  SOFTMAX_BINDINGS, RMS_NORM_BINDINGS, ATTENTION_BINDINGS,
+} from './bindings';
 
 interface TestResult {
   name: string;
@@ -151,16 +155,13 @@ export async function testVecAdd(): Promise<TestResult> {
     new Uint32Array(uData)[0] = N;
     const uBuf = createUniformBuffer(uData);
 
-    const pipeline = createPipeline(VEC_ADD, 4);
-    const bg = getDevice().createBindGroup({
-      layout: pipeline.getBindGroupLayout(0),
-      entries: [
+    const pipeline = createPipeline(VEC_ADD, VEC_ADD_BINDINGS);
+    const bg = createBindGroupForPipeline(pipeline, VEC_ADD_BINDINGS, [
         { binding: 0, resource: { buffer: uBuf } },
         { binding: 1, resource: { buffer: bufA } },
         { binding: 2, resource: { buffer: bufB } },
         { binding: 3, resource: { buffer: bufC } },
-      ],
-    });
+      ]);
 
     const res = await runGpuTest({
       name: 'VecAdd',
@@ -197,16 +198,13 @@ export async function testMatmul(): Promise<TestResult> {
     uv[0] = N; uv[1] = N; uv[2] = N;
     const uBuf = createUniformBuffer(uData);
 
-    const pipeline = createPipeline(MATMUL, 4);
-    const bg = getDevice().createBindGroup({
-      layout: pipeline.getBindGroupLayout(0),
-      entries: [
+    const pipeline = createPipeline(MATMUL, MATMUL_BINDINGS);
+    const bg = createBindGroupForPipeline(pipeline, MATMUL_BINDINGS, [
         { binding: 0, resource: { buffer: uBuf } },
         { binding: 1, resource: { buffer: bufA } },
         { binding: 2, resource: { buffer: bufB } },
         { binding: 3, resource: { buffer: bufC } },
-      ],
-    });
+      ]);
 
     const res = await runGpuTest({
       name: 'Matmul',
@@ -258,16 +256,13 @@ export async function testConv2D(): Promise<TestResult> {
     uv[4] = F; uv[5] = FH; uv[6] = FW; uv[7] = OH; uv[8] = OW;
     const uBuf = createUniformBuffer(uData);
 
-    const pipeline = createPipeline(CONV2D, 4);
-    const bg = getDevice().createBindGroup({
-      layout: pipeline.getBindGroupLayout(0),
-      entries: [
+    const pipeline = createPipeline(CONV2D, CONV2D_BINDINGS);
+    const bg = createBindGroupForPipeline(pipeline, CONV2D_BINDINGS, [
         { binding: 0, resource: { buffer: uBuf } },
         { binding: 1, resource: { buffer: bufIn } },
         { binding: 2, resource: { buffer: bufK } },
         { binding: 3, resource: { buffer: bufOut } },
-      ],
-    });
+      ]);
 
     const res = await runGpuTest({
       name: 'Conv2D',
@@ -305,15 +300,12 @@ export async function testSoftmax(): Promise<TestResult> {
     new Uint32Array(uData)[1] = cols;
     const uBuf = createUniformBuffer(uData);
 
-    const pipeline = createPipeline(SOFTMAX, 3); // 3 bindings
-    const bg = getDevice().createBindGroup({
-      layout: pipeline.getBindGroupLayout(0),
-      entries: [
+    const pipeline = createPipeline(SOFTMAX, SOFTMAX_BINDINGS);
+    const bg = createBindGroupForPipeline(pipeline, SOFTMAX_BINDINGS, [
         { binding: 0, resource: { buffer: uBuf } },
         { binding: 1, resource: { buffer: bufIn } },
         { binding: 2, resource: { buffer: bufOut } },
-      ],
-    });
+      ]);
 
     const res = await runGpuTest({
       name: 'Softmax',
@@ -354,16 +346,13 @@ export async function testRMSNorm(): Promise<TestResult> {
     new Float32Array(uData)[1] = eps;
     const uBuf = createUniformBuffer(uData);
 
-    const pipeline = createPipeline(RMS_NORM, 4);
-    const bg = getDevice().createBindGroup({
-      layout: pipeline.getBindGroupLayout(0),
-      entries: [
+    const pipeline = createPipeline(RMS_NORM, RMS_NORM_BINDINGS);
+    const bg = createBindGroupForPipeline(pipeline, RMS_NORM_BINDINGS, [
         { binding: 0, resource: { buffer: uBuf } },
         { binding: 1, resource: { buffer: bufIn } },
         { binding: 2, resource: { buffer: bufW } },
         { binding: 3, resource: { buffer: bufOut } },
-      ],
-    });
+      ]);
 
     const res = await runGpuTest({
       name: 'RMSNorm',
@@ -417,18 +406,15 @@ export async function testAttention(): Promise<TestResult> {
     fv[3] = scale;
     const uBuf = createUniformBuffer(uData);
 
-    const pipeline = createPipeline(ATTENTION, 6);
-    const bg = getDevice().createBindGroup({
-      layout: pipeline.getBindGroupLayout(0),
-      entries: [
+    const pipeline = createPipeline(ATTENTION, ATTENTION_BINDINGS);
+    const bg = createBindGroupForPipeline(pipeline, ATTENTION_BINDINGS, [
         { binding: 0, resource: { buffer: uBuf } },
         { binding: 1, resource: { buffer: bufQ } },
         { binding: 2, resource: { buffer: bufK } },
         { binding: 3, resource: { buffer: bufV } },
         { binding: 4, resource: { buffer: bufOut } },
         { binding: 5, resource: { buffer: bufScores } },
-      ],
-    });
+      ]);
 
     const res = await runGpuTest({
       name: 'Attention',

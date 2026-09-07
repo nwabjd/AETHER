@@ -5,12 +5,13 @@ import {
   type BenchmarkResult,
 } from './engine';
 import { CONV2D } from './kernels';
+import { CONV2D_BINDINGS } from './bindings';
 import { runGpuTest } from './gpu-test';
 
 export async function benchmarkConv2D(): Promise<BenchmarkResult[]> {
   const device = getDevice();
   const results: BenchmarkResult[] = [];
-  const pipeline = createPipeline(CONV2D, 4);
+  const pipeline = createPipeline(CONV2D, CONV2D_BINDINGS);
 
   // Small deterministic test: 1x1x5x5 input, 1x1x3x3 kernel
   const N = 1, C = 1, H = 5, W = 5, F = 1, FH = 3, FW = 3;
