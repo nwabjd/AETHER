@@ -122,4 +122,38 @@ import { analyzeNumeric, rowSums } from '../src/benchmark/numeric.ts';
   assert.equal(len.pass, false);
 }
 
+// ── analyzeNumeric: zero-error (perfect match) must PASS with useful diagnostics ──
+{
+  const gpu = new Float32Array([32, 32, 32]);
+  const cpu = new Float32Array([32, 32, 32]);
+  const r = analyzeNumeric(gpu, cpu, 1e-3);
+  assert.equal(r.pass, true, 'perfect match must pass');
+  assert.equal(r.maxError, 0, 'maxError == 0');
+  assert.equal(r.errorIndex, 0, 'errorIndex seeded with first element');
+  assert.equal(r.cpuValue, 32, 'cpuValue recorded');
+  assert.equal(r.gpuValue, 32, 'gpuValue recorded');
+  assert.equal(r.allFinite, true);
+  assert.equal(r.lengthMismatch, false);
+}
+
+// ── analyzeNumeric: small mismatch must FAIL with correct index ──
+{
+  const gpu = new Float32Array([32, 32, 32.01]);
+  const cpu = new Float32Array([32, 32, 32]);
+  const r = analyzeNumeric(gpu, cpu, 1e-3);
+  assert.equal(r.pass, false);
+  assert.ok(Math.abs(r.maxError - 0.01) < 1e-3, `maxError ${r.maxError}`);
+  assert.equal(r.errorIndex, 2);
+  assert.equal(r.cpuValue, 32);
+  assert.ok(Math.abs(r.gpuValue! - 32.01) < 1e-3);
+}
+
+// ── analyzeNumeric: empty arrays must FAIL (nothing to compare) ──
+{
+  const r = analyzeNumeric(new Float32Array([]), new Float32Array([]), 1e-3);
+  assert.equal(r.pass, false, 'empty arrays must not pass');
+  assert.equal(r.allFinite, true);
+  assert.equal(r.lengthMismatch, false);
+}
+
 console.log('PASS: CPU reference + numeric unit tests');

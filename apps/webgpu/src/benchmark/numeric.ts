@@ -36,6 +36,7 @@ export function analyzeNumeric(
   let expMax = -Infinity;
   let actMin = Infinity;
   let actMax = -Infinity;
+  let compared = false;
 
   for (let i = 0; i < n; i++) {
     const g = gpu[i];
@@ -49,6 +50,14 @@ export function analyzeNumeric(
     if (c > expMax) expMax = c;
     if (g < actMin) actMin = g;
     if (g > actMax) actMax = g;
+    // Seed diagnostic values with the first valid comparison so perfect-zero
+    // results (maxError == 0) still report a meaningful cpuValue / gpuValue.
+    if (!compared) {
+      compared = true;
+      errorIndex = 0;
+      cpuValue = c;
+      gpuValue = g;
+    }
     const e = Math.abs(g - c);
     if (e > maxError) {
       maxError = e;
@@ -72,7 +81,7 @@ export function analyzeNumeric(
   const pass =
     !lengthMismatch &&
     allFinite &&
-    errorIndex >= 0 &&
+    compared &&
     maxError <= tolerance;
 
   return {
