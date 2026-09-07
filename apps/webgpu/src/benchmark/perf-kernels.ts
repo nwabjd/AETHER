@@ -154,7 +154,7 @@ const MATMUL_CONF = [
   { size: 128, iterations: 12, validate: true },
   { size: 256, iterations: 12, validate: true },
   { size: 512, iterations: 10, validate: false },
-  { size: 1024, iterations: 8, validate: false },
+  { size: 1024, iterations: 10, validate: false },
 ] as const;
 
 export async function benchMatmul(tm: TimingManager, subset?: ReadonlySet<string>): Promise<PerfSample[]> {
@@ -262,19 +262,19 @@ export async function benchVecAdd(tm: TimingManager, subset?: ReadonlySet<string
 // ─── CONV2D (1×C input, no padding, stride 1) ────────────────────────────
 
 const CONV2D_CONF = [
-  { channels: 1, rows: 32, cols: 32, iterations: 10 },
-  { channels: 8, rows: 64, cols: 64, iterations: 8 },
-  { channels: 16, rows: 128, cols: 128, iterations: 6 },
+  { inputChannels: 1, outputChannels: 1, rows: 32, cols: 32, iterations: 10 },
+  { inputChannels: 1, outputChannels: 8, rows: 64, cols: 64, iterations: 8 },
+  { inputChannels: 1, outputChannels: 16, rows: 128, cols: 128, iterations: 6 },
 ] as const;
 
 export async function benchConv2D(tm: TimingManager, subset?: ReadonlySet<string>): Promise<PerfSample[]> {
   const out: PerfSample[] = [];
   for (const conf of CONV2D_CONF) {
-    const C = conf.channels;
+    const C = conf.inputChannels;
     const H = conf.rows;
-    if (subset && !subset.has(`conv2d-${C}-${H}`)) continue;
+    if (subset && !subset.has(`conv2d-${conf.inputChannels}-${conf.outputChannels}-${H}`)) continue;
     const W = conf.cols;
-    const F = C; // inputChannels → outputChannels mirror (F = C per TASK 6 mapping)
+    const F = conf.outputChannels;
     const FH = 3;
     const FW = 3;
     const OH = H - FH + 1;
@@ -312,7 +312,7 @@ export async function benchConv2D(tm: TimingManager, subset?: ReadonlySet<string
       },
       { iterations: conf.iterations, wait: waitFor(bufOut, F * OH * OW * 4) }
     );
-    out.push(sample(`conv2d-${C}-${H}`, 'Convolution 3×3', `${C}×${H}×${W} → ${F}×${OH}×${OW}`, stats));
+    out.push(sample(`conv2d-${C}-${F}-${H}`, 'Convolution 3×3', `${C}→${F} ch, ${H}×${W} → ${OH}×${OW}`, stats));
   }
   return out;
 }
@@ -480,7 +480,25 @@ export async function benchAttention(tm: TimingManager, seqs?: number[]): Promis
     if (seqs && !seqs.includes(seq)) continue;
     const dim = 64;
     const batch = 1;
-    const ctx = await setupAttention(seq, dim, batch);
+
+    // TASK 8: always compute the score-matrix requirement before allocating.
+    const scoresBytes = seq * seq * 4;
+    if (seq * seq > 1 << 24) {
+      // >256M entries (≥1 GiB for the scores matrix) — do not even attempt.
+      main.push(skipSample(`attention-${seq}`, 'Attention (single pass)', `seq=${seq} dim=64 batch=1`, 'SKIPPED — UNSAFE MEMORY REQUIREMENT'));
+      phases[`seq=${seq}`] = [skipSample(`attention-skip-${seq}`, 'Attention phases', `seq=${seq}`, 'SKIPPED — UNSAFE MEMORY REQUIREMENT')];
+      continue;
+    }
+
+    let ctx: AttentionCtx;
+    try {
+      ctx = await setupAttention(seq, dim, batch);
+    } catch (err) {
+      main.push(skipSample(`attention-${seq}`, 'Attention (single pass)', `seq=${seq} dim=64 batch=1 scores=${(scoresBytes / (1024 * 1024)).toFixed(1)} MiB`, 'SKIPPED — UNSAFE MEMORY REQUIREMENT'));
+      phases[`seq=${seq}`] = [skipSample(`attention-skip-${seq}`, 'Attention phases', `seq=${seq}`, 'SKIPPED — UNSAFE MEMORY REQUIREMENT')];
+      void err;
+      continue;
+    }
 
     // monolithic validation vs CPU reference
     await dispatchTo(ctx.pipelines.total, ctx.groups.total, [batch, 1, 1], ctx.bufs.out, seq * dim * 4);
@@ -575,6 +593,10 @@ async function measureAttentionPhases(
     out.push(sample(`attention-pv-${seq}`, 'Softmax × V', `seq=${seq} dim=64`, statsOfTimes(times, tm.mode), gflops(2 * seq * seq * dim, medianOf(times))));
   }
   return out;
+}
+
+function skipSample(id: string, name: string, size: string, note: string): PerfSample {
+  return { id, name, size, timingMode: 'END_TO_END', iterations: 0, warmup: 0, medianMs: 0, averageMs: 0, minMs: 0, maxMs: 0, stdDevMs: 0, note };
 }
 
 function statsOfTimes(times: number[], mode: 'GPU_TIMESTAMP' | 'END_TO_END') {

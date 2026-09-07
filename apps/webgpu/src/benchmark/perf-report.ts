@@ -241,6 +241,169 @@ export function buildPerfReport(input: ReportInput): PerfReport {
   return sanitize(report);
 }
 
+export interface IphoneResultSample {
+  test: string;
+  configuration: string;
+  iterations: number;
+  warmup: number;
+  minMs: number;
+  maxMs: number;
+  meanMs: number;
+  medianMs: number;
+  stdDevMs: number;
+  timingMode: string;
+  throughput?: string | null;
+  note?: string | null;
+}
+
+export interface IphoneBaselineJson {
+  device: PerfReport['device'];
+  browser: PerfReport['browser'];
+  webgpu: PerfReport['webgpu'];
+  timingMode: string;
+  timestamp: string;
+  commit: string | null;
+  results: Record<string, IphoneResultSample>;
+}
+
+/** TASK 18 — exact exported JSON shape for benchmarks/iphone-gpu-results.json. */
+export function buildIphoneBaseline(report: PerfReport): IphoneBaselineJson {
+  const results: Record<string, IphoneResultSample> = {};
+  const put = (test: string, configuration: string, s: PerfSample): void => {
+    results[`${test}.${configuration}`] = {
+      test,
+      configuration,
+      iterations: s.iterations,
+      warmup: s.warmup,
+      minMs: s.minMs,
+      maxMs: s.maxMs,
+      meanMs: s.averageMs,
+      medianMs: s.medianMs,
+      stdDevMs: s.stdDevMs,
+      timingMode: s.timingMode,
+      throughput: s.throughput ? `${s.throughput.value.toFixed(2)} ${s.throughput.unit}` : null,
+      note: s.note ?? null,
+    };
+  };
+
+  for (const s of report.tests.matmul) put('matmul', s.size, s);
+  for (const s of report.tests.vecadd) put('vecadd', s.size, s);
+  for (const s of report.tests.conv2d) put('conv2d', s.size, s);
+  for (const s of report.tests.softmax) put('softmax', s.size, s);
+  for (const s of report.tests.rmsnorm) put('rmsnorm', s.size, s);
+  for (const s of report.tests.attention) put('attention', s.size, s);
+  for (const [size, phaseSamples] of Object.entries(report.tests.attentionPhases)) {
+    for (const s of phaseSamples) put('attention', `${s.name} ${size}`, s);
+  }
+  for (const m of report.memory) {
+    results[`memory.${m.requestedMiB} MiB`] = {
+      test: 'memory',
+      configuration: `${m.requestedMiB} MiB`,
+      iterations: 1,
+      warmup: 0,
+      minMs: 0,
+      maxMs: 0,
+      meanMs: 0,
+      medianMs: 0,
+      stdDevMs: 0,
+      timingMode: 'ALLOCATION',
+      note: `${m.requestedMiB} MiB requested (${m.requestedBytes} B) — created=${m.success ? 'yes' : 'no'}, success=${m.success ? 'yes' : 'no'}${m.note ? ` — ${m.note}` : ''}`,
+      throughput: null,
+    };
+  }
+  for (const key of Object.keys(report.bufferReuse)) {
+    const o = report.bufferReuse[key];
+    results[`bufferReuse.${o.name}`] = {
+      test: 'bufferReuse',
+      configuration: o.name,
+      iterations: o.iterations,
+      warmup: 0,
+      minMs: medianOf(o.samplesMs),
+      maxMs: o.samplesMs[o.samplesMs.length - 1] ?? 0,
+      meanMs: o.totalMs / Math.max(o.iterations, 1),
+      medianMs: o.perOpMs,
+      stdDevMs: 0,
+      timingMode: o.timingMode,
+      throughput: null,
+      note: `per-op (median) ${o.perOpMs.toFixed(3)} ms — ${o.note ?? ''}`.trim(),
+    };
+  }
+  for (const key of Object.keys(report.pipelineCache)) {
+    const o = report.pipelineCache[key];
+    results[`pipelineReuse.${o.name}`] = {
+      test: 'pipelineReuse',
+      configuration: o.name,
+      iterations: o.iterations,
+      warmup: 0,
+      minMs: medianOf(o.samplesMs),
+      maxMs: o.samplesMs[o.samplesMs.length - 1] ?? 0,
+      meanMs: o.totalMs / Math.max(o.iterations, 1),
+      medianMs: o.perOpMs,
+      stdDevMs: 0,
+      timingMode: o.timingMode,
+      throughput: null,
+      note: `per-op (median) ${o.perOpMs.toFixed(3)} ms — ${o.note ?? ''}`.trim(),
+    };
+  }
+  for (const c of report.commandBatching) {
+    results[`commandBatching.${c.name}`] = {
+      test: 'commandBatching',
+      configuration: c.name,
+      iterations: c.samplesMs.length,
+      warmup: 0,
+      minMs: c.samplesMs[0] ?? 0,
+      maxMs: c.samplesMs[c.samplesMs.length - 1] ?? 0,
+      meanMs: c.samplesMs.reduce((a, b) => a + b, 0) / Math.max(c.samplesMs.length, 1),
+      medianMs: c.totalMedianMs,
+      stdDevMs: 0,
+      timingMode: c.timingMode,
+      throughput: null,
+      note: `${c.dispatches} work dispatches across ${c.name.includes('one command buffer') ? 'passes in one command buffer' : 'separate submissions'}`,
+    };
+  }
+  if (report.sustained) {
+    const s = report.sustained;
+    results['sustained.30sec'] = {
+      test: 'sustained',
+      configuration: 'MatMul 256×256, 30 seconds',
+      iterations: s.samples.length,
+      warmup: 0,
+      minMs: s.minGflops,
+      maxMs: s.maxGflops,
+      meanMs: s.avgGflops,
+      medianMs: s.samples[Math.floor(s.samples.length / 2)]?.gflops ?? 0,
+      stdDevMs: 0,
+      timingMode: s.timingMode,
+      throughput: null,
+      note: `avg ${s.avgGflops.toFixed(1)} GFLOPS; first10s ${s.first10sAvgGflops.toFixed(1)}, last10s ${s.last10sAvgGflops.toFixed(1)}; throttled=${s.throttled ? 'yes' : 'no'} (miss=${s.dropPct.toFixed(1)}%)${s.error ? ` — ${s.error}` : ''}`,
+    };
+  }
+  if (report.suiteError) results['suite.error'] = {
+    test: 'suite',
+    configuration: 'aborted',
+    iterations: 0,
+    warmup: 0,
+    minMs: 0,
+    maxMs: 0,
+    meanMs: 0,
+    medianMs: 0,
+    stdDevMs: 0,
+    timingMode: report.timingMode,
+    throughput: null,
+    note: report.suiteError,
+  };
+
+  return {
+    device: report.device,
+    browser: report.browser,
+    webgpu: report.webgpu,
+    timingMode: report.timingMode,
+    timestamp: report.timestamp,
+    commit: report.build.commit,
+    results,
+  };
+}
+
 // ─── TASK 21 — result interpretation (data-driven, no theoretical maxima) ───
 
 function medianOf(times: number[]): number {

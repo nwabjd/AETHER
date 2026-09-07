@@ -15,6 +15,7 @@ import { strict as assert } from 'node:assert';
 import { statsOf } from '../src/benchmark/timing.ts';
 import {
   buildPerfReport,
+  buildIphoneBaseline,
   thermalStateValue,
   gpuUtilizationValue,
   interpretResults,
@@ -195,4 +196,18 @@ test('interpretResults is data-driven and covers the expected cases', () => {
   assert.ok(lines.some((l) => l.includes('buffer reuse')));
   // No fabricated utilization claim anywhere.
   assert.ok(!lines.some((l) => l.includes('utilization')));
+});
+
+test('buildIphoneBaseline emits the exact TASK 18 export shape', () => {
+  const s = makeSample({ id: 'matmul-256', size: '256×256', medianMs: 0.9, throughput: { value: 88, unit: 'GFLOPS' } });
+  const r = buildPerfReport(emptyInput({ tests: { matmul: [s], vecadd: [], conv2d: [], softmax: [], rmsnorm: [], attention: [], attentionPhases: {} } }));
+  const out = buildIphoneBaseline(r);
+  assert.ok('device' in out && 'browser' in out && 'webgpu' in out);
+  assert.ok('timingMode' in out && 'timestamp' in out && 'commit' in out && 'results' in out);
+  const sample = out.results['matmul.256×256'];
+  assert.ok(sample, 'measurement present under matmul.<config>');
+  for (const key of ['test', 'configuration', 'iterations', 'warmup', 'minMs', 'maxMs', 'meanMs', 'medianMs', 'stdDevMs', 'timingMode']) {
+    assert.ok(key in sample, `sample has ${key}`);
+  }
+  assert.equal(sample.throughput, '88.00 GFLOPS');
 });

@@ -328,18 +328,18 @@ export async function benchCommandBatching(): Promise<CommandBatchingResult[]> {
     indivTimes.push(ms);
   }
 
-  // batched: 8 dispatches in a single pass/submit per iteration
+  // batched: 8 compute passes encoded into one command buffer → single submit
   const batchTimes: number[] = [];
   for (let i = 0; i < 20; i++) {
     const ms = await endToEndOp(async () => {
       const enc = getDevice().createCommandEncoder();
-      const pass = enc.beginComputePass();
-      pass.setPipeline(pipeline);
-      pass.setBindGroup(0, bg);
       for (let d = 0; d < BATCH_DISPATCHES; d++) {
+        const pass = enc.beginComputePass();
+        pass.setPipeline(pipeline);
+        pass.setBindGroup(0, bg);
         pass.dispatchWorkgroups(wg[0], wg[1], wg[2]);
+        pass.end();
       }
-      pass.end();
       getDevice().queue.submit([enc.finish()]);
       await readbackBuffer(bufC, bytes);
     });
@@ -358,7 +358,7 @@ export async function benchCommandBatching(): Promise<CommandBatchingResult[]> {
     },
     {
       id: 'command-batch-batched',
-      name: `${BATCH_DISPATCHES} × VecAdd(${BATCH_N}) — one batched submit`,
+      name: `${BATCH_DISPATCHES} × VecAdd(${BATCH_N}) — 8 passes, one command buffer`,
       dispatches: BATCH_DISPATCHES,
       timingMode: 'END_TO_END',
       totalMedianMs: median(batchTimes),

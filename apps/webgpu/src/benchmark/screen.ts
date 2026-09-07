@@ -23,6 +23,7 @@ import { AETHER_BUILD_ID, AETHER_COMMIT, AETHER_BUILD_TIME } from '../build-info
 import { runPerfSuite, isSuiteRunning, type PerfMode } from './perf-suite';
 import {
   interpretResults,
+  buildIphoneBaseline,
   type PerfReport,
   type PerfSample,
   type OverheadSample,
@@ -457,9 +458,11 @@ function fmtMode(mode: string): string {
 function sampleRows(samples: PerfSample[]): string {
   if (!samples || samples.length === 0) return '<tr><td colspan="7" style="color:var(--text-dim)">not run</td></tr>';
   return samples
-    .map(
-      (s) =>
-        `<tr ${s.error ? 'style="color:var(--red)"' : ''}>
+    .map((s) => {
+      if (s.note && s.note.startsWith('SKIPPED')) {
+        return `<tr><td class="td-l">${esc(s.size)}</td><td colspan="7" style="color:var(--yellow)">${esc(s.note)} — not reported as a failure</td></tr>`;
+      }
+      return `<tr ${s.error ? 'style="color:var(--red)"' : ''}>
           <td class="td-l">${esc(s.size)}</td>
           <td>${fmtMode(s.timingMode)}</td>
           <td>${fmtMs(s.medianMs)}</td>
@@ -468,8 +471,8 @@ function sampleRows(samples: PerfSample[]): string {
           <td>${fmtMs(s.maxMs)}</td>
           <td>${fmtMs(s.stdDevMs)}</td>
           <td>${fmtThruput(s.throughput)}</td>
-        </tr>`
-    )
+        </tr>`;
+    })
     .join('');
 }
 
@@ -611,7 +614,8 @@ function renderPerfReport(report: PerfReport) {
 
 function exportPerfJson() {
   if (!_lastPerfReport) return;
-  const blob = new Blob([JSON.stringify(_lastPerfReport, null, 2)], { type: 'application/json' });
+  const json = JSON.stringify(buildIphoneBaseline(_lastPerfReport), null, 2);
+  const blob = new Blob([json], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
