@@ -11,45 +11,82 @@ export interface GpuTestParams {
   validator: (data: Float32Array) => { pass: boolean, error: string };
 }
 
+type GPUErrorFilter = 'validation' | 'out-of-memory' | 'internal';
+
+function pushScopeSafe(device: GPUDevice, filter: GPUErrorFilter): boolean {
+  try {
+    device.pushErrorScope(filter);
+    return true;
+  } catch {
+    // Some implementations (iOS Safari) do not support every scope type.
+    return false;
+  }
+}
+
+async function popScopesSafe(device: GPUDevice, count: number): Promise<GPUError | null> {
+  let firstError: GPUError | null = null;
+  for (let i = 0; i < count; i++) {
+    try {
+      const err = await device.popErrorScope();
+      if (err && !firstError) firstError = err;
+    } catch {
+      // Ignore scope pop failures; never leave the stack unbalanced.
+    }
+  }
+  return firstError;
+}
+
+function withTimeout(p: Promise<void>, ms: number): Promise<void> {
+  let timer: number | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = window.setTimeout(() => reject(new Error(`GPU operation timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([p, timeout]).finally(() => {
+    if (timer !== undefined) window.clearTimeout(timer);
+  });
+}
+
 export async function runGpuTest(params: GpuTestParams): Promise<{ pass: boolean, error: string | null }> {
   const device = getDevice();
-  device.pushErrorScope('validation');
-  device.pushErrorScope('out-of-memory');
-  device.pushErrorScope('internal');
+
+  // Push error scopes defensively. If a scope type is unsupported, skip it.
+  const scopeFilters: GPUErrorFilter[] = ['validation', 'out-of-memory', 'internal'];
+  let pushed = 0;
+  for (const f of scopeFilters) {
+    if (pushScopeSafe(device, f)) pushed++;
+  }
 
   try {
+    const staging = device.createBuffer({
+      size: params.outputBytes,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+
+    // Single command buffer, single submit: compute pass + copy to staging.
     const encoder = device.createCommandEncoder();
     const pass = encoder.beginComputePass();
     pass.setPipeline(params.pipeline);
     pass.setBindGroup(0, params.bindGroup);
     pass.dispatchWorkgroups(...params.workgroups);
     pass.end();
+    encoder.copyBufferToBuffer(params.outputBuffer, 0, staging, 0, params.outputBytes);
     device.queue.submit([encoder.finish()]);
-    await device.queue.onSubmittedWorkDone();
 
-    const errors = await Promise.all([
-      device.popErrorScope(),
-      device.popErrorScope(),
-      device.popErrorScope()
-    ]);
-    const firstError = errors.find(e => e !== null);
-    if (firstError) return { pass: false, error: `Validation Error: ${firstError.message}` };
-
-    const staging = device.createBuffer({
-      size: params.outputBytes,
-      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-    });
-    const encoder2 = device.createCommandEncoder();
-    encoder2.copyBufferToBuffer(params.outputBuffer, 0, staging, 0, params.outputBytes);
-    device.queue.submit([encoder2.finish()]);
-    await staging.mapAsync(GPUMapMode.READ);
+    // mapAsync waits for all prior submitted work; does not depend on the
+    // flaky onSubmittedWorkDone() API on iOS Safari.
+    await withTimeout(staging.mapAsync(GPUMapMode.READ), 15000);
     const data = new Float32Array(staging.getMappedRange().slice(0));
     staging.unmap();
     staging.destroy();
 
+    const gpuError = await popScopesSafe(device, pushed);
+    if (gpuError) return { pass: false, error: `GPU Error: ${gpuError.message}` };
+
     const validation = params.validator(data);
     return { pass: validation.pass, error: validation.pass ? null : validation.error };
   } catch (e) {
+    // Always pop scopes so the per-device stack stays balanced across tests.
+    await popScopesSafe(device, pushed);
     return { pass: false, error: (e as Error).message };
   }
 }

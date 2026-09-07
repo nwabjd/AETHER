@@ -328,6 +328,12 @@ async function runCorrectnessTests() {
   try {
     log('═══ CORRECTNESS TESTS ═══', 'info');
     await initBenchmark();
+    try {
+      getDevice().onuncapturederror = (ev) => {
+        const msg = (ev.error as GPUError)?.message || 'unknown GPU error';
+        log(`UNCAPTURED GPU ERROR: ${msg}`, 'err');
+      };
+    } catch { /* ignore */ }
     const testFunctions = [
       { name: 'Vector Add', fn: testVecAdd },
       { name: 'Matmul', fn: testMatmul },
