@@ -228,6 +228,66 @@ pre {
 
 .empty-state p { margin: 8px 0; }
 
+/* ─── GATE 3: AETHER GPU PERFORMANCE tables ─── */
+
+.perf-block {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-top: 10px;
+}
+
+.perf-block-title {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text);
+  margin-bottom: 8px;
+}
+
+.perf-sub {
+  font-size: 11px;
+  color: var(--text-dim);
+  font-family: var(--mono);
+  margin: 10px 0 4px;
+}
+
+.perf-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+  font-family: var(--mono);
+}
+
+.perf-table th,
+.perf-table td {
+  padding: 4px 8px;
+  text-align: right;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+.perf-table .th-l,
+.perf-table .td-l { text-align: left; }
+
+.perf-table thead th {
+  color: var(--text-dim);
+  font-weight: 600;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.perf-table tbody tr:last-child td { border-bottom: none; }
+
+.pad-bar {
+  flex: 1;
+  background: var(--accent);
+  border-radius: 2px 2px 0 0;
+  min-width: 4px;
+}
+
 canvas {
   display: block;
   max-width: 100%;
