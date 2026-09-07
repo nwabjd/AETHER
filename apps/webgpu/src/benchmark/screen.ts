@@ -19,7 +19,7 @@ import {
 } from './tests';
 import { runGpuSanity } from './sanity';
 import { runStandaloneMatmul } from './standalone-matmul';
-import { runSharedDeviceDirectMatmul } from './harness-matmul';
+import { runSharedDeviceDirectMatmul, runMinimalHarnessMatmul } from './harness-matmul';
 import { AETHER_BUILD_ID, AETHER_COMMIT, AETHER_BUILD_TIME } from '../build-info';
 import { runPerfSuite, isSuiteRunning, type PerfMode } from './perf-suite';
 import {
@@ -367,6 +367,57 @@ async function runSharedDeviceDirectMatmulHandler() {
       ],
     });
     log(`SHARED-DEVICE DIRECT MATMUL: ${r.pass ? 'PASS' : 'FAIL'}`, r.pass ? 'ok' : 'err');
+    if (r.errorType) log(`  error type: ${r.errorType}`, 'err');
+    if (r.errorMessage) log(`  error message: ${r.errorMessage}`, 'err');
+    if (hasDeviceLost()) stopDeviceLost();
+  } catch (e) {
+    log(`ERROR: ${(e as Error).message}`, 'err');
+    if (hasDeviceLost()) stopDeviceLost();
+  } finally {
+    _running = false;
+  }
+}
+
+// MINIMAL HARNESS MATMUL — engine device, inline 64×64 / 128×128, no
+// runGpuTest, no runWithScope. Isolates the harness failure to the execution
+// path so the working standalone flow is mirrored byte-for-byte.
+async function runMinimalHarnessHandler(size: 64 | 128, cardId: string) {
+  if (_running) return;
+  _running = true;
+  try {
+    const diag = await initBenchmark();
+    _deviceDiag = diag;
+    installListeners();
+    log(`═══ MINIMAL HARNESS MATMUL ${size}×${size} (getDevice, inline, no runGpuTest) ═══`, 'info');
+    const r = await runMinimalHarnessMatmul(size);
+    const deviceLabel = diag ? `${diag.adapterName}${diag.adapterVendor ? ` / ${diag.adapterVendor}` : ''}` : 'unknown';
+    const notes: string[] = [
+      `Device: ${deviceLabel}`,
+      `Pipeline: ${r.stageResults.pipeline ? 'PASS' : 'FAIL'}`,
+      `Bind Group: ${r.stageResults['bind-group'] ? 'PASS' : 'FAIL'}`,
+      `Dispatch: ${r.stageResults.dispatch ? 'PASS' : 'FAIL'}`,
+      `Submission: ${r.stageResults.submission ? 'PASS' : 'FAIL'}`,
+      `Readback: ${r.stageResults.readback ? 'PASS' : 'FAIL'}`,
+      `Validation: ${r.stageResults.validation ? 'PASS' : 'FAIL'}`,
+      `Expected: ${r.expected}`,
+      `Actual range: [${r.actualMin}, ${r.actualMax}]`,
+      `Max error: ${r.maxError !== null ? r.maxError.toExponential(2) : '—'}`,
+      `Non-finite values: ${r.nonFinite}`,
+      `GPU error: ${r.gpuError ?? 'none'}`,
+      `Uncaptured error: ${r.uncaptured.length ? r.uncaptured.join(' | ') : 'none'}`,
+      `Shader compilation: ${r.compilationMessages.length ? r.compilationMessages.join(' | ') : 'none'}`,
+      `expected first 16: ${Array(16).fill(r.expected).join(', ')}`,
+      `actual first 16: ${r.first16.length ? r.first16.slice(0, 16).join(', ') : '—'}`,
+    ];
+    renderResultCard(cardId, {
+      title: `MINIMAL HARNESS MATMUL ${size}×${size}`,
+      pass: r.pass,
+      stage: r.stage || 'complete',
+      errorType: r.errorType,
+      errorMessage: r.errorMessage,
+      notes,
+    });
+    log(`MINIMAL HARNESS MATMUL ${size}×${size}: ${r.pass ? 'PASS' : 'FAIL'}`, r.pass ? 'ok' : 'err');
     if (r.errorType) log(`  error type: ${r.errorType}`, 'err');
     if (r.errorMessage) log(`  error message: ${r.errorMessage}`, 'err');
     if (hasDeviceLost()) stopDeviceLost();
@@ -863,6 +914,14 @@ export function render(el: HTMLElement) {
     <div id="res-direct"></div>
     <div id="res-harness"></div>
 
+    <div class="btn-row" style="margin-top:12px">
+      <button class="btn btn-outline" id="btn-minimal-64">RUN MINIMAL HARNESS MATMUL 64×64</button>
+      <button class="btn btn-outline" id="btn-minimal-128">RUN MINIMAL HARNESS MATMUL 128×128</button>
+    </div>
+
+    <div id="res-minimal-64"></div>
+    <div id="res-minimal-128"></div>
+
     <div id="validation-panel"></div>
     <div id="report-panel"></div>
     <div id="perf-panel"></div>
@@ -882,6 +941,8 @@ export function render(el: HTMLElement) {
   el.querySelector('#btn-sanity')?.addEventListener('click', runGpuSanityHandler);
   el.querySelector('#btn-standalone')?.addEventListener('click', runStandaloneMatmulHandler);
   el.querySelector('#btn-direct')?.addEventListener('click', runSharedDeviceDirectMatmulHandler);
+  el.querySelector('#btn-minimal-64')?.addEventListener('click', () => runMinimalHarnessHandler(64, 'res-minimal-64'));
+  el.querySelector('#btn-minimal-128')?.addEventListener('click', () => runMinimalHarnessHandler(128, 'res-minimal-128'));
   el.querySelector('#btn-harness')?.addEventListener('click', runHarnessMatmulHandler);
 
   const correctBtn = el.querySelector('#btn-correctness') as HTMLButtonElement | null;
