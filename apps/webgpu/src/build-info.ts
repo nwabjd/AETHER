@@ -1,20 +1,24 @@
 // AETHER build / commit identifiers.
-// Replaced at build time by Vite (see vite.config.ts):
-//   __AETHER_BUILD_ID__  -> git commit SHA (prefers AETHER_COMMIT env) or timestamp
-//   __AETHER_COMMIT__    -> commit SHA when available, otherwise undefined
-// Falls back to a dev timestamp when the defines were not injected (e.g. type-check only).
+// Read from import.meta.env. Vite inlines VITE_-prefixed variables at build
+// time (see vite.config.ts):
+//   VITE_GIT_COMMIT  -> git commit SHA (injected by the GitHub Actions workflow;
+//                       falls back to the local git SHA, then a timestamp)
+//   VITE_BUILD_TIME  -> ISO-8601 time this bundle was produced
+// Falls back to a dev timestamp when running outside a build (type-check only).
 
-declare const __AETHER_BUILD_ID__: string | undefined;
-declare const __AETHER_COMMIT__: string | undefined;
+function firstDefined(...values: Array<string | undefined>): string | undefined {
+  for (const v of values) {
+    if (v) return v;
+  }
+  return undefined;
+}
 
-export const AETHER_BUILD_ID: string =
-  typeof __AETHER_BUILD_ID__ !== 'undefined'
-    ? __AETHER_BUILD_ID__
-    : `dev-${Date.now().toString(36)}`;
+const gitCommit = firstDefined(import.meta.env.VITE_GIT_COMMIT as string | undefined);
+const buildTime = firstDefined(import.meta.env.VITE_BUILD_TIME as string | undefined);
+
+export const AETHER_BUILD_ID: string = gitCommit ?? buildTime ?? `dev-${Date.now().toString(36)}`;
 
 export const AETHER_COMMIT: string | null =
-  typeof __AETHER_COMMIT__ !== 'undefined' && __AETHER_COMMIT__
-    ? __AETHER_COMMIT__
-    : AETHER_BUILD_ID.length === 40 && /^[0-9a-f]{40}$/.test(AETHER_BUILD_ID)
-      ? AETHER_BUILD_ID
-      : null;
+  gitCommit && /^[0-9a-f]{40}$/.test(gitCommit) ? gitCommit : null;
+
+export const AETHER_BUILD_TIME: string = buildTime ?? '';

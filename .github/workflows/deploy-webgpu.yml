@@ -40,7 +40,7 @@ jobs:
         run: npm run build
         env:
           BASE_PATH: /AETHER/
-          AETHER_COMMIT: ${{ github.sha }}
+          VITE_GIT_COMMIT: ${{ github.sha }}
 
       - name: Configure Pages
         uses: actions/configure-pages@v5

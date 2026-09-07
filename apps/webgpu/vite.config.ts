@@ -5,11 +5,14 @@ import { resolve } from 'node:path';
 import type { Plugin } from 'vite';
 
 // Build identity: the current git commit SHA when available (preferring the
-// AETHER_COMMIT env var injected by the GitHub Actions workflow), otherwise a
-// timestamp. Injected into the bundle + build-info.json so a stale browser
+// VITE_GIT_COMMIT env var injected by the GitHub Actions workflow), otherwise
+// a timestamp. Injected into the bundle + build-info.json so a stale browser
 // cache is immediately detectable.
+//
+// VITE_-prefixed variables are exposed to the client as import.meta.env, so
+// build-info.ts reads VITE_GIT_COMMIT / VITE_BUILD_TIME directly.
 function getCommitSha(): string {
-  const injected = process.env.AETHER_COMMIT;
+  const injected = process.env.VITE_GIT_COMMIT;
   if (injected) return injected.trim();
   try {
     const sha = execSync('git rev-parse HEAD', { encoding: 'utf-8' }).trim();
@@ -47,13 +50,14 @@ function buildInfoJsonPlugin(buildId: string, commit: string): Plugin {
 const basePath = process.env.BASE_PATH || '/';
 const commit = getCommitSha();
 const buildId = getBuildId(commit);
+const buildTime = new Date().toISOString();
+
+// Expose VITE_-prefixed values to import.meta.env (Vite reads process.env).
+if (!process.env.VITE_GIT_COMMIT) process.env.VITE_GIT_COMMIT = commit;
+process.env.VITE_BUILD_TIME = buildTime;
 
 export default defineConfig({
   base: basePath,
-  define: {
-    __AETHER_BUILD_ID__: JSON.stringify(buildId),
-    __AETHER_COMMIT__: JSON.stringify(commit || undefined),
-  },
   plugins: [buildInfoJsonPlugin(buildId, commit)],
   server: {
     host: '0.0.0.0',

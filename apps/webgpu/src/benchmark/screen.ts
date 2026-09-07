@@ -1,24 +1,34 @@
 // AETHER GPU Benchmark — Diagnostic Screen
-// Diagnostic iteration: only GPU SANITY / MATMUL / CORRECTNESS are available.
+// Isolated diagnostics only: GPU SANITY, STANDALONE MATMUL, HARNESS MATMUL.
 // Performance benchmarks are disabled until correctness is independently proven.
 //
-// Shows build ID + commit so a stale Safari cache is immediately obvious.
+// Each diagnostic renders its own PASS/FAIL card with stage, error type and
+// error message, and the footer shows build ID + commit + build time so a
+// stale Safari cache is immediately obvious.
 
 import { initBenchmark, getDevice, getDeviceLostInfo, hasDeviceLost } from './engine';
 import { testVecAdd, testMatmul, testConv2D, testSoftmax, testRMSNorm, testAttention } from './tests';
 import { runGpuSanity } from './sanity';
 import { runStandaloneMatmul } from './standalone-matmul';
-import { AETHER_BUILD_ID, AETHER_COMMIT } from '../build-info';
+import { AETHER_BUILD_ID, AETHER_COMMIT, AETHER_BUILD_TIME } from '../build-info';
 
 let _container: HTMLElement | null = null;
 let _running = false;
 let _listenersInstalled = false;
 
-// TASK 11: gate tests — CORRECTNESS stays locked until these all pass.
+// CORRECTNESS stays locked until these all pass.
 const _gateStatus = { sanity: false, standaloneMatmul: false, harnessMatmul: false };
 
 function gatesPassed(): boolean {
   return _gateStatus.sanity && _gateStatus.standaloneMatmul && _gateStatus.harnessMatmul;
+}
+
+function updateCorrectnessButton() {
+  const btn = _container?.querySelector('#btn-correctness') as HTMLButtonElement | null;
+  if (!btn) return;
+  const ready = gatesPassed();
+  btn.disabled = !ready;
+  btn.textContent = ready ? 'CORRECTNESS' : 'CORRECTNESS (LOCKED)';
 }
 
 function log(msg: string, cls: string = '') {
@@ -45,7 +55,7 @@ function stopDeviceLost() {
   log('Remaining tests stopped.', 'err');
 }
 
-// TASK 7 + TASK 8: install uncapturederror + device.lost listeners once.
+// Install uncapturederror + device.lost listeners once (engine device).
 function installListeners() {
   if (_listenersInstalled) return;
   try {
@@ -63,21 +73,82 @@ function installListeners() {
   }
 }
 
-// TASK 4 + TASK 5: GPU SANITY button.
-async function runSanityTest() {
+interface ResultCardSpec {
+  title: string;
+  pass: boolean;
+  stage: string;
+  errorType: string | null;
+  errorMessage: string | null;
+  notes: string[];
+}
+
+function renderResultCard(cardId: string, spec: ResultCardSpec) {
+  const mount = _container?.querySelector(`#${cardId}`) as HTMLElement | null;
+  if (!mount) return;
+  const lines = [
+    spec.stage ? `<div>stage: <b style="color:var(--text)">${esc(spec.stage)}</b></div>` : '',
+    spec.pass
+      ? ''
+      : spec.errorType
+        ? `<div>error type: <b style="color:var(--red)">${esc(spec.errorType)}</b></div>`
+        : '',
+    spec.pass
+      ? ''
+      : spec.errorMessage
+        ? `<div>error message: <b style="color:var(--red)">${esc(spec.errorMessage)}</b></div>`
+        : '',
+    ...spec.notes.map(n => `<div style="color:var(--text-dim)">${esc(n)}</div>`),
+  ].join('');
+  mount.innerHTML = `
+    <div class="card" style="border-color:${spec.pass ? 'var(--green)' : 'var(--red)'};margin-top:12px">
+      <div class="card-header">
+        <span class="card-title">${esc(spec.title)}</span>
+        <span class="badge ${spec.pass ? 'badge-pass' : 'badge-fail'}">${spec.pass ? 'PASS' : 'FAIL'}</span>
+      </div>
+      <div style="margin-top:8px;font-size:12px;font-family:var(--mono);display:grid;gap:2px;word-break:break-all">${lines || '<div style="color:var(--text-dim)">—</div>'}</div>
+    </div>
+  `;
+}
+
+function esc(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function standaloneNotes(result: { expected: string; actual: string | null; scopeErrors: Array<{ type: string; message: string }>; uncaptured: Array<{ type: string; message: string }>; lost: { reason: string | null; message: string | null }; exception: string | null }): string[] {
+  const notes: string[] = [];
+  for (const e of result.scopeErrors) notes.push(`GPU error scope [${e.type}]: ${e.message}`);
+  for (const e of result.uncaptured) notes.push(`uncaptured GPU error [${e.type}]: ${e.message}`);
+  if (result.lost.reason) notes.push(`device lost — reason: ${result.lost.reason} — message: ${result.lost.message ?? ''}`);
+  notes.push(`expected: ${result.expected}`);
+  if (result.actual !== null) notes.push(`actual: ${result.actual}`);
+  if (result.exception) notes.push(`exception: ${result.exception}`);
+  return notes;
+}
+
+// GPU SANITY — fully standalone (own adapter/device).
+async function runGpuSanityHandler() {
   if (_running) return;
   _running = true;
   try {
-    await initBenchmark();
-    installListeners();
-    log('═══ GPU SANITY ═══', 'info');
+    log('═══ GPU SANITY (standalone) ═══', 'info');
     const r = await runGpuSanity();
+    _gateStatus.sanity = r.pass;
+    updateCorrectnessButton();
+    renderResultCard('res-sanity', {
+      title: 'GPU SANITY',
+      pass: r.pass,
+      stage: r.stage || 'complete',
+      errorType: r.errorType,
+      errorMessage: r.errorMessage,
+      notes: standaloneNotes(r),
+    });
     log(`GPU SANITY TEST: ${r.pass ? 'PASS' : 'FAIL'}`, r.pass ? 'ok' : 'err');
-    if (r.expected) log(`  expected: ${r.expected}`, '');
-    if (r.actual) log(`  actual:   ${r.actual}`, r.pass ? 'ok' : 'err');
-    for (const e of r.errors) log(`  GPU error scope result: ${e}`, 'err');
-    if (r.exception) log(`  exception: ${r.exception}`, 'err');
-    if (hasDeviceLost()) stopDeviceLost();
+    if (r.errorType) log(`  error type: ${r.errorType}`, 'err');
+    if (r.errorMessage) log(`  error message: ${r.errorMessage}`, 'err');
   } catch (e) {
     log(`ERROR: ${(e as Error).message}`, 'err');
   } finally {
@@ -85,52 +156,54 @@ async function runSanityTest() {
   }
 }
 
-// TASK 6: A/B comparison — standalone sanity, standalone matmul, harness matmul.
-async function runMatmulDiagnostics() {
+// STANDALONE MATMUL — fully standalone (own adapter/device).
+async function runStandaloneMatmulHandler() {
+  if (_running) return;
+  _running = true;
+  try {
+    log('═══ STANDALONE MATMUL (64×64) ═══', 'info');
+    const r = await runStandaloneMatmul();
+    _gateStatus.standaloneMatmul = r.pass;
+    updateCorrectnessButton();
+    renderResultCard('res-standalone', {
+      title: 'STANDALONE MATMUL',
+      pass: r.pass,
+      stage: r.stage || 'complete',
+      errorType: r.errorType,
+      errorMessage: r.errorMessage,
+      notes: standaloneNotes(r),
+    });
+    log(`STANDALONE MATMUL: ${r.pass ? 'PASS' : 'FAIL'}`, r.pass ? 'ok' : 'err');
+    if (r.errorType) log(`  error type: ${r.errorType}`, 'err');
+    if (r.errorMessage) log(`  error message: ${r.errorMessage}`, 'err');
+  } catch (e) {
+    log(`ERROR: ${(e as Error).message}`, 'err');
+  } finally {
+    _running = false;
+  }
+}
+
+// HARNESS MATMUL — engine device via runGpuTest.
+async function runHarnessMatmulHandler() {
   if (_running) return;
   _running = true;
   try {
     await initBenchmark();
     installListeners();
-    log('═══ MATMUL DIAGNOSTICS ═══', 'info');
-
-    // 1/3 — standalone GPU sanity
-    log('— 1/3 Standalone GPU sanity —', 'info');
-    const s = await runGpuSanity();
-    _gateStatus.sanity = s.pass;
-    log(`GPU SANITY TEST: ${s.pass ? 'PASS' : 'FAIL'}`, s.pass ? 'ok' : 'err');
-    for (const e of s.errors) log(`  error scope result: ${e}`, 'err');
-    if (s.exception) log(`  exception: ${s.exception}`, 'err');
-    if (hasDeviceLost()) { stopDeviceLost(); return; }
-
-    // 2/3 — standalone matmul
-    log('— 2/3 Standalone MatMul (64×64) —', 'info');
-    const m = await runStandaloneMatmul();
-    _gateStatus.standaloneMatmul = m.pass;
-    log(`STANDALONE MATMUL: ${m.pass ? 'PASS' : 'FAIL'}`, m.pass ? 'ok' : 'err');
-    if (m.expected) log(`  expected: ${m.expected}`, '');
-    if (m.actual) log(`  actual:   ${m.actual}`, m.pass ? 'ok' : 'err');
-    for (const e of m.errors) log(`  error scope result: ${e}`, 'err');
-    if (m.exception) log(`  exception: ${m.exception}`, 'err');
-    if (hasDeviceLost()) { stopDeviceLost(); return; }
-
-    // 3/3 — harness matmul (runGpuTest)
-    log('— 3/3 Harness MatMul (runGpuTest) —', 'info');
+    log('═══ HARNESS MATMUL (runGpuTest) ═══', 'info');
     const h = await testMatmul();
     _gateStatus.harnessMatmul = h.pass;
+    updateCorrectnessButton();
+    renderResultCard('res-harness', {
+      title: 'HARNESS MATMUL',
+      pass: h.pass,
+      stage: 'runGpuTest',
+      errorType: h.pass ? null : 'test-failure',
+      errorMessage: h.pass ? null : h.details,
+      notes: [`details: ${h.details || '—'}`, `max error: ${h.maxError.toExponential(2)}`],
+    });
     log(`HARNESS MATMUL: ${h.pass ? 'PASS' : 'FAIL'} — ${h.details || ''}`, h.pass ? 'ok' : 'err');
-    if (hasDeviceLost()) { stopDeviceLost(); return; }
-
-    if (gatesPassed()) {
-      log('All three gate tests passed — CORRECTNESS enabled.', 'ok');
-      const correctBtn = _container?.querySelector('#btn-correctness') as HTMLButtonElement | null;
-      if (correctBtn) {
-        correctBtn.disabled = false;
-        correctBtn.textContent = 'CORRECTNESS';
-      }
-    }
-
-    log('═══ MATMUL DIAGNOSTICS COMPLETE ═══', 'info');
+    if (hasDeviceLost()) stopDeviceLost();
   } catch (e) {
     log(`ERROR: ${(e as Error).message}`, 'err');
     if (hasDeviceLost()) stopDeviceLost();
@@ -142,7 +215,7 @@ async function runMatmulDiagnostics() {
 async function runCorrectnessTests() {
   if (_running) return;
   if (!gatesPassed()) {
-    log('CORRECTNESS LOCKED — run GPU SANITY and MATMUL first.', 'warn');
+    log('CORRECTNESS LOCKED — run GPU SANITY, STANDALONE MATMUL and HARNESS MATMUL first.', 'warn');
     return;
   }
   _running = true;
@@ -190,6 +263,7 @@ function renderDiagnostics(el: HTMLElement) {
     ['window.isSecureContext', String(window.isSecureContext)],
     ['navigator.userAgent', navigator.userAgent],
     ['AETHER_BUILD_ID', AETHER_BUILD_ID],
+    ['Built at', AETHER_BUILD_TIME || 'n/a'],
     ['Benchmark code revision', AETHER_BUILD_ID],
   ];
   panel.innerHTML = rows
@@ -203,9 +277,9 @@ export function render(el: HTMLElement) {
   _container = el;
   _listenersInstalled = false;
   el.innerHTML = `
-    <h2>GPU Compute Benchmark — Diagnostics</h2>
+    <h2>GPU Compute Benchmark — Isolated Diagnostics</h2>
     <p style="color:var(--text-dim);margin-bottom:16px;font-size:13px">
-      Isolated GPU checks. Performance benchmarks are disabled until correctness is proven.
+      Three independent checks — each requests its own GPU device. Performance benchmarks are disabled until correctness is proven.
     </p>
 
     <div class="card" style="border-color:var(--border)">
@@ -223,25 +297,32 @@ export function render(el: HTMLElement) {
       <div id="diag-panel" style="margin-top:8px"></div>
     </div>
 
-    <div class="btn-row">
+    <div class="btn-row" style="margin-top:16px">
       <button class="btn" id="btn-sanity">GPU SANITY</button>
-      <button class="btn btn-outline" id="btn-matmul">MATMUL</button>
+      <button class="btn btn-outline" id="btn-standalone">STANDALONE MATMUL</button>
+      <button class="btn btn-outline" id="btn-harness">HARNESS MATMUL</button>
       <button class="btn btn-outline" id="btn-correctness">CORRECTNESS (LOCKED)</button>
     </div>
+
+    <div id="res-sanity"></div>
+    <div id="res-standalone"></div>
+    <div id="res-harness"></div>
 
     <div class="log" id="bench-log"></div>
 
     <div style="margin-top:14px;padding-top:10px;border-top:1px solid var(--border);font-size:11px;font-family:var(--mono);color:var(--text-dim)">
-      <div>App build: <b id="build-id" style="color:var(--text)">${AETHER_BUILD_ID}</b></div>
+      <div>AETHER BUILD: <b id="build-id" style="color:var(--text)">${AETHER_BUILD_ID}</b></div>
       <div>Git commit: <b id="build-commit" style="color:var(--text)">${AETHER_COMMIT ?? 'unavailable'}</b></div>
+      <div>Build time: <b id="build-time" style="color:var(--text)">${AETHER_BUILD_TIME || 'unavailable'}</b></div>
       <div>Environment: GitHub Pages</div>
     </div>
   `;
 
   renderDiagnostics(el);
 
-  el.querySelector('#btn-sanity')?.addEventListener('click', runSanityTest);
-  el.querySelector('#btn-matmul')?.addEventListener('click', runMatmulDiagnostics);
+  el.querySelector('#btn-sanity')?.addEventListener('click', runGpuSanityHandler);
+  el.querySelector('#btn-standalone')?.addEventListener('click', runStandaloneMatmulHandler);
+  el.querySelector('#btn-harness')?.addEventListener('click', runHarnessMatmulHandler);
 
   const correctBtn = el.querySelector('#btn-correctness') as HTMLButtonElement | null;
   if (correctBtn) {
@@ -286,8 +367,6 @@ export function render(el: HTMLElement) {
       badge.textContent = 'WEBGPU UNAVAILABLE';
       badge.className = 'badge badge-fail';
     }
-    if (el.querySelector('#diag-panel')) {
-      log(`WEBGPU not available: ${(e as Error).message}`, 'err');
-    }
+    log(`WEBGPU not available: ${(e as Error).message}`, 'err');
   });
 }
