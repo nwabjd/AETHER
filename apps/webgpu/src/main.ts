@@ -9,6 +9,7 @@ import * as Diagnostics from './screens/diagnostics';
 import * as TensorBench from './screens/tensor-bench';
 import * as WebGPUDiag from './screens/webgpu-diagnostics';
 import * as GPUBench from './benchmark/screen';
+import { purgeLegacyServiceWorkers, resetAetherCache } from './sw-purge';
 
 const screens = [
   { id: 'gpubench', label: 'GPU Bench', module: GPUBench },
@@ -77,7 +78,38 @@ function init() {
   });
 }
 
-// NOTE: No service worker registration. The benchmark runs as a normal static
-// HTTPS app so Safari can never execute stale cached JavaScript.
+function renderResetComplete() {
+  const app = document.getElementById('app')!;
+  app.innerHTML = `
+    <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:80vh;text-align:center;gap:16px;padding:24px">
+      <h2 style="color:var(--green, #22c55e);margin:0">AETHER CACHE RESET COMPLETE</h2>
+      <p style="color:var(--text-dim, #9ca3af);margin:0">Please reload AETHER normally.</p>
+      <button id="btn-reset-reload" class="btn">Reload AETHER</button>
+    </div>
+  `;
+  app.querySelector('#btn-reset-reload')?.addEventListener('click', () => {
+    history.replaceState(null, '', window.location.pathname + window.location.search);
+    window.location.reload();
+  });
+}
 
-init();
+async function boot() {
+  // Special cache-reset route: full purge, then show a result page. Do NOT
+  // redirect automatically so the user can see the outcome.
+  if (window.location.hash === '#reset') {
+    await resetAetherCache();
+    renderResetComplete();
+    return;
+  }
+
+  // One-time cleanup BEFORE any UI initializes (purge stale service workers).
+  await purgeLegacyServiceWorkers();
+
+  init();
+}
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', () => void boot());
+} else {
+  void boot();
+}

@@ -8,11 +8,18 @@ import { initBenchmark, getDevice, getDeviceLostInfo, hasDeviceLost } from './en
 import { testVecAdd, testMatmul, testConv2D, testSoftmax, testRMSNorm, testAttention } from './tests';
 import { runGpuSanity } from './sanity';
 import { runStandaloneMatmul } from './standalone-matmul';
-import { AETHER_BUILD_ID } from './build-id';
+import { AETHER_BUILD_ID, AETHER_COMMIT } from '../build-info';
 
 let _container: HTMLElement | null = null;
 let _running = false;
 let _listenersInstalled = false;
+
+// TASK 11: gate tests — CORRECTNESS stays locked until these all pass.
+const _gateStatus = { sanity: false, standaloneMatmul: false, harnessMatmul: false };
+
+function gatesPassed(): boolean {
+  return _gateStatus.sanity && _gateStatus.standaloneMatmul && _gateStatus.harnessMatmul;
+}
 
 function log(msg: string, cls: string = '') {
   if (!_container) return;
@@ -65,7 +72,7 @@ async function runSanityTest() {
     installListeners();
     log('═══ GPU SANITY ═══', 'info');
     const r = await runGpuSanity();
-    log(`GPU SANITY: ${r.pass ? 'PASS' : 'FAIL'}`, r.pass ? 'ok' : 'err');
+    log(`GPU SANITY TEST: ${r.pass ? 'PASS' : 'FAIL'}`, r.pass ? 'ok' : 'err');
     if (r.expected) log(`  expected: ${r.expected}`, '');
     if (r.actual) log(`  actual:   ${r.actual}`, r.pass ? 'ok' : 'err');
     for (const e of r.errors) log(`  GPU error scope result: ${e}`, 'err');
@@ -90,7 +97,8 @@ async function runMatmulDiagnostics() {
     // 1/3 — standalone GPU sanity
     log('— 1/3 Standalone GPU sanity —', 'info');
     const s = await runGpuSanity();
-    log(`Standalone GPU sanity: ${s.pass ? 'PASS' : 'FAIL'}`, s.pass ? 'ok' : 'err');
+    _gateStatus.sanity = s.pass;
+    log(`GPU SANITY TEST: ${s.pass ? 'PASS' : 'FAIL'}`, s.pass ? 'ok' : 'err');
     for (const e of s.errors) log(`  error scope result: ${e}`, 'err');
     if (s.exception) log(`  exception: ${s.exception}`, 'err');
     if (hasDeviceLost()) { stopDeviceLost(); return; }
@@ -98,7 +106,8 @@ async function runMatmulDiagnostics() {
     // 2/3 — standalone matmul
     log('— 2/3 Standalone MatMul (64×64) —', 'info');
     const m = await runStandaloneMatmul();
-    log(`Standalone MatMul: ${m.pass ? 'PASS' : 'FAIL'}`, m.pass ? 'ok' : 'err');
+    _gateStatus.standaloneMatmul = m.pass;
+    log(`STANDALONE MATMUL: ${m.pass ? 'PASS' : 'FAIL'}`, m.pass ? 'ok' : 'err');
     if (m.expected) log(`  expected: ${m.expected}`, '');
     if (m.actual) log(`  actual:   ${m.actual}`, m.pass ? 'ok' : 'err');
     for (const e of m.errors) log(`  error scope result: ${e}`, 'err');
@@ -108,8 +117,18 @@ async function runMatmulDiagnostics() {
     // 3/3 — harness matmul (runGpuTest)
     log('— 3/3 Harness MatMul (runGpuTest) —', 'info');
     const h = await testMatmul();
-    log(`Harness MatMul: ${h.pass ? 'PASS' : 'FAIL'} — ${h.details || ''}`, h.pass ? 'ok' : 'err');
+    _gateStatus.harnessMatmul = h.pass;
+    log(`HARNESS MATMUL: ${h.pass ? 'PASS' : 'FAIL'} — ${h.details || ''}`, h.pass ? 'ok' : 'err');
     if (hasDeviceLost()) { stopDeviceLost(); return; }
+
+    if (gatesPassed()) {
+      log('All three gate tests passed — CORRECTNESS enabled.', 'ok');
+      const correctBtn = _container?.querySelector('#btn-correctness') as HTMLButtonElement | null;
+      if (correctBtn) {
+        correctBtn.disabled = false;
+        correctBtn.textContent = 'CORRECTNESS';
+      }
+    }
 
     log('═══ MATMUL DIAGNOSTICS COMPLETE ═══', 'info');
   } catch (e) {
@@ -122,6 +141,10 @@ async function runMatmulDiagnostics() {
 
 async function runCorrectnessTests() {
   if (_running) return;
+  if (!gatesPassed()) {
+    log('CORRECTNESS LOCKED — run GPU SANITY and MATMUL first.', 'warn');
+    return;
+  }
   _running = true;
   try {
     await initBenchmark();
@@ -129,7 +152,6 @@ async function runCorrectnessTests() {
     log('═══ CORRECTNESS TESTS ═══', 'info');
     const testFunctions = [
       { name: 'Vector Add', fn: testVecAdd },
-      { name: 'Matmul', fn: testMatmul },
       { name: 'Conv2D', fn: testConv2D },
       { name: 'Softmax', fn: testSoftmax },
       { name: 'RMSNorm', fn: testRMSNorm },
@@ -204,15 +226,15 @@ export function render(el: HTMLElement) {
     <div class="btn-row">
       <button class="btn" id="btn-sanity">GPU SANITY</button>
       <button class="btn btn-outline" id="btn-matmul">MATMUL</button>
-      <button class="btn btn-outline" id="btn-correctness">CORRECTNESS</button>
+      <button class="btn btn-outline" id="btn-correctness">CORRECTNESS (LOCKED)</button>
     </div>
 
     <div class="log" id="bench-log"></div>
 
     <div style="margin-top:14px;padding-top:10px;border-top:1px solid var(--border);font-size:11px;font-family:var(--mono);color:var(--text-dim)">
-      <div>Build: <b id="build-id" style="color:var(--text)">${AETHER_BUILD_ID}</b></div>
+      <div>App build: <b id="build-id" style="color:var(--text)">${AETHER_BUILD_ID}</b></div>
+      <div>Git commit: <b id="build-commit" style="color:var(--text)">${AETHER_COMMIT ?? 'unavailable'}</b></div>
       <div>Environment: GitHub Pages</div>
-      <div>Commit: <b id="build-commit" style="color:var(--text)">${AETHER_BUILD_ID}</b></div>
     </div>
   `;
 
@@ -220,7 +242,13 @@ export function render(el: HTMLElement) {
 
   el.querySelector('#btn-sanity')?.addEventListener('click', runSanityTest);
   el.querySelector('#btn-matmul')?.addEventListener('click', runMatmulDiagnostics);
-  el.querySelector('#btn-correctness')?.addEventListener('click', runCorrectnessTests);
+
+  const correctBtn = el.querySelector('#btn-correctness') as HTMLButtonElement | null;
+  if (correctBtn) {
+    correctBtn.addEventListener('click', runCorrectnessTests);
+    correctBtn.disabled = !gatesPassed();
+    correctBtn.textContent = gatesPassed() ? 'CORRECTNESS' : 'CORRECTNESS (LOCKED)';
+  }
 
   // Suppress unhandled errors so failures render in the log instead of a crash dialog.
   const errorHandler = (e: Event) => { e.preventDefault(); };
