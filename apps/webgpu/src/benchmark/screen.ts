@@ -6,8 +6,17 @@
 // error message, and the footer shows build ID + commit + build time so a
 // stale Safari cache is immediately obvious.
 
-import { initBenchmark, getDevice, getDeviceLostInfo, hasDeviceLost } from './engine';
-import { testVecAdd, testMatmul, testConv2D, testSoftmax, testRMSNorm, testAttention } from './tests';
+import { initBenchmark, getDevice, getDeviceLostInfo, hasDeviceLost, type DeviceDiagnostics } from './engine';
+import {
+  runAllTests,
+  testMatmul,
+  installUncapturedCollector,
+  drainUncaptured,
+  type TestResult,
+  type KernelCaseResult,
+  type SuiteReport,
+  type SuiteReportEntry,
+} from './tests';
 import { runGpuSanity } from './sanity';
 import { runStandaloneMatmul } from './standalone-matmul';
 import { AETHER_BUILD_ID, AETHER_COMMIT, AETHER_BUILD_TIME } from '../build-info';
@@ -15,6 +24,7 @@ import { AETHER_BUILD_ID, AETHER_COMMIT, AETHER_BUILD_TIME } from '../build-info
 let _container: HTMLElement | null = null;
 let _running = false;
 let _listenersInstalled = false;
+let _deviceDiag: DeviceDiagnostics | null = null;
 
 // CORRECTNESS stays locked until these all pass.
 const _gateStatus = { sanity: false, standaloneMatmul: false, harnessMatmul: false };
@@ -129,6 +139,140 @@ function standaloneNotes(result: { expected: string; actual: string | null; scop
   return notes;
 }
 
+// ─── AETHER KERNEL VALIDATION panel ───
+
+function caseChip(c: KernelCaseResult): string {
+  const style = c.pass
+    ? 'display:inline-block;margin:0 6px 6px 0;padding:2px 8px;border-radius:10px;font-size:11px;font-family:var(--mono);border:1px solid var(--green);color:var(--green)'
+    : 'display:inline-block;margin:0 6px 6px 0;padding:2px 8px;border-radius:10px;font-size:11px;font-family:var(--mono);border:1px solid var(--red);color:var(--red)';
+  const title = c.pass
+    ? `${c.config} — complete`
+    : `${c.config} — stage: ${c.stage} · ${c.errorType ?? ''} · ${c.errorMessage ?? ''}`;
+  return `<span style="${style}" title="${esc(title)}">${esc(c.config)} ${c.pass ? '✓' : '✗'}</span>`;
+}
+
+function caseFailureLines(c: KernelCaseResult): string[] {
+  const lines: string[] = [];
+  lines.push(`stage: ${esc(c.stage)} · error type: <b style="color:var(--red)">${esc(c.errorType ?? 'unknown')}</b>`);
+  if (c.errorMessage) lines.push(`error: ${esc(c.errorMessage)}`);
+  if (c.nonFiniteIndex >= 0) lines.push(`non-finite output at index ${c.nonFiniteIndex}`);
+  if (c.errorIndex >= 0 && c.cpuValue !== null && c.gpuValue !== null) {
+    lines.push(`largest error @ ${c.errorIndex}: cpu=${c.cpuValue.toExponential(4)} gpu=${c.gpuValue.toExponential(4)}`);
+  }
+  if (c.expectedRange) lines.push(`expected range [${c.expectedRange[0].toExponential(3)}, ${c.expectedRange[1].toExponential(3)}]`);
+  if (c.actualRange) lines.push(`actual range [${c.actualRange[0].toExponential(3)}, ${c.actualRange[1].toExponential(3)}]`);
+  return lines.map((x) => `<div style="color:var(--red)">${x}</div>`);
+}
+
+function renderKernelValidation(results: TestResult[]) {
+  const mount = _container?.querySelector('#validation-panel') as HTMLElement | null;
+  if (!mount) return;
+  const allPass = results.length === 6 && results.every((r) => r.pass);
+  const cards = results.map((r) => {
+    const failLines = r.cases.filter((c) => !c.pass).flatMap(caseFailureLines);
+    const status = r.pass
+      ? 'complete'
+      : r.details.includes('ABORTED')
+        ? 'aborted (device lost)'
+        : r.cases.find((c) => !c.pass)?.stage ?? 'failed';
+    return `
+      <div class="card" style="border-color:${r.pass ? 'var(--green)' : 'var(--red)'};margin-top:10px">
+        <div class="card-header">
+          <span class="card-title">${esc(r.name.toUpperCase())}</span>
+          <span class="badge ${r.pass ? 'badge-pass' : 'badge-fail'}">${r.pass ? 'PASS' : 'FAIL'}</span>
+        </div>
+        <div style="margin-top:8px;font-size:12px;font-family:var(--mono);display:grid;gap:4px;word-break:break-all">
+          <div>${r.cases.map(caseChip).join('') || '<span style="color:var(--text-dim)">not run</span>'}</div>
+          <div>max error: <b>${r.maxError >= 0 ? r.maxError.toExponential(2) : '—'}</b></div>
+          <div>execution status: <b>${esc(status)}</b></div>
+          ${failLines}
+        </div>
+      </div>`;
+  }).join('');
+  mount.innerHTML = `
+    <h3 style="margin-top:20px">AETHER KERNEL VALIDATION</h3>
+    <div class="card" style="border-color:${allPass ? 'var(--green)' : 'var(--red)'};margin-top:4px">
+      <div class="card-header">
+        <span class="card-title">All kernels</span>
+        <span class="badge ${allPass ? 'badge-pass' : 'badge-fail'}">${allPass ? 'ALL PASS' : 'FAILURE(S)'}</span>
+      </div>
+    </div>
+    ${cards}
+  `;
+}
+
+// ─── Correctness report (TASK 14): local save + JSON export ───
+
+function reportEntry(r: TestResult | undefined): SuiteReportEntry {
+  const t = r ?? { name: '?', pass: false, maxError: -1, details: 'not run', cases: [] as KernelCaseResult[] };
+  return { pass: t.pass, maxError: t.maxError, cases: t.cases };
+}
+
+function buildReport(results: TestResult[]): SuiteReport | null {
+  if (!_deviceDiag || results.length === 0) return null;
+  return {
+    device: {
+      webgpuAvailable: _deviceDiag.webgpuAvailable,
+      adapterName: _deviceDiag.adapterName,
+      adapterVendor: _deviceDiag.adapterVendor,
+      adapterDevice: _deviceDiag.adapterDevice,
+      fallbackAdapter: _deviceDiag.isFallbackAdapter,
+    },
+    build: { id: AETHER_BUILD_ID, commit: AETHER_COMMIT ?? null, time: AETHER_BUILD_TIME ?? null },
+    timestamp: new Date().toISOString(),
+    uncapturedErrors: drainUncaptured(),
+    tests: {
+      vectorAdd: reportEntry(results[0]),
+      matmul: reportEntry(results[1]),
+      conv2d: reportEntry(results[2]),
+      softmax: reportEntry(results[3]),
+      rmsNorm: reportEntry(results[4]),
+      attention: reportEntry(results[5]),
+    },
+    allPass: results.length === 6 && results.every((r) => r.pass),
+  };
+}
+
+function saveReportToStorage(report: SuiteReport) {
+  try {
+    localStorage.setItem('aether.correctness', JSON.stringify(report));
+  } catch {
+    // Storage unavailable (private mode) — export still works in-memory.
+  }
+}
+
+function exportReportJson(report: SuiteReport) {
+  const blob = new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `aether-correctness-${new Date().toISOString().slice(0, 19).replace(/:/g, '-')}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function renderReportPanel(report: SuiteReport) {
+  const mount = _container?.querySelector('#report-panel') as HTMLElement | null;
+  if (!mount) return;
+  mount.innerHTML = `
+    <div class="card" style="border-color:${report.allPass ? 'var(--green)' : 'var(--red)'};margin-top:12px">
+      <div class="card-header">
+        <span class="card-title">Correctness Report</span>
+        <span class="badge ${report.allPass ? 'badge-pass' : 'badge-fail'}">${report.allPass ? 'VALID' : 'INVALID'}</span>
+      </div>
+      <div class="btn-row" style="margin-top:10px">
+        <button class="btn" id="btn-export-json">EXPORT JSON</button>
+        <button class="btn btn-outline" id="btn-reload">RELOAD</button>
+      </div>
+      <div style="font-size:11px;color:var(--text-dim);margin-top:8px">
+        device: ${esc(report.device.adapterName)} · ${esc(report.device.adapterVendor)} · saved to localStorage
+      </div>
+    </div>
+  `;
+  mount.querySelector('#btn-export-json')?.addEventListener('click', () => exportReportJson(report));
+  mount.querySelector('#btn-reload')?.addEventListener('click', () => location.reload());
+}
+
 // GPU SANITY — fully standalone (own adapter/device).
 async function runGpuSanityHandler() {
   if (_running) return;
@@ -194,13 +338,14 @@ async function runHarnessMatmulHandler() {
     const h = await testMatmul();
     _gateStatus.harnessMatmul = h.pass;
     updateCorrectnessButton();
+    const caseSummary = h.cases.map((c) => `${c.config}:${c.pass ? 'PASS' : 'FAIL'}`).join(' ');
     renderResultCard('res-harness', {
       title: 'HARNESS MATMUL',
       pass: h.pass,
-      stage: 'runGpuTest',
-      errorType: h.pass ? null : 'test-failure',
-      errorMessage: h.pass ? null : h.details,
-      notes: [`details: ${h.details || '—'}`, `max error: ${h.maxError.toExponential(2)}`],
+      stage: h.pass ? 'complete' : h.cases.find((c) => !c.pass)?.stage ?? 'runGpuTest',
+      errorType: h.pass ? null : h.cases.find((c) => !c.pass)?.errorType ?? null,
+      errorMessage: h.pass ? null : h.cases.find((c) => !c.pass)?.errorMessage ?? h.details,
+      notes: [`cases: ${caseSummary || '—'}`, `max error: ${h.maxError >= 0 ? h.maxError.toExponential(2) : '—'}`],
     });
     log(`HARNESS MATMUL: ${h.pass ? 'PASS' : 'FAIL'} — ${h.details || ''}`, h.pass ? 'ok' : 'err');
     if (hasDeviceLost()) stopDeviceLost();
@@ -220,31 +365,33 @@ async function runCorrectnessTests() {
   }
   _running = true;
   try {
-    await initBenchmark();
+    const diag = await initBenchmark();
+    _deviceDiag = diag;
     installListeners();
-    log('═══ CORRECTNESS TESTS ═══', 'info');
-    const testFunctions = [
-      { name: 'Vector Add', fn: testVecAdd },
-      { name: 'Conv2D', fn: testConv2D },
-      { name: 'Softmax', fn: testSoftmax },
-      { name: 'RMSNorm', fn: testRMSNorm },
-      { name: 'Attention', fn: testAttention },
-    ];
+    // Clear any stale uncaptured errors from previous runs before the suite.
+    drainUncaptured();
+    installUncapturedCollector();
+    log('═══ AETHER KERNEL VALIDATION (sequential, one test at a time) ═══', 'info');
 
-    let allPass = true;
-    for (const t of testFunctions) {
-      if (hasDeviceLost()) { stopDeviceLost(); return; }
-      try {
-        const res = await t.fn();
-        log(`${res.pass ? '✓' : '✗'} ${res.name}: ${res.details || ''} (max err: ${res.maxError.toExponential(2)})`, res.pass ? 'ok' : 'err');
-        if (!res.pass) allPass = false;
-      } catch (e) {
-        log(`✗ ${t.name}: FAILED WITH ERROR: ${(e as Error).message}`, 'err');
-        allPass = false;
+    const results = await runAllTests((r) => {
+      log(`${r.pass ? '✓' : '✗'} ${r.name} — ${r.details}`, r.pass ? 'ok' : 'err');
+    });
+
+    renderKernelValidation(results);
+    const allPass = results.length === 6 && results.every((r) => r.pass);
+    log(allPass ? 'ALL KERNELS PASSED' : 'SOME KERNELS FAILED', allPass ? 'ok' : 'err');
+
+    if (hasDeviceLost()) {
+      stopDeviceLost();
+      log('Requires runtime reinitialization — reload the page (or re-run up the gate diagnostics) before retrying.', 'err');
+    } else {
+      const report = buildReport(results);
+      if (report) {
+        saveReportToStorage(report);
+        renderReportPanel(report);
+        log('Correctness report saved locally (aether.correctness).', 'info');
       }
     }
-    log('', '');
-    log(allPass ? 'ALL TESTS PASSED' : 'SOME TESTS FAILED', allPass ? 'ok' : 'err');
   } catch (e) {
     log(`ERROR: ${(e as Error).message}`, 'err');
     if (hasDeviceLost()) stopDeviceLost();
@@ -308,6 +455,9 @@ export function render(el: HTMLElement) {
     <div id="res-standalone"></div>
     <div id="res-harness"></div>
 
+    <div id="validation-panel"></div>
+    <div id="report-panel"></div>
+
     <div class="log" id="bench-log"></div>
 
     <div style="margin-top:14px;padding-top:10px;border-top:1px solid var(--border);font-size:11px;font-family:var(--mono);color:var(--text-dim)">
@@ -338,6 +488,7 @@ export function render(el: HTMLElement) {
 
   // Auto-initialize on load to show device info + diagnostics.
   initBenchmark().then(diag => {
+    _deviceDiag = diag;
     installListeners();
     const badge = el.querySelector('#device-badge') as HTMLElement;
     const info = el.querySelector('#device-info') as HTMLElement;
