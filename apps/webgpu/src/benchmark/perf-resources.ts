@@ -14,6 +14,7 @@ import {
   getDevice,
 } from './engine';
 import { VEC_ADD } from './kernels';
+import { createVecAddUniform } from './uniforms';
 
 const RESOURCE_ITERS = 30;
 const RESOURCE_N = 65536; // 256 KiB per buffer
@@ -108,7 +109,7 @@ export async function benchBufferReuse(): Promise<{ allocateDestroy: OverheadSam
     a[i] = (i % 100) / 25 - 2;
     b[i] = (i % 77) / 13 - 3;
   }
-  const uniform = createUniformBuffer(new Float32Array([n, 0, 0, 0]).buffer as ArrayBuffer);
+  const uniform = createUniformBuffer(createVecAddUniform(n));
 
   // allocate + destroy every operation
   const allocTimes: number[] = [];
@@ -204,7 +205,7 @@ export async function benchPipelineCache(): Promise<{ recreate: OverheadSample; 
 const bufA = createStorageBuffer(bytes, a);
   const bufB = createStorageBuffer(bytes, b);
   const bufC = createStorageBuffer(bytes);
-  const uniform = createUniformBuffer(new Float32Array([n, 0, 0, 0]).buffer as ArrayBuffer);
+  const uniform = createUniformBuffer(createVecAddUniform(n));
 
   // recreate pipeline + bind group every operation
   const recreateTimes: number[] = [];
@@ -296,7 +297,7 @@ export async function benchCommandBatching(): Promise<CommandBatchingResult[]> {
     a[i] = (i % 100) / 25 - 2;
     b[i] = (i % 77) / 13 - 3;
   }
-  const uniform = createUniformBuffer(new Float32Array([n, 0, 0, 0]).buffer as ArrayBuffer);
+  const uniform = createUniformBuffer(createVecAddUniform(n));
   const stored = createStorageBuffer(bytes, a);
   const stored2 = createStorageBuffer(bytes, b);
   const bufC = createStorageBuffer(bytes);

@@ -6,6 +6,7 @@ import {
 } from './engine';
 import { CONV2D } from './kernels';
 import { CONV2D_BINDINGS } from './bindings';
+import { createConv2DUniform } from './uniforms';
 import { runGpuTest } from './gpu-test';
 
 export async function benchmarkConv2D(): Promise<BenchmarkResult[]> {
@@ -30,12 +31,7 @@ export async function benchmarkConv2D(): Promise<BenchmarkResult[]> {
   const bufInput = createStorageBuffer(inputElements * 4, inputData);
   const bufKernel = createStorageBuffer(kernelElements * 4, kernelData);
   const bufOutput = createStorageBuffer(outputElements * 4);
-
-  const uniformData = new ArrayBuffer(36);
-  const uv = new Uint32Array(uniformData);
-  uv[0] = N; uv[1] = C; uv[2] = H; uv[3] = W;
-  uv[4] = F; uv[5] = FH; uv[6] = FW; uv[7] = OH; uv[8] = OW;
-  const uBuf = createUniformBuffer(uniformData);
+  const uBuf = createUniformBuffer(createConv2DUniform(N, C, H, W, F, FH, FW, OH, OW));
 
   const bindGroup = device.createBindGroup({
     layout: pipeline.getBindGroupLayout(0),

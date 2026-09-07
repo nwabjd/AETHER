@@ -19,6 +19,15 @@ import {
   readbackBuffer,
   getDevice,
 } from './engine';
+import {
+  createMatmulUniform,
+  createVecAddUniform,
+  createConv2DUniform,
+  createSoftmaxUniform,
+  createRMSNormUniform,
+  createAttentionUniform,
+  logMatmulUniformDiagnostic,
+} from './uniforms';
 import type { StorageAccess } from './layout';
 import { MATMUL, VEC_ADD, CONV2D, SOFTMAX, RMS_NORM, ATTENTION } from './kernels';
 import { cpuVecAdd, cpuMatmul, cpuConv2D, cpuSoftmax, cpuRMSNorm, cpuAttention } from './cpu-refs';
@@ -171,7 +180,9 @@ export async function benchMatmul(tm: TimingManager, subset?: ReadonlySet<string
     const bufA = createStorageBuffer(bytes, a);
     const bufB = createStorageBuffer(bytes, b);
     const bufC = createStorageBuffer(bytes);
-    const uniform = createUniformBuffer(new Float32Array([n, n, n, 1]).buffer as ArrayBuffer);
+    const uData = createMatmulUniform(n, n, n);
+    logMatmulUniformDiagnostic(uData);
+    const uniform = createUniformBuffer(uData);
     const pipeline = createPipeline(MATMUL, ['uniform', 'read-only-storage', 'read-only-storage', 'storage']);
     const bg = createBindGroupForPipeline(pipeline, ['uniform', 'read-only-storage', 'read-only-storage', 'storage'], [
       { binding: 0, resource: { buffer: uniform } },
@@ -228,7 +239,7 @@ export async function benchVecAdd(tm: TimingManager, subset?: ReadonlySet<string
     const bufA = createStorageBuffer(bytes, a);
     const bufB = createStorageBuffer(bytes, b);
     const bufC = createStorageBuffer(bytes);
-    const uniform = createUniformBuffer(new Float32Array([n, 0, 0, 0]).buffer as ArrayBuffer);
+    const uniform = createUniformBuffer(createVecAddUniform(n));
     const pipeline = createPipeline(VEC_ADD, ['uniform', 'read-only-storage', 'read-only-storage', 'storage']);
     const bg = createBindGroupForPipeline(pipeline, ['uniform', 'read-only-storage', 'read-only-storage', 'storage'], [
       { binding: 0, resource: { buffer: uniform } },
@@ -288,7 +299,7 @@ export async function benchConv2D(tm: TimingManager, subset?: ReadonlySet<string
     const bufIn = createStorageBuffer(C * H * W * 4, input);
     const bufK = createStorageBuffer(F * C * FH * FW * 4, kernel);
     const bufOut = createStorageBuffer(F * OH * OW * 4);
-    const uniform = createUniformBuffer(new Float32Array([1, C, H, W, F, FH, FW, OH, OW, 0, 0, 0]).buffer as ArrayBuffer);
+    const uniform = createUniformBuffer(createConv2DUniform(1, C, H, W, F, FH, FW, OH, OW));
     const pipeline = createPipeline(CONV2D, ['uniform', 'read-only-storage', 'read-only-storage', 'storage']);
     const bg = createBindGroupForPipeline(pipeline, ['uniform', 'read-only-storage', 'read-only-storage', 'storage'], [
       { binding: 0, resource: { buffer: uniform } },
@@ -335,7 +346,7 @@ export async function benchSoftmax(tm: TimingManager, subset?: ReadonlySet<strin
 
     const bufIn = createStorageBuffer(rows * cols * 4, data);
     const bufOut = createStorageBuffer(rows * cols * 4);
-    const uniform = createUniformBuffer(new Float32Array([rows, cols, 0, 0]).buffer as ArrayBuffer);
+    const uniform = createUniformBuffer(createSoftmaxUniform(rows, cols));
     const pipeline = createPipeline(SOFTMAX, ['uniform', 'read-only-storage', 'storage']);
     const bg = createBindGroupForPipeline(pipeline, ['uniform', 'read-only-storage', 'storage'], [
       { binding: 0, resource: { buffer: uniform } },
@@ -386,7 +397,7 @@ export async function benchRMSNorm(tm: TimingManager, subset?: ReadonlySet<strin
     const bufIn = createStorageBuffer(size * 4, data);
     const bufW = createStorageBuffer(size * 4, weight);
     const bufOut = createStorageBuffer(size * 4);
-    const uniform = createUniformBuffer(new Float32Array([size, eps, 0, 0]).buffer as ArrayBuffer);
+    const uniform = createUniformBuffer(createRMSNormUniform(size, eps));
     const pipeline = createPipeline(RMS_NORM, ['uniform', 'read-only-storage', 'read-only-storage', 'storage']);
     const bg = createBindGroupForPipeline(pipeline, ['uniform', 'read-only-storage', 'read-only-storage', 'storage'], [
       { binding: 0, resource: { buffer: uniform } },
@@ -631,7 +642,7 @@ async function setupAttention(seq: number, dim: number, batch: number): Promise<
   const bufOut = createStorageBuffer(seq * dim * 4);
   const bufScores = createStorageBuffer(seq * seq * 4);
   const bufProbs = createStorageBuffer(seq * seq * 4);
-  const uniform = createUniformBuffer(new Float32Array([batch, seq, dim, scale]).buffer as ArrayBuffer);
+  const uniform = createUniformBuffer(createAttentionUniform(batch, seq, dim, scale));
 
   const total = createPipeline(ATTENTION, ['uniform', 'read-only-storage', 'read-only-storage', 'read-only-storage', 'storage', 'storage']);
   const qkt = createPipeline(ATTN_QKT, [...QKT_BINDINGS]);

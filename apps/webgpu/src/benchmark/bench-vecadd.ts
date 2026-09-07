@@ -8,6 +8,7 @@ import {
 } from './engine';
 import { VEC_ADD } from './kernels';
 import { VEC_ADD_BINDINGS } from './bindings';
+import { createVecAddUniform } from './uniforms';
 import { runGpuTest } from './gpu-test';
 
 export async function benchmarkVectorAdd(): Promise<BenchmarkResult[]> {
@@ -26,9 +27,7 @@ export async function benchmarkVectorAdd(): Promise<BenchmarkResult[]> {
     const bufA = createStorageBuffer(bytes, aData);
     const bufB = createStorageBuffer(bytes, bData);
     const bufC = createStorageBuffer(bytes);
-    const uniformData = new ArrayBuffer(4);
-    new Uint32Array(uniformData)[0] = N;
-    const uBuf = createUniformBuffer(uniformData);
+    const uBuf = createUniformBuffer(createVecAddUniform(N));
 
     const bindGroup = device.createBindGroup({
       layout: pipeline.getBindGroupLayout(0),

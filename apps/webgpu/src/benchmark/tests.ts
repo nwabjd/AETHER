@@ -25,6 +25,14 @@ import {
   cpuVecAdd, cpuMatmul, cpuConv2D, cpuSoftmax, cpuRMSNorm, cpuAttention,
 } from './cpu-refs';
 import { analyzeNumeric, rowSums, type NumericInfo } from './numeric';
+import {
+  createVecAddUniform,
+  createMatmulUniform,
+  createConv2DUniform,
+  createSoftmaxUniform,
+  createRMSNormUniform,
+  createAttentionUniform,
+} from './uniforms';
 
 // ─── Result shapes ───
 
@@ -245,9 +253,7 @@ async function vecAddCase(N: number): Promise<KernelCaseResult> {
   const bufA = makeBuf(A);
   const bufB = makeBuf(B);
   const bufC = createStorageBuffer(N * 4);
-  const uData = new ArrayBuffer(4);
-  new Uint32Array(uData)[0] = N;
-  const uBuf = createUniformBuffer(uData);
+  const uBuf = createUniformBuffer(createVecAddUniform(N));
 
   return runComputeCase({
     name: 'VecAdd',
@@ -288,10 +294,7 @@ async function matmulCase(N: number): Promise<KernelCaseResult> {
   const bufA = makeBuf(A);
   const bufB = makeBuf(B);
   const bufC = createStorageBuffer(N * N * 4);
-  const uData = new ArrayBuffer(12);
-  const uv = new Uint32Array(uData);
-  uv[0] = N; uv[1] = N; uv[2] = N; // M, N, K
-  const uBuf = createUniformBuffer(uData);
+  const uBuf = createUniformBuffer(createMatmulUniform(N, N, N));
 
   return runComputeCase({
     name: 'Matmul',
@@ -356,12 +359,7 @@ async function conv2dCase(caseNum: number): Promise<KernelCaseResult> {
   const bufIn = makeBuf(d.input);
   const bufK = makeBuf(d.kernel);
   const bufOut = createStorageBuffer(outputBytes);
-
-  const uData = new ArrayBuffer(9 * 4);
-  const uv = new Uint32Array(uData);
-  uv[0] = N; uv[1] = C; uv[2] = H; uv[3] = W;
-  uv[4] = F; uv[5] = FH; uv[6] = FW; uv[7] = OH; uv[8] = OW;
-  const uBuf = createUniformBuffer(uData);
+  const uBuf = createUniformBuffer(createConv2DUniform(N, C, H, W, F, FH, FW, OH, OW));
 
   return runComputeCase({
     name: 'Conv2D',
@@ -415,11 +413,7 @@ async function softmaxCase(caseNum: number): Promise<KernelCaseResult> {
 
   const bufIn = createStorageBuffer(bytes, d.data);
   const bufOut = createStorageBuffer(bytes);
-
-  const uData = new ArrayBuffer(8);
-  new Uint32Array(uData)[0] = rows;
-  new Uint32Array(uData)[1] = cols;
-  const uBuf = createUniformBuffer(uData);
+  const uBuf = createUniformBuffer(createSoftmaxUniform(rows, cols));
 
   return runComputeCase({
     name: 'Softmax',
@@ -484,11 +478,7 @@ async function rmsNormCase(caseNum: number): Promise<KernelCaseResult> {
   const bufIn = makeBuf(d.input);
   const bufW = makeBuf(d.weight);
   const bufOut = createStorageBuffer(N * 4);
-
-  const uData = new ArrayBuffer(8);
-  new Uint32Array(uData)[0] = N;
-  new Float32Array(uData)[1] = d.eps;
-  const uBuf = createUniformBuffer(uData);
+  const uBuf = createUniformBuffer(createRMSNormUniform(N, d.eps));
 
   return runComputeCase({
     name: 'RMSNorm',
@@ -547,13 +537,7 @@ async function attentionCase(caseNum: number): Promise<KernelCaseResult> {
   const bufV = makeBuf(a.V);
   const bufOut = createStorageBuffer(qkv * 4);
   const bufScores = createStorageBuffer(scores * 4);
-
-  const uData = new ArrayBuffer(16);
-  const uv = new Uint32Array(uData);
-  const fv = new Float32Array(uData);
-  uv[0] = batch; uv[1] = seq; uv[2] = dim;
-  fv[3] = scale;
-  const uBuf = createUniformBuffer(uData);
+  const uBuf = createUniformBuffer(createAttentionUniform(batch, seq, dim, scale));
 
   return runComputeCase({
     name: 'Attention',

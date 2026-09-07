@@ -6,6 +6,7 @@ import {
 } from './engine';
 import { RMS_NORM } from './kernels';
 import { RMS_NORM_BINDINGS } from './bindings';
+import { createRMSNormUniform } from './uniforms';
 import { runGpuTest } from './gpu-test';
 
 export async function benchmarkRMSNorm(): Promise<BenchmarkResult[]> {
@@ -23,11 +24,7 @@ export async function benchmarkRMSNorm(): Promise<BenchmarkResult[]> {
     const bufInput = createStorageBuffer(bytes, inputData);
     const bufWeight = createStorageBuffer(bytes, weightData);
     const bufOutput = createStorageBuffer(bytes);
-
-    const uniformData = new ArrayBuffer(8);
-    new Uint32Array(uniformData)[0] = N;
-    new Float32Array(uniformData)[1] = 1e-6;
-    const uBuf = createUniformBuffer(uniformData);
+    const uBuf = createUniformBuffer(createRMSNormUniform(N, 1e-6));
 
     const bindGroup = device.createBindGroup({
       layout: pipeline.getBindGroupLayout(0),

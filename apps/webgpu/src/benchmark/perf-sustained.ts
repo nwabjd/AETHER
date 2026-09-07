@@ -17,6 +17,7 @@ import {
   getDevice,
 } from './engine';
 import { MATMUL } from './kernels';
+import { createMatmulUniform } from './uniforms';
 
 export const SUSTAINED_SECONDS = 30;
 const DISPATCH_CAP = 2000;
@@ -46,7 +47,7 @@ function matmulFixture() {
   const bufA = createStorageBuffer(bytes, a);
   const bufB = createStorageBuffer(bytes, b);
   const bufC = createStorageBuffer(bytes);
-  const uniform = createUniformBuffer(new Float32Array([N, N, N, 1]).buffer as ArrayBuffer);
+  const uniform = createUniformBuffer(createMatmulUniform(N, N, N));
   const pipeline = createPipeline(MATMUL, ['uniform', 'read-only-storage', 'read-only-storage', 'storage']);
   const bg = createBindGroupForPipeline(pipeline, ['uniform', 'read-only-storage', 'read-only-storage', 'storage'], [
     { binding: 0, resource: { buffer: uniform } },

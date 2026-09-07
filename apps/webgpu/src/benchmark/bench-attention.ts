@@ -6,6 +6,7 @@ import {
 } from './engine';
 import { ATTENTION } from './kernels';
 import { ATTENTION_BINDINGS } from './bindings';
+import { createAttentionUniform } from './uniforms';
 import { runGpuTest } from './gpu-test';
 
 export async function benchmarkAttention(): Promise<BenchmarkResult[]> {
@@ -29,13 +30,7 @@ export async function benchmarkAttention(): Promise<BenchmarkResult[]> {
   const bufV = createStorageBuffer(qkvSize * 4, vData);
   const bufOut = createStorageBuffer(qkvSize * 4);
   const bufScores = createStorageBuffer(scoresSize * 4);
-
-  const uniformData = new ArrayBuffer(16);
-  const uv = new Uint32Array(uniformData);
-  const fv = new Float32Array(uniformData);
-  uv[0] = batch; uv[1] = seq; uv[2] = dim;
-  fv[3] = scale;
-  const uBuf = createUniformBuffer(uniformData);
+  const uBuf = createUniformBuffer(createAttentionUniform(batch, seq, dim, scale));
 
   const bindGroup = device.createBindGroup({
     layout: pipeline.getBindGroupLayout(0),

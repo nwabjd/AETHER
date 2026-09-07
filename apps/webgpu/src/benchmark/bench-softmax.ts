@@ -6,6 +6,7 @@ import {
 } from './engine';
 import { SOFTMAX } from './kernels';
 import { SOFTMAX_BINDINGS } from './bindings';
+import { createSoftmaxUniform } from './uniforms';
 import { runGpuTest } from './gpu-test';
 
 export async function benchmarkSoftmax(): Promise<BenchmarkResult[]> {
@@ -25,11 +26,7 @@ export async function benchmarkSoftmax(): Promise<BenchmarkResult[]> {
     const data = new Float32Array(N).map((_, i) => (i % t.cols) * 0.1);
     const bufInput = createStorageBuffer(bytes, data);
     const bufOutput = createStorageBuffer(bytes);
-
-    const uniformData = new ArrayBuffer(8);
-    new Uint32Array(uniformData)[0] = t.rows;
-    new Uint32Array(uniformData)[1] = t.cols;
-    const uBuf = createUniformBuffer(uniformData);
+    const uBuf = createUniformBuffer(createSoftmaxUniform(t.rows, t.cols));
 
     const bindGroup = device.createBindGroup({
       layout: pipeline.getBindGroupLayout(0),

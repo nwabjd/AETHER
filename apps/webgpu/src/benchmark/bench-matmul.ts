@@ -8,6 +8,7 @@ import {
 } from './engine';
 import { MATMUL } from './kernels';
 import { MATMUL_BINDINGS } from './bindings';
+import { createMatmulUniform } from './uniforms';
 
 const SIZES = [128, 256, 512];
 
@@ -47,10 +48,7 @@ export async function benchmarkMatmul(): Promise<BenchmarkResult[]> {
       const bufB = createStorageBuffer(K * N * 4, bData);
       const bufC = createStorageBuffer(M * N * 4);
 
-      const uniformData = new ArrayBuffer(12);
-      const uv = new Uint32Array(uniformData);
-      uv[0] = M; uv[1] = N; uv[2] = K;
-      const uBuf = createUniformBuffer(uniformData);
+      const uBuf = createUniformBuffer(createMatmulUniform(M, N, K));
 
       const bindGroup = device.createBindGroup({
         layout,
