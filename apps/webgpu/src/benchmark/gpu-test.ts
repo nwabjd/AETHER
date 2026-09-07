@@ -13,6 +13,7 @@ import {
   getBindGroupDeviceIdentity,
   isDeviceLost,
 } from './device-identity.ts';
+import { ReadbackManager } from './readback.ts';
 
 export interface GpuTestParams {
   name: string;
@@ -143,22 +144,17 @@ export async function runGpuTest(device: GPUDevice, params: GpuTestParams): Prom
   let stage = 'encode';
 
   try {
-    const staging = device.createBuffer({
-      size: params.outputBytes,
-      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-    });
+    const readbackMgr = ReadbackManager.getInstance();
+    const staging = readbackMgr.acquire(device, params.outputBytes);
 
     // Single command buffer, single submit: compute pass + copy to staging.
     stage = 'encode';
-    const encoder = device.createCommandEncoder();
+    const encoder = device.createCommandEncoder({ label: `Enc_${params.name}` });
     const pass = encoder.beginComputePass();
 
     stage = 'set-pipeline';
     pass.setPipeline(params.pipeline);
 
-    // TASK 7 — bind group identity. If we tracked it, it must match the
-    // execution device; if we can't determine it, continue but warn — do not
-    // fabricate an identity.
     if (bindGroupDeviceId !== null && bindGroupDeviceId !== executionDeviceId) {
       // Pop scopes to keep the stack balanced before returning.
       await popScopesSafe(device, pushed);
@@ -189,13 +185,8 @@ export async function runGpuTest(device: GPUDevice, params: GpuTestParams): Prom
     encoder.copyBufferToBuffer(params.outputBuffer, 0, staging, 0, params.outputBytes);
     device.queue.submit([encoder.finish()]);
 
-    // mapAsync waits for all prior submitted work; does not depend on the
-    // flaky onSubmittedWorkDone() API on iOS Safari.
     stage = 'readback';
-    await withTimeout(staging.mapAsync(GPUMapMode.READ), 15000);
-    const data = new Float32Array(staging.getMappedRange().slice(0));
-    staging.unmap();
-    staging.destroy();
+    const data = await readbackMgr.readSubmittedCopy(device, staging, params.outputBytes, params.name);
 
     const gpuError = await popScopesSafe(device, pushed);
     if (gpuError) {

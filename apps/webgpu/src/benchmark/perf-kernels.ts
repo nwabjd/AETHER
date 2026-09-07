@@ -19,6 +19,7 @@ import {
   readbackBuffer,
   getDevice,
 } from './engine';
+import { ReadbackManager } from './readback.ts';
 import {
   createMatmulUniform,
   createVecAddUniform,
@@ -114,28 +115,37 @@ function assertValid(kernel: string, size: string, data: Float32Array, ref: Floa
   }
 }
 
-/** Encode+submit one dispatch, then copy to staging + map so the wait is real. */
-async function dispatchTo(
+/** Encode+submit compute pass + copyBufferToBuffer in ONE encoder, then mapAsync via ReadbackManager. */
+async function dispatchToAndRead(
   pipeline: GPUComputePipeline,
   bg: GPUBindGroup,
   wg: [number, number, number],
-  out: GPUBuffer,
-  bytes: number
-): Promise<void> {
+  outBuffer: GPUBuffer,
+  bytes: number,
+  contextInfo = 'dispatchToAndRead'
+): Promise<Float32Array> {
   const device = getDevice();
-  const enc = device.createCommandEncoder();
+  const readbackMgr = ReadbackManager.getInstance();
+  const staging = readbackMgr.acquire(device, bytes);
+
+  const enc = device.createCommandEncoder({ label: `Enc_${contextInfo}` });
   const pass = enc.beginComputePass();
   pass.setPipeline(pipeline);
   pass.setBindGroup(0, bg);
   pass.dispatchWorkgroups(wg[0], wg[1], wg[2]);
   pass.end();
+  enc.copyBufferToBuffer(outBuffer, 0, staging, 0, bytes);
   device.queue.submit([enc.finish()]);
-  await readbackBuffer(out, bytes);
+
+  return readbackMgr.readSubmittedCopy(device, staging, bytes, contextInfo);
 }
 
-/** END_TO_END completion wait used when timestamps are unavailable. */
-function waitFor(out: GPUBuffer, bytes: number): () => Promise<void> {
-  return () => readbackBuffer(out, bytes).then(() => undefined);
+/** END_TO_END completion wait using ReadbackManager. */
+function waitFor(outBuffer: GPUBuffer, bytes: number, contextInfo = 'waitFor'): () => Promise<void> {
+  return async () => {
+    const device = getDevice();
+    await ReadbackManager.getInstance().copyAndRead(device, outBuffer, bytes, contextInfo);
+  };
 }
 
 function fillDeterministic(data: Float32Array): void {
@@ -192,24 +202,30 @@ export async function benchMatmul(tm: TimingManager, subset?: ReadonlySet<string
     ]);
     const wg: [number, number, number] = [n / 16, n / 16, 1];
 
-    await dispatchTo(pipeline, bg, wg, bufC, bytes);
-    const got = await readbackBuffer(bufC, bytes);
-    if (conf.validate) {
-      const ref = cpuMatmul(a, b, n, n, n);
-      assertValid('matmul', `${n}×${n}`, got, ref, 1e-2);
-    } else if (!allFinite(got)) {
-      throw fail('matmul', `${n}×${n}`, 'non-finite output', '');
-    }
+    try {
+      const got = await dispatchToAndRead(pipeline, bg, wg, bufC, bytes, `matmul-${n}`);
+      if (conf.validate) {
+        const ref = cpuMatmul(a, b, n, n, n);
+        assertValid('matmul', `${n}×${n}`, got, ref, 1e-2);
+      } else if (!allFinite(got)) {
+        throw fail('matmul', `${n}×${n}`, 'non-finite output', '');
+      }
 
-    const stats = await tm.measure(
-      (pass) => {
-        pass.setPipeline(pipeline);
-        pass.setBindGroup(0, bg);
-        pass.dispatchWorkgroups(wg[0], wg[1], wg[2]);
-      },
-      { iterations: conf.iterations, wait: waitFor(bufC, bytes) }
-    );
-    out.push(sample(`matmul-${n}`, 'Matrix Multiply', `${n}×${n}`, stats, gflops(2 * n * n * n, stats.medianMs)));
+      const stats = await tm.measure(
+        (pass) => {
+          pass.setPipeline(pipeline);
+          pass.setBindGroup(0, bg);
+          pass.dispatchWorkgroups(wg[0], wg[1], wg[2]);
+        },
+        { iterations: conf.iterations, wait: waitFor(bufC, bytes, `matmul-${n}`) }
+      );
+      out.push(sample(`matmul-${n}`, 'Matrix Multiply', `${n}×${n}`, stats, gflops(2 * n * n * n, stats.medianMs)));
+    } finally {
+      bufA.destroy();
+      bufB.destroy();
+      bufC.destroy();
+      uniform.destroy();
+    }
   }
   return out;
 }
@@ -250,22 +266,28 @@ export async function benchVecAdd(tm: TimingManager, subset?: ReadonlySet<string
     const count = Math.ceil(n / 64);
     const wg: [number, number, number] = [count, 1, 1];
 
-    await dispatchTo(pipeline, bg, wg, bufC, bytes);
-    const got = await readbackBuffer(bufC, bytes);
-    const ref = cpuVecAdd(a, b);
-    assertValid('vecadd', `${n.toLocaleString('en-US')} elements`, got, ref, 1e-2);
+    try {
+      const got = await dispatchToAndRead(pipeline, bg, wg, bufC, bytes, `vecadd-${n}`);
+      const ref = cpuVecAdd(a, b);
+      assertValid('vecadd', `${n.toLocaleString('en-US')} elements`, got, ref, 1e-2);
 
-    const stats = await tm.measure(
-      (pass) => {
-        pass.setPipeline(pipeline);
-        pass.setBindGroup(0, bg);
-        pass.dispatchWorkgroups(wg[0], wg[1], wg[2]);
-      },
-      { iterations: conf.iterations, wait: waitFor(bufC, bytes) }
-    );
-    out.push(
-      sample(`vecadd-${n}`, 'Vector Add', `${n.toLocaleString('en-US')} elements`, stats, gbytes(3 * n * 4, stats.medianMs))
-    );
+      const stats = await tm.measure(
+        (pass) => {
+          pass.setPipeline(pipeline);
+          pass.setBindGroup(0, bg);
+          pass.dispatchWorkgroups(wg[0], wg[1], wg[2]);
+        },
+        { iterations: conf.iterations, wait: waitFor(bufC, bytes, `vecadd-${n}`) }
+      );
+      out.push(
+        sample(`vecadd-${n}`, 'Vector Add', `${n.toLocaleString('en-US')} elements`, stats, gbytes(3 * n * 4, stats.medianMs))
+      );
+    } finally {
+      bufA.destroy();
+      bufB.destroy();
+      bufC.destroy();
+      uniform.destroy();
+    }
   }
   return out;
 }
@@ -290,6 +312,7 @@ export async function benchConv2D(tm: TimingManager, subset?: ReadonlySet<string
     const FW = 3;
     const OH = H - FH + 1;
     const OW = W - FW + 1;
+    const outBytes = F * OH * OW * 4;
 
     const input = new Float32Array(C * H * W);
     const kernel = new Float32Array(F * C * FH * FW);
@@ -298,7 +321,7 @@ export async function benchConv2D(tm: TimingManager, subset?: ReadonlySet<string
 
     const bufIn = createStorageBuffer(C * H * W * 4, input);
     const bufK = createStorageBuffer(F * C * FH * FW * 4, kernel);
-    const bufOut = createStorageBuffer(F * OH * OW * 4);
+    const bufOut = createStorageBuffer(outBytes);
     const uniform = createUniformBuffer(createConv2DUniform(1, C, H, W, F, FH, FW, OH, OW));
     const pipeline = createPipeline(CONV2D, ['uniform', 'read-only-storage', 'read-only-storage', 'storage']);
     const bg = createBindGroupForPipeline(pipeline, ['uniform', 'read-only-storage', 'read-only-storage', 'storage'], [
@@ -310,20 +333,26 @@ export async function benchConv2D(tm: TimingManager, subset?: ReadonlySet<string
     const z = OH * OW;
     const wg: [number, number, number] = [1, F, z];
 
-    await dispatchTo(pipeline, bg, wg, bufOut, F * OH * OW * 4);
-    const got = await readbackBuffer(bufOut, F * OH * OW * 4);
-    const ref = cpuConv2D(input, kernel, 1, C, H, W, F, FH, FW);
-    assertValid('conv2d', `${C}×${H}×${W} → ${F}×${OH}×${OW}`, got, ref, 1e-3);
+    try {
+      const got = await dispatchToAndRead(pipeline, bg, wg, bufOut, outBytes, `conv2d-${C}-${F}-${H}`);
+      const ref = cpuConv2D(input, kernel, 1, C, H, W, F, FH, FW);
+      assertValid('conv2d', `${C}×${H}×${W} → ${F}×${OH}×${OW}`, got, ref, 1e-3);
 
-    const stats = await tm.measure(
-      (pass) => {
-        pass.setPipeline(pipeline);
-        pass.setBindGroup(0, bg);
-        pass.dispatchWorkgroups(wg[0], wg[1], wg[2]);
-      },
-      { iterations: conf.iterations, wait: waitFor(bufOut, F * OH * OW * 4) }
-    );
-    out.push(sample(`conv2d-${C}-${F}-${H}`, 'Convolution 3×3', `${C}→${F} ch, ${H}×${W} → ${OH}×${OW}`, stats));
+      const stats = await tm.measure(
+        (pass) => {
+          pass.setPipeline(pipeline);
+          pass.setBindGroup(0, bg);
+          pass.dispatchWorkgroups(wg[0], wg[1], wg[2]);
+        },
+        { iterations: conf.iterations, wait: waitFor(bufOut, outBytes, `conv2d-${C}-${F}-${H}`) }
+      );
+      out.push(sample(`conv2d-${C}-${F}-${H}`, 'Convolution 3×3', `${C}→${F} ch, ${H}×${W} → ${OH}×${OW}`, stats));
+    } finally {
+      bufIn.destroy();
+      bufK.destroy();
+      bufOut.destroy();
+      uniform.destroy();
+    }
   }
   return out;
 }
@@ -343,9 +372,10 @@ export async function benchSoftmax(tm: TimingManager, subset?: ReadonlySet<strin
     if (subset && !subset.has(`softmax-${rows}`)) continue;
     const data = new Float32Array(rows * cols);
     fillDeterministic(data);
+    const bytes = rows * cols * 4;
 
-    const bufIn = createStorageBuffer(rows * cols * 4, data);
-    const bufOut = createStorageBuffer(rows * cols * 4);
+    const bufIn = createStorageBuffer(bytes, data);
+    const bufOut = createStorageBuffer(bytes);
     const uniform = createUniformBuffer(createSoftmaxUniform(rows, cols));
     const pipeline = createPipeline(SOFTMAX, ['uniform', 'read-only-storage', 'storage']);
     const bg = createBindGroupForPipeline(pipeline, ['uniform', 'read-only-storage', 'storage'], [
@@ -355,20 +385,25 @@ export async function benchSoftmax(tm: TimingManager, subset?: ReadonlySet<strin
     ]);
     const wg: [number, number, number] = [rows, 1, 1];
 
-    await dispatchTo(pipeline, bg, wg, bufOut, rows * cols * 4);
-    const got = await readbackBuffer(bufOut, rows * cols * 4);
-    const ref = cpuSoftmax(data, rows, cols);
-    assertValid('softmax', `${rows}×${cols}`, got, ref, 1e-3);
+    try {
+      const got = await dispatchToAndRead(pipeline, bg, wg, bufOut, bytes, `softmax-${rows}`);
+      const ref = cpuSoftmax(data, rows, cols);
+      assertValid('softmax', `${rows}×${cols}`, got, ref, 1e-3);
 
-    const stats = await tm.measure(
-      (pass) => {
-        pass.setPipeline(pipeline);
-        pass.setBindGroup(0, bg);
-        pass.dispatchWorkgroups(wg[0], wg[1], wg[2]);
-      },
-      { iterations, wait: waitFor(bufOut, rows * cols * 4) }
-    );
-    out.push(sample(`softmax-${rows}`, 'Softmax', `${rows}×${cols}`, stats));
+      const stats = await tm.measure(
+        (pass) => {
+          pass.setPipeline(pipeline);
+          pass.setBindGroup(0, bg);
+          pass.dispatchWorkgroups(wg[0], wg[1], wg[2]);
+        },
+        { iterations, wait: waitFor(bufOut, bytes, `softmax-${rows}`) }
+      );
+      out.push(sample(`softmax-${rows}`, 'Softmax', `${rows}×${cols}`, stats));
+    } finally {
+      bufIn.destroy();
+      bufOut.destroy();
+      uniform.destroy();
+    }
   }
   return out;
 }
@@ -393,10 +428,11 @@ export async function benchRMSNorm(tm: TimingManager, subset?: ReadonlySet<strin
     const weight = new Float32Array(size);
     for (let i = 0; i < size; i++) weight[i] = 1 + (i % 7) * 0.01;
     const eps = 1e-6;
+    const bytes = size * 4;
 
-    const bufIn = createStorageBuffer(size * 4, data);
-    const bufW = createStorageBuffer(size * 4, weight);
-    const bufOut = createStorageBuffer(size * 4);
+    const bufIn = createStorageBuffer(bytes, data);
+    const bufW = createStorageBuffer(bytes, weight);
+    const bufOut = createStorageBuffer(bytes);
     const uniform = createUniformBuffer(createRMSNormUniform(size, eps));
     const pipeline = createPipeline(RMS_NORM, ['uniform', 'read-only-storage', 'read-only-storage', 'storage']);
     const bg = createBindGroupForPipeline(pipeline, ['uniform', 'read-only-storage', 'read-only-storage', 'storage'], [
@@ -407,20 +443,26 @@ export async function benchRMSNorm(tm: TimingManager, subset?: ReadonlySet<strin
     ]);
     const wg: [number, number, number] = [1, 1, 1];
 
-    await dispatchTo(pipeline, bg, wg, bufOut, size * 4);
-    const got = await readbackBuffer(bufOut, size * 4);
-    const ref = cpuRMSNorm(data, weight, eps);
-    assertValid('rmsnorm', String(size), got, ref, 1e-3);
+    try {
+      const got = await dispatchToAndRead(pipeline, bg, wg, bufOut, bytes, `rmsnorm-${size}`);
+      const ref = cpuRMSNorm(data, weight, eps);
+      assertValid('rmsnorm', String(size), got, ref, 1e-3);
 
-    const stats = await tm.measure(
-      (pass) => {
-        pass.setPipeline(pipeline);
-        pass.setBindGroup(0, bg);
-        pass.dispatchWorkgroups(wg[0], wg[1], wg[2]);
-      },
-      { iterations, wait: waitFor(bufOut, size * 4) }
-    );
-    out.push(sample(`rmsnorm-${size}`, 'RMSNorm', String(size), stats));
+      const stats = await tm.measure(
+        (pass) => {
+          pass.setPipeline(pipeline);
+          pass.setBindGroup(0, bg);
+          pass.dispatchWorkgroups(wg[0], wg[1], wg[2]);
+        },
+        { iterations, wait: waitFor(bufOut, bytes, `rmsnorm-${size}`) }
+      );
+      out.push(sample(`rmsnorm-${size}`, 'RMSNorm', String(size), stats));
+    } finally {
+      bufIn.destroy();
+      bufW.destroy();
+      bufOut.destroy();
+      uniform.destroy();
+    }
   }
   return out;
 }
@@ -511,28 +553,38 @@ export async function benchAttention(tm: TimingManager, seqs?: number[]): Promis
       continue;
     }
 
-    // monolithic validation vs CPU reference
-    await dispatchTo(ctx.pipelines.total, ctx.groups.total, [batch, 1, 1], ctx.bufs.out, seq * dim * 4);
-    const got = await readbackBuffer(ctx.bufs.out, seq * dim * 4);
-    if (conf.validate) {
-      assertValid('attention', `seq=${seq}`, got, ctx.ref.out, 1e-2);
-    } else if (!allFinite(got)) {
-      throw fail('attention', `seq=${seq}`, 'non-finite output', '');
+    try {
+      // monolithic validation vs CPU reference
+      const got = await dispatchToAndRead(ctx.pipelines.total, ctx.groups.total, [batch, 1, 1], ctx.bufs.out, seq * dim * 4, `attention-${seq}`);
+      if (conf.validate) {
+        assertValid('attention', `seq=${seq}`, got, ctx.ref.out, 1e-2);
+      } else if (!allFinite(got)) {
+        throw fail('attention', `seq=${seq}`, 'non-finite output', '');
+      }
+
+      const total = await tm.measure(
+        (pass) => {
+          pass.setPipeline(ctx.pipelines.total);
+          pass.setBindGroup(0, ctx.groups.total);
+          pass.dispatchWorkgroups(batch, 1, 1);
+        },
+        { iterations, wait: waitFor(ctx.bufs.out, seq * dim * 4, `attention-${seq}`) }
+      );
+      main.push(
+        sample(`attention-${seq}`, 'Attention (single pass)', `seq=${seq} dim=64 batch=1`, total, gflops(4 * seq * seq * dim, total.medianMs), 'QK^T + softmax + PV in one pass')
+      );
+
+      phases[`seq=${seq}`] = await measureAttentionPhases(tm, ctx, seq, dim, iterations);
+    } finally {
+      try {
+        ctx.bufs.q.destroy();
+        ctx.bufs.k.destroy();
+        ctx.bufs.v.destroy();
+        ctx.bufs.out.destroy();
+        ctx.bufs.scores.destroy();
+        ctx.bufs.probs.destroy();
+      } catch {}
     }
-
-    const total = await tm.measure(
-      (pass) => {
-        pass.setPipeline(ctx.pipelines.total);
-        pass.setBindGroup(0, ctx.groups.total);
-        pass.dispatchWorkgroups(batch, 1, 1);
-      },
-      { iterations, wait: waitFor(ctx.bufs.out, seq * dim * 4) }
-    );
-    main.push(
-      sample(`attention-${seq}`, 'Attention (single pass)', `seq=${seq} dim=64 batch=1`, total, gflops(4 * seq * seq * dim, total.medianMs), 'QK^T + softmax + PV in one pass')
-    );
-
-    phases[`seq=${seq}`] = await measureAttentionPhases(tm, ctx, seq, dim, iterations);
   }
   return { main, phases };
 }
@@ -551,23 +603,22 @@ async function measureAttentionPhases(
 
   // warmup the phase composition path (qkt → softmax → pv)
   for (let i = 0; i < 3; i++) {
-    await dispatchTo(ctx.pipelines.qkt, ctx.groups.qkt, wgQ, ctx.bufs.scores, scoresBytes);
-    await dispatchTo(ctx.pipelines.soft, ctx.groups.soft, [seq, 1, 1], ctx.bufs.probs, scoresBytes);
-    await dispatchTo(ctx.pipelines.pv, ctx.groups.pv, wgP, ctx.bufs.out, outBytes);
+    await dispatchToAndRead(ctx.pipelines.qkt, ctx.groups.qkt, wgQ, ctx.bufs.scores, scoresBytes, 'warmup-qkt');
+    await dispatchToAndRead(ctx.pipelines.soft, ctx.groups.soft, [seq, 1, 1], ctx.bufs.probs, scoresBytes, 'warmup-soft');
+    await dispatchToAndRead(ctx.pipelines.pv, ctx.groups.pv, wgP, ctx.bufs.out, outBytes, 'warmup-pv');
   }
 
   const out: PerfSample[] = [];
 
   // QK^T — measure the score computation alone; validate against ref.scores.
   {
-    await dispatchTo(ctx.pipelines.qkt, ctx.groups.qkt, wgQ, ctx.bufs.scores, scoresBytes);
-    const s = await readbackBuffer(ctx.bufs.scores, scoresBytes);
+    const s = await dispatchToAndRead(ctx.pipelines.qkt, ctx.groups.qkt, wgQ, ctx.bufs.scores, scoresBytes, `qkt-${seq}`);
     if (maxAbsDiff(s, ctx.ref.scores) > 1e-2) throw fail('attention.qkt', `seq=${seq}`, 'phase correctness check failed', `maxErr=${maxAbsDiff(s, ctx.ref.scores).toExponential(2)}`);
     const times: number[] = [];
     for (let i = 0; i < iterations; i++) {
       times.push(await tm.timeOne(
         (pass) => { pass.setPipeline(ctx.pipelines.qkt); pass.setBindGroup(0, ctx.groups.qkt); pass.dispatchWorkgroups(wgQ[0], wgQ[1], wgQ[2]); },
-        waitFor(ctx.bufs.scores, scoresBytes)
+        waitFor(ctx.bufs.scores, scoresBytes, `qkt-${seq}`)
       ));
     }
     out.push(sample(`attention-qkt-${seq}`, 'QK^T (scores)', `seq=${seq} dim=64`, statsOfTimes(times, tm.mode), gflops(2 * seq * seq * dim, medianOf(times))));
@@ -577,13 +628,13 @@ async function measureAttentionPhases(
   {
     const times: number[] = [];
     for (let i = 0; i < iterations; i++) {
-      await dispatchTo(ctx.pipelines.qkt, ctx.groups.qkt, wgQ, ctx.bufs.scores, scoresBytes); // fresh raw scores
+      await dispatchToAndRead(ctx.pipelines.qkt, ctx.groups.qkt, wgQ, ctx.bufs.scores, scoresBytes, `soft-prep-${seq}`);
       times.push(await tm.timeOne(
         (pass) => { pass.setPipeline(ctx.pipelines.soft); pass.setBindGroup(0, ctx.groups.soft); pass.dispatchWorkgroups(seq, 1, 1); },
-        waitFor(ctx.bufs.probs, scoresBytes)
+        waitFor(ctx.bufs.probs, scoresBytes, `soft-${seq}`)
       ));
     }
-    const p = await readbackBuffer(ctx.bufs.probs, scoresBytes);
+    const p = await ReadbackManager.getInstance().copyAndRead(getDevice(), ctx.bufs.probs, scoresBytes, `soft-val-${seq}`);
     if (maxAbsDiff(p, ctx.ref.probs) > 1e-2) throw fail('attention.softmax', `seq=${seq}`, 'phase correctness check failed', `maxErr=${maxAbsDiff(p, ctx.ref.probs).toExponential(2)}`);
     out.push(sample(`attention-softmax-${seq}`, 'Softmax on scores', `seq=${seq} rows=${seq}`, statsOfTimes(times, tm.mode)));
   }
@@ -592,14 +643,14 @@ async function measureAttentionPhases(
   {
     const times: number[] = [];
     for (let i = 0; i < iterations; i++) {
-      await dispatchTo(ctx.pipelines.qkt, ctx.groups.qkt, wgQ, ctx.bufs.scores, scoresBytes);
-      await dispatchTo(ctx.pipelines.soft, ctx.groups.soft, [seq, 1, 1], ctx.bufs.probs, scoresBytes);
+      await dispatchToAndRead(ctx.pipelines.qkt, ctx.groups.qkt, wgQ, ctx.bufs.scores, scoresBytes, `pv-prep1-${seq}`);
+      await dispatchToAndRead(ctx.pipelines.soft, ctx.groups.soft, [seq, 1, 1], ctx.bufs.probs, scoresBytes, `pv-prep2-${seq}`);
       times.push(await tm.timeOne(
         (pass) => { pass.setPipeline(ctx.pipelines.pv); pass.setBindGroup(0, ctx.groups.pv); pass.dispatchWorkgroups(wgP[0], wgP[1], wgP[2]); },
-        waitFor(ctx.bufs.out, outBytes)
+        waitFor(ctx.bufs.out, outBytes, `pv-${seq}`)
       ));
     }
-    const o = await readbackBuffer(ctx.bufs.out, outBytes);
+    const o = await ReadbackManager.getInstance().copyAndRead(getDevice(), ctx.bufs.out, outBytes, `pv-val-${seq}`);
     if (maxAbsDiff(o, ctx.ref.out) > 1e-2) throw fail('attention.pv', `seq=${seq}`, 'phase correctness check failed', `maxErr=${maxAbsDiff(o, ctx.ref.out).toExponential(2)}`);
     out.push(sample(`attention-pv-${seq}`, 'Softmax × V', `seq=${seq} dim=64`, statsOfTimes(times, tm.mode), gflops(2 * seq * seq * dim, medianOf(times))));
   }

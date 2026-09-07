@@ -7,6 +7,10 @@
 // (submit → wait for completion) and is NEVER labelled "GPU execution time".
 // A single report never mixes the two modes; each sample carries its mode.
 
+import { ReadbackManager } from './readback.ts';
+
+export const AETHER_DISABLE_TIMESTAMPS = true;
+
 export type TimingMode = 'GPU_TIMESTAMP' | 'END_TO_END';
 
 export interface TimingStats {
@@ -78,6 +82,7 @@ export class TimingManager {
   }
 
   private tryEnableTimestamps(device: GPUDevice): boolean {
+    if (AETHER_DISABLE_TIMESTAMPS) return false;
     try {
       if (!device.features || typeof device.features.has !== 'function') return false;
       if (!device.features.has('timestamp-query')) return false;
@@ -185,19 +190,9 @@ export class TimingManager {
       encoder.resolveQuerySet(this._querySet, 0, 2, this._resolve, 0);
       this.device.queue.submit([encoder.finish()]);
 
-      const staging = this.device.createBuffer({
-        size: 16,
-        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-      });
-      const copy = this.device.createCommandEncoder();
-      copy.copyBufferToBuffer(this._resolve, 0, staging, 0, 16);
-      this.device.queue.submit([copy.finish()]);
-
-      await staging.mapAsync(GPUMapMode.READ);
-      const ts = new BigUint64Array(staging.getMappedRange());
+      const res = await ReadbackManager.getInstance().copyAndRead(this.device, this._resolve, 16, 'measureTimestampPass');
+      const ts = new BigUint64Array(res.buffer);
       const delta = Number(ts[1] - ts[0]);
-      staging.unmap();
-      staging.destroy();
       if (!(delta > 0)) return null;
       return (delta * this._periodNs) / 1e6;
     } catch {
@@ -220,9 +215,11 @@ export class TimingManager {
   /** Wait for all previously submitted work to finish (completion sync). */
   private async sync(): Promise<void> {
     try {
-      await this.device.queue.onSubmittedWorkDone();
+      const dummy = this.device.createBuffer({ size: 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+      await ReadbackManager.getInstance().copyAndRead(this.device, dummy, 4, 'sync');
+      dummy.destroy();
     } catch {
-      // iOS Safari may reject onSubmittedWorkDone; fall back to a bounded wait.
+      // Bounded wait if sync readback fails
       await new Promise((r) => setTimeout(r, 16));
     }
   }

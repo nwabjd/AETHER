@@ -232,17 +232,11 @@ export function createReadBuffer(size: number): GPUBuffer {
   });
 }
 
-export async function readbackBuffer(src: GPUBuffer, size: number): Promise<Float32Array> {
+import { ReadbackManager } from './readback.ts';
+
+export async function readbackBuffer(src: GPUBuffer, size: number, contextInfo = 'readbackBuffer'): Promise<Float32Array> {
   const device = getDevice();
-  const staging = createReadBuffer(size);
-  const encoder = device.createCommandEncoder();
-  encoder.copyBufferToBuffer(src, 0, staging, 0, size);
-  device.queue.submit([encoder.finish()]);
-  await staging.mapAsync(GPUMapMode.READ);
-  const data = new Float32Array(staging.getMappedRange().slice(0));
-  staging.unmap();
-  staging.destroy();
-  return data;
+  return ReadbackManager.getInstance().copyAndRead(device, src, size, contextInfo);
 }
 
 export interface PipelineDiagnostics {

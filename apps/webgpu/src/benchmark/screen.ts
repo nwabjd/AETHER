@@ -6,7 +6,7 @@
 // error message, and the footer shows build ID + commit + build time so a
 // stale Safari cache is immediately obvious.
 
-import { initBenchmark, getDevice, getDeviceLostInfo, hasDeviceLost, type DeviceDiagnostics } from './engine';
+import { initBenchmark, getDevice, getDeviceLostInfo, hasDeviceLost, createStorageBuffer, type DeviceDiagnostics } from './engine';
 import {
   runAllTests,
   testMatmul,
@@ -20,6 +20,7 @@ import {
 import { runGpuSanity } from './sanity';
 import { runStandaloneMatmul } from './standalone-matmul';
 import { runSharedDeviceDirectMatmul, runMinimalHarnessMatmul } from './harness-matmul';
+import { ReadbackManager } from './readback.ts';
 import { AETHER_BUILD_ID, AETHER_COMMIT, AETHER_BUILD_TIME } from '../build-info';
 import { runPerfSuite, isSuiteRunning, type PerfMode } from './perf-suite';
 import {
@@ -424,6 +425,151 @@ async function runMinimalHarnessHandler(size: 64 | 128, cardId: string) {
   } catch (e) {
     log(`ERROR: ${(e as Error).message}`, 'err');
     if (hasDeviceLost()) stopDeviceLost();
+  } finally {
+    _running = false;
+  }
+}
+
+// ─── READBACK ENGINE DIAGNOSTICS & TESTS (TASK 13, 14, 20) ───────────────────
+
+function updateReadbackEngineCard() {
+  const container = document.getElementById('res-readback-engine');
+  if (!container) return;
+  const mgr = ReadbackManager.getInstance();
+  const diag = mgr.getDiagnostics(hasDeviceLost());
+  container.innerHTML = `
+    <div class="card" style="border-color:var(--border);margin-top:12px">
+      <div class="card-header">
+        <span class="card-title">READBACK ENGINE</span>
+        <span class="badge ${diag.lastStatus === 'PASS' ? 'badge-ok' : diag.lastStatus === 'FAIL' ? 'badge-err' : 'badge-info'}">${diag.lastStatus}</span>
+      </div>
+      <div style="font-size:12px;font-family:var(--mono);color:var(--text-dim);margin-top:8px;display:grid;grid-template-columns:1fr 1fr;gap:6px">
+        <div>Staging buffer: <b style="color:var(--text)">${diag.stagingSize} B</b></div>
+        <div>Mapped: <b style="color:var(--text)">${diag.isMapped ? 'YES' : 'NO'}</b></div>
+        <div>Pending readback: <b style="color:var(--text)">${diag.isPending ? 'YES' : 'NO'}</b></div>
+        <div>Queue depth: <b style="color:var(--text)">${diag.queueDepth}</b></div>
+        <div>Last mapAsync: <b style="color:var(--text)">${diag.lastStatus}</b></div>
+        <div>Device lost: <b style="color:var(--text)">${diag.deviceLost ? 'YES' : 'NO'}</b></div>
+      </div>
+      ${diag.lastError ? `<div style="font-size:11px;font-family:var(--mono);color:var(--err);margin-top:6px">Last error: ${diag.lastError}</div>` : ''}
+    </div>
+  `;
+}
+
+async function runReadbackTestHandler() {
+  if (_running) return;
+  _running = true;
+  try {
+    await initBenchmark();
+    installListeners();
+    log('═══ RUN READBACK TEST (4 B → 1 MB) ═══', 'info');
+    const device = getDevice();
+    const sizes = [
+      { name: '4 B', bytes: 4 },
+      { name: '16 B', bytes: 16 },
+      { name: '64 B', bytes: 64 },
+      { name: '1 KB', bytes: 1024 },
+      { name: '64 KB', bytes: 65536 },
+      { name: '256 KB', bytes: 262144 },
+      { name: '1 MB', bytes: 1048576 },
+    ];
+    const results: Array<{ name: string; pass: boolean; err?: string }> = [];
+
+    for (const { name, bytes } of sizes) {
+      try {
+        const fill = new Float32Array(bytes / 4).fill(123.0);
+        const buf = createStorageBuffer(bytes, fill);
+        const read = await ReadbackManager.getInstance().copyAndRead(device, buf, bytes, `Test_${name}`);
+        buf.destroy();
+
+        let pass = read.length === bytes / 4;
+        if (pass && read.length > 0) {
+          pass = Math.abs(read[0] - 123.0) < 1e-3;
+        }
+        results.push({ name, pass });
+        log(`  ${name.padEnd(8)}: ${pass ? 'PASS' : 'FAIL'}`, pass ? 'ok' : 'err');
+      } catch (e) {
+        const errMsg = (e as Error).message;
+        results.push({ name, pass: false, err: errMsg });
+        log(`  ${name.padEnd(8)}: FAIL — ${errMsg}`, 'err');
+        break; // stop on first failure per TASK 13
+      }
+    }
+
+    const allPass = results.length === sizes.length && results.every((r) => r.pass);
+    renderResultCard('res-readback-test', {
+      title: 'READBACK DIAGNOSTIC (4B → 1MB)',
+      pass: allPass,
+      stage: allPass ? 'complete' : 'readback-test',
+      errorType: null,
+      errorMessage: allPass ? null : results.find((r) => !r.pass)?.err ?? 'Readback size test failed',
+      notes: results.map((r) => `${r.name}: ${r.pass ? 'PASS' : 'FAIL'}${r.err ? ` (${r.err})` : ''}`),
+    });
+    updateReadbackEngineCard();
+  } catch (e) {
+    log(`ERROR: ${(e as Error).message}`, 'err');
+  } finally {
+    _running = false;
+  }
+}
+
+async function runReadbackStressHandler() {
+  if (_running) return;
+  _running = true;
+  try {
+    await initBenchmark();
+    installListeners();
+    log('═══ RUN READBACK STRESS (100 iterations) ═══', 'info');
+    const device = getDevice();
+    const bytes = 64; // 16 floats
+    let totalReads = 0;
+    let failedReads = 0;
+    let firstFailIter: number | null = null;
+    let firstFailErr: string | null = null;
+
+    const fill = new Float32Array(bytes / 4).fill(42.0);
+    const buf = createStorageBuffer(bytes, fill);
+
+    try {
+      for (let i = 1; i <= 100; i++) {
+        try {
+          const read = await ReadbackManager.getInstance().copyAndRead(device, buf, bytes, `Stress_${i}`);
+          if (read.length !== 16 || Math.abs(read[0] - 42.0) >= 1e-3) {
+            throw new Error(`Data mismatch at iteration ${i}: got ${read[0]}`);
+          }
+          totalReads++;
+        } catch (e) {
+          failedReads++;
+          if (firstFailIter === null) {
+            firstFailIter = i;
+            firstFailErr = (e as Error).message;
+          }
+          break; // Stop immediately on first MAP_READ failure per TASK 16
+        }
+      }
+    } finally {
+      buf.destroy();
+    }
+
+    const pass = failedReads === 0 && totalReads === 100;
+    renderResultCard('res-readback-stress', {
+      title: 'READBACK STRESS (100 Iterations)',
+      pass,
+      stage: pass ? 'complete' : `iter-${firstFailIter}`,
+      errorType: null,
+      errorMessage: firstFailErr,
+      notes: [
+        `Successful reads: ${totalReads}/100`,
+        `Failed reads: ${failedReads}`,
+        `First failure iter: ${firstFailIter ?? 'None'}`,
+        `Device lost: ${hasDeviceLost() ? 'YES' : 'NO'}`,
+      ],
+    });
+    log(`READBACK STRESS: ${pass ? 'PASS' : 'FAIL'} (${totalReads}/100 reads succeeded)`, pass ? 'ok' : 'err');
+    if (firstFailErr) log(`  First failure at iter ${firstFailIter}: ${firstFailErr}`, 'err');
+    updateReadbackEngineCard();
+  } catch (e) {
+    log(`ERROR: ${(e as Error).message}`, 'err');
   } finally {
     _running = false;
   }
@@ -917,10 +1063,15 @@ export function render(el: HTMLElement) {
     <div class="btn-row" style="margin-top:12px">
       <button class="btn btn-outline" id="btn-minimal-64">RUN MINIMAL HARNESS MATMUL 64×64</button>
       <button class="btn btn-outline" id="btn-minimal-128">RUN MINIMAL HARNESS MATMUL 128×128</button>
+      <button class="btn btn-outline" id="btn-readback-test">RUN READBACK TEST (4B → 1MB)</button>
+      <button class="btn btn-outline" id="btn-readback-stress">RUN READBACK STRESS</button>
     </div>
 
     <div id="res-minimal-64"></div>
     <div id="res-minimal-128"></div>
+    <div id="res-readback-test"></div>
+    <div id="res-readback-stress"></div>
+    <div id="res-readback-engine"></div>
 
     <div id="validation-panel"></div>
     <div id="report-panel"></div>
@@ -943,6 +1094,8 @@ export function render(el: HTMLElement) {
   el.querySelector('#btn-direct')?.addEventListener('click', runSharedDeviceDirectMatmulHandler);
   el.querySelector('#btn-minimal-64')?.addEventListener('click', () => runMinimalHarnessHandler(64, 'res-minimal-64'));
   el.querySelector('#btn-minimal-128')?.addEventListener('click', () => runMinimalHarnessHandler(128, 'res-minimal-128'));
+  el.querySelector('#btn-readback-test')?.addEventListener('click', runReadbackTestHandler);
+  el.querySelector('#btn-readback-stress')?.addEventListener('click', runReadbackStressHandler);
   el.querySelector('#btn-harness')?.addEventListener('click', runHarnessMatmulHandler);
 
   const correctBtn = el.querySelector('#btn-correctness') as HTMLButtonElement | null;
@@ -962,6 +1115,7 @@ export function render(el: HTMLElement) {
   initBenchmark().then(diag => {
     _deviceDiag = diag;
     installListeners();
+    updateReadbackEngineCard();
     const badge = el.querySelector('#device-badge') as HTMLElement;
     const info = el.querySelector('#device-info') as HTMLElement;
     if (badge) {

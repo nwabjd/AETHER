@@ -38,7 +38,7 @@ export function isSuiteRunning(): boolean {
 }
 
 const QUICK = {
-  matmul: new Set(['matmul-256', 'matmul-512']),
+  matmul: new Set(['matmul-128', 'matmul-256', 'matmul-512']),
   vecadd: new Set(['vecadd-1048576']),
   conv2d: new Set<string>(),
   softmax: new Set(['softmax-256']),
