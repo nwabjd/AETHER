@@ -31,12 +31,14 @@ function openDB(): Promise<IDBDatabase> {
   });
 }
 
+let _runSeq = 0;
+
 export async function saveResults(
   results: BenchmarkResult[],
   deviceInfo: { adapter: string; os: string; browser: string }
 ): Promise<string> {
   const db = await openDB();
-  const runId = `run_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const runId = `run_${Date.now().toString(36)}_${(_runSeq++).toString(36)}`;
 
   const run: StoredRun = {
     id: runId,

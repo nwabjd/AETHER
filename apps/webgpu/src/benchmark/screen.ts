@@ -1,22 +1,18 @@
-// AETHER GPU Benchmark — Main Screen
-// Quick / Full / Sustained benchmark modes with results table and export
+// AETHER GPU Benchmark — Diagnostic Screen
+// Diagnostic iteration: only GPU SANITY / MATMUL / CORRECTNESS are available.
+// Performance benchmarks are disabled until correctness is independently proven.
+//
+// Shows build ID + commit so a stale Safari cache is immediately obvious.
 
-import { initBenchmark, getDevice, destroyBenchmark, type BenchmarkResult, type DeviceDiagnostics } from './engine';
-import { benchmarkVectorAdd } from './bench-vecadd';
-import { benchmarkMatmul } from './bench-matmul';
-import { benchmarkConv2D } from './bench-conv2d';
-import { benchmarkSoftmax } from './bench-softmax';
-import { benchmarkRMSNorm } from './bench-rmsnorm';
-import { benchmarkAttention } from './bench-attention';
-import { benchmarkMemory } from './bench-memory';
-import { benchmarkSustained } from './bench-sustained';
+import { initBenchmark, getDevice, getDeviceLostInfo, hasDeviceLost } from './engine';
 import { testVecAdd, testMatmul, testConv2D, testSoftmax, testRMSNorm, testAttention } from './tests';
-import { saveResults, getAllRuns, exportJSON, downloadJSON, clearAllRuns } from './results-store';
-
-
+import { runGpuSanity } from './sanity';
+import { runStandaloneMatmul } from './standalone-matmul';
+import { AETHER_BUILD_ID } from './build-id';
 
 let _container: HTMLElement | null = null;
 let _running = false;
+let _listenersInstalled = false;
 
 function log(msg: string, cls: string = '') {
   if (!_container) return;
@@ -29,54 +25,6 @@ function log(msg: string, cls: string = '') {
   logEl.scrollTop = logEl.scrollHeight;
 }
 
-function setProgress(pct: number, msg: string) {
-  if (!_container) return;
-  const fill = _container.querySelector('#progress-fill') as HTMLElement;
-  const label = _container.querySelector('#progress-label') as HTMLElement;
-  if (fill) fill.style.width = pct < 0 ? '0%' : `${Math.min(pct, 100)}%`;
-  if (label) label.textContent = msg;
-}
-
-function renderResultsTable(results: BenchmarkResult[]) {
-  if (!_container) return;
-  const tableEl = _container.querySelector('#results-table') as HTMLElement;
-  if (!tableEl) return;
-
-  if (results.length === 0) {
-    tableEl.innerHTML = '<div class="empty-state"><p>No results yet</p></div>';
-    return;
-  }
-
-  let html = `<table style="width:100%;border-collapse:collapse;font-size:12px;font-family:var(--mono)">
-    <thead>
-      <tr style="border-bottom:1px solid var(--border)">
-        <th style="text-align:left;padding:6px;color:var(--text-dim)">Operation</th>
-        <th style="text-align:left;padding:6px;color:var(--text-dim)">Input</th>
-        <th style="text-align:right;padding:6px;color:var(--text-dim)">Time</th>
-        <th style="text-align:right;padding:6px;color:var(--text-dim)">Throughput</th>
-        <th style="text-align:right;padding:6px;color:var(--text-dim)">Memory</th>
-        <th style="text-align:center;padding:6px;color:var(--text-dim)">Status</th>
-      </tr>
-    </thead>
-    <tbody>`;
-
-  for (const r of results) {
-    const statusCls = r.success ? 'color:var(--green)' : 'color:var(--red)';
-    const statusText = r.success ? 'PASS' : 'FAIL';
-    html += `<tr style="border-bottom:1px solid var(--border)">
-      <td style="padding:6px;color:var(--text)">${r.name}</td>
-      <td style="padding:6px;color:var(--text-dim)">${r.inputSize}</td>
-      <td style="padding:6px;text-align:right;color:var(--text)">${r.executionTimeMs.toFixed(2)} ms</td>
-      <td style="padding:6px;text-align:right;color:var(--text)">${r.throughput}</td>
-      <td style="padding:6px;text-align:right;color:var(--text-dim)">${formatBytes(r.memoryBytes)}</td>
-      <td style="padding:6px;text-align:center;${statusCls}">${statusText}</td>
-    </tr>`;
-  }
-
-  html += '</tbody></table>';
-  tableEl.innerHTML = html;
-}
-
 function formatBytes(bytes: number): string {
   if (bytes >= 1073741824) return `${(bytes / 1073741824).toFixed(1)} GB`;
   if (bytes >= 1048576) return `${(bytes / 1048576).toFixed(1)} MB`;
@@ -84,256 +32,101 @@ function formatBytes(bytes: number): string {
   return `${bytes} B`;
 }
 
-async function runQuickBenchmark() {
-  if (_running) return;
-  _running = true;
-
-  const runBtn = _container?.querySelector('#btn-quick') as HTMLButtonElement;
-  if (runBtn) runBtn.disabled = true;
-
-  const allResults: BenchmarkResult[] = [];
-
-  try {
-    log('═══ QUICK BENCHMARK ═══', 'info');
-    setProgress(0, 'Initializing GPU...');
-
-    const diag = await initBenchmark();
-    log(`Adapter: ${diag.adapterName}`, 'ok');
-    log(`Timestamp query: ${diag.timestampQuerySupport ? 'YES' : 'NO'}`, '');
-
-    // Correctness tests first
-    log('', '');
-    log('── CORRECTNESS TESTS ──', 'info');
-    
-    const testFunctions = [
-      { name: 'Vector Add', fn: testVecAdd },
-      { name: 'Matmul', fn: testMatmul },
-      { name: 'Conv2D', fn: testConv2D },
-      { name: 'Softmax', fn: testSoftmax },
-      { name: 'RMSNorm', fn: testRMSNorm },
-      { name: 'Attention', fn: testAttention },
-    ];
-    
-    let allPass = true;
-    for (const t of testFunctions) {
-      try {
-        const res = await t.fn();
-        log(`  ${res.pass ? '✓' : '✗'} ${res.name}: ${res.details || ''} (max err: ${res.maxError.toExponential(2)})`, res.pass ? 'ok' : 'err');
-        if (!res.pass) allPass = false;
-      } catch (e) {
-        log(`  ✗ ${t.name}: FAILED WITH ERROR: ${(e as Error).message}`, 'err');
-        allPass = false;
-      }
-    }
-    
-    log(`  ${allPass ? 'ALL TESTS PASSED' : 'SOME TESTS FAILED'}`, allPass ? 'ok' : 'err');
-
-    // Quick benchmarks: VecAdd 1M, Matmul 128+256, Softmax small, RMSNorm small
-    log('', '');
-    log('── BENCHMARKS ──', 'info');
-
-    setProgress(10, 'Vector Add...');
-    log('▸ Vector Addition', 'info');
-    const vecResults = await benchmarkVectorAdd();
-    for (const r of vecResults) {
-      log(`  ${r.name} ${r.inputSize}: ${r.executionTimeMs.toFixed(2)} ms — ${r.throughput} [${r.success ? 'PASS' : 'FAIL'}]`, r.success ? 'ok' : 'err');
-      allResults.push(r);
-    }
-
-    setProgress(30, 'Matrix Multiply...');
-    log('▸ Matrix Multiply', 'info');
-    const matResults = await benchmarkMatmul();
-    for (const r of matResults) {
-      log(`  ${r.name} ${r.inputSize}: ${r.executionTimeMs.toFixed(2)} ms — ${r.throughput} [${r.success ? 'PASS' : 'FAIL'}]`, r.success ? 'ok' : 'err');
-      allResults.push(r);
-    }
-
-    setProgress(60, 'Softmax...');
-    log('▸ Softmax', 'info');
-    const softResults = await benchmarkSoftmax();
-    for (const r of softResults) {
-      log(`  ${r.name} ${r.inputSize}: ${r.executionTimeMs.toFixed(2)} ms — ${r.throughput} [${r.success ? 'PASS' : 'FAIL'}]`, r.success ? 'ok' : 'err');
-      allResults.push(r);
-    }
-
-    setProgress(80, 'RMSNorm...');
-    log('▸ RMSNorm', 'info');
-    const rmsResults = await benchmarkRMSNorm();
-    for (const r of rmsResults) {
-      log(`  ${r.name} ${r.inputSize}: ${r.executionTimeMs.toFixed(2)} ms — ${r.throughput} [${r.success ? 'PASS' : 'FAIL'}]`, r.success ? 'ok' : 'err');
-      allResults.push(r);
-    }
-
-    setProgress(100, 'Done');
-    log('', '');
-    log('═══ QUICK BENCHMARK COMPLETE ═══', 'info');
-    log(`${allResults.length} tests run`, '');
-
-    renderResultsTable(allResults);
-
-    // Save to IndexedDB
-    try {
-      await saveResults(allResults, {
-        adapter: diag.adapterName,
-        os: detectOS(),
-        browser: detectBrowser(),
-      });
-    } catch { /* ignore save errors */ }
-  } catch (e) {
-    log(`ERROR: ${(e as Error).message}`, 'err');
-    setProgress(0, 'Error');
-  } finally {
-    _running = false;
-    if (runBtn) runBtn.disabled = false;
-  }
+function stopDeviceLost() {
+  const info = getDeviceLostInfo();
+  log(`WEBGPU DEVICE LOST — reason: ${info.reason ?? 'unknown'} — message: ${info.message ?? ''}`, 'err');
+  log('Remaining tests stopped.', 'err');
 }
 
-async function runFullBenchmark() {
-  if (_running) return;
-  _running = true;
-
-  const runBtn = _container?.querySelector('#btn-full') as HTMLButtonElement;
-  if (runBtn) runBtn.disabled = true;
-
-  const allResults: BenchmarkResult[] = [];
-
+// TASK 7 + TASK 8: install uncapturederror + device.lost listeners once.
+function installListeners() {
+  if (_listenersInstalled) return;
   try {
-    log('═══ FULL BENCHMARK ═══', 'info');
-    setProgress(0, 'Initializing GPU...');
-
-    const diag = await initBenchmark();
-    log(`Adapter: ${diag.adapterName}`, 'ok');
-
-    // Correctness tests
-    log('', '');
-    log('── CORRECTNESS TESTS ──', 'info');
-    const testFunctions = [
-      { name: 'Vector Add', fn: testVecAdd },
-      { name: 'Matmul', fn: testMatmul },
-      { name: 'Conv2D', fn: testConv2D },
-      { name: 'Softmax', fn: testSoftmax },
-      { name: 'RMSNorm', fn: testRMSNorm },
-      { name: 'Attention', fn: testAttention },
-    ];
-    
-    for (const t of testFunctions) {
-      try {
-        const res = await t.fn();
-        log(`  ${res.pass ? '✓' : '✗'} ${res.name}: ${res.details || ''} (max err: ${res.maxError.toExponential(2)})`, res.pass ? 'ok' : 'err');
-      } catch (e) {
-        log(`  ✗ ${t.name}: FAILED WITH ERROR: ${(e as Error).message}`, 'err');
-      }
-    }
-
-    const benchmarks = [
-      { name: 'Vector Addition', fn: benchmarkVectorAdd, pct: 10 },
-      { name: 'Matrix Multiply', fn: benchmarkMatmul, pct: 25 },
-      { name: 'Convolution', fn: benchmarkConv2D, pct: 40 },
-      { name: 'Softmax', fn: benchmarkSoftmax, pct: 55 },
-      { name: 'RMSNorm', fn: benchmarkRMSNorm, pct: 65 },
-      { name: 'Attention', fn: benchmarkAttention, pct: 75 },
-      { name: 'Memory', fn: () => benchmarkMemory(diag), pct: 90 },
-    ];
-
-    for (const b of benchmarks) {
-      setProgress(b.pct, `${b.name}...`);
-      log(`▸ ${b.name}`, 'info');
-      try {
-        const results = await b.fn();
-        for (const r of results) {
-          log(`  ${r.inputSize}: ${r.executionTimeMs.toFixed(2)} ms — ${r.throughput} [${r.success ? 'PASS' : 'FAIL'}]`, r.success ? 'ok' : 'err');
-          allResults.push(r);
-        }
-      } catch (e) {
-        log(`  ERROR: ${(e as Error).message}`, 'err');
-      }
-    }
-
-    setProgress(100, 'Done');
-    log('', '');
-    log('═══ FULL BENCHMARK COMPLETE ═══', 'info');
-    log(`${allResults.length} tests run`, '');
-
-    renderResultsTable(allResults);
-
-    try {
-      await saveResults(allResults, {
-        adapter: diag.adapterName,
-        os: detectOS(),
-        browser: detectBrowser(),
-      });
-    } catch { /* ignore */ }
-  } catch (e) {
-    log(`ERROR: ${(e as Error).message}`, 'err');
-    setProgress(0, 'Error');
-  } finally {
-    _running = false;
-    if (runBtn) runBtn.disabled = false;
-  }
-}
-
-async function runSustainedBenchmark() {
-  if (_running) return;
-  _running = true;
-
-  const runBtn = _container?.querySelector('#btn-sustained') as HTMLButtonElement;
-  if (runBtn) runBtn.disabled = true;
-
-  const allResults: BenchmarkResult[] = [];
-
-  try {
-    log('═══ SUSTAINED LOAD BENCHMARK ═══', 'info');
-    log('This will run 30s + 60s + 180s = 270s total', 'warn');
-    log('Keep the screen on and do not switch tabs', 'warn');
-    setProgress(0, 'Initializing GPU...');
-
-    await initBenchmark();
-
-    const sustainedResults = await benchmarkSustained((pct, msg) => {
-      if (pct >= 0) setProgress(pct, msg);
-      log(`  ${msg}`, '');
+    const device = getDevice();
+    device.addEventListener('uncapturederror', (ev) => {
+      const err = (ev as unknown as { error?: GPUError }).error;
+      log(`UNCAPTURED GPU ERROR: ${err?.message ?? 'unknown'}`, 'err');
     });
+    device.lost.then(info => {
+      log(`WEBGPU DEVICE LOST — reason: ${info.reason} — message: ${info.message}`, 'err');
+    });
+    _listenersInstalled = true;
+  } catch {
+    // Not initialized yet; will retry after initBenchmark().
+  }
+}
 
-    for (const r of sustainedResults) {
-      log(`  ${r.name}: ${r.avgGflops.toFixed(1)} GFLOPS avg, throttled=${r.thermalThrottling}`, r.thermalThrottling ? 'warn' : 'ok');
-      allResults.push(r);
-    }
-
-    setProgress(100, 'Done');
-    log('', '');
-    log('═══ SUSTAINED BENCHMARK COMPLETE ═══', 'info');
-
-    renderResultsTable(allResults);
-
-    try {
-      await saveResults(allResults, {
-        adapter: (await initBenchmark()).adapterName,
-        os: detectOS(),
-        browser: detectBrowser(),
-      });
-    } catch { /* ignore */ }
+// TASK 4 + TASK 5: GPU SANITY button.
+async function runSanityTest() {
+  if (_running) return;
+  _running = true;
+  try {
+    await initBenchmark();
+    installListeners();
+    log('═══ GPU SANITY ═══', 'info');
+    const r = await runGpuSanity();
+    log(`GPU SANITY: ${r.pass ? 'PASS' : 'FAIL'}`, r.pass ? 'ok' : 'err');
+    if (r.expected) log(`  expected: ${r.expected}`, '');
+    if (r.actual) log(`  actual:   ${r.actual}`, r.pass ? 'ok' : 'err');
+    for (const e of r.errors) log(`  GPU error scope result: ${e}`, 'err');
+    if (r.exception) log(`  exception: ${r.exception}`, 'err');
+    if (hasDeviceLost()) stopDeviceLost();
   } catch (e) {
     log(`ERROR: ${(e as Error).message}`, 'err');
-    setProgress(0, 'Error');
   } finally {
     _running = false;
-    if (runBtn) runBtn.disabled = false;
+  }
+}
+
+// TASK 6: A/B comparison — standalone sanity, standalone matmul, harness matmul.
+async function runMatmulDiagnostics() {
+  if (_running) return;
+  _running = true;
+  try {
+    await initBenchmark();
+    installListeners();
+    log('═══ MATMUL DIAGNOSTICS ═══', 'info');
+
+    // 1/3 — standalone GPU sanity
+    log('— 1/3 Standalone GPU sanity —', 'info');
+    const s = await runGpuSanity();
+    log(`Standalone GPU sanity: ${s.pass ? 'PASS' : 'FAIL'}`, s.pass ? 'ok' : 'err');
+    for (const e of s.errors) log(`  error scope result: ${e}`, 'err');
+    if (s.exception) log(`  exception: ${s.exception}`, 'err');
+    if (hasDeviceLost()) { stopDeviceLost(); return; }
+
+    // 2/3 — standalone matmul
+    log('— 2/3 Standalone MatMul (64×64) —', 'info');
+    const m = await runStandaloneMatmul();
+    log(`Standalone MatMul: ${m.pass ? 'PASS' : 'FAIL'}`, m.pass ? 'ok' : 'err');
+    if (m.expected) log(`  expected: ${m.expected}`, '');
+    if (m.actual) log(`  actual:   ${m.actual}`, m.pass ? 'ok' : 'err');
+    for (const e of m.errors) log(`  error scope result: ${e}`, 'err');
+    if (m.exception) log(`  exception: ${m.exception}`, 'err');
+    if (hasDeviceLost()) { stopDeviceLost(); return; }
+
+    // 3/3 — harness matmul (runGpuTest)
+    log('— 3/3 Harness MatMul (runGpuTest) —', 'info');
+    const h = await testMatmul();
+    log(`Harness MatMul: ${h.pass ? 'PASS' : 'FAIL'} — ${h.details || ''}`, h.pass ? 'ok' : 'err');
+    if (hasDeviceLost()) { stopDeviceLost(); return; }
+
+    log('═══ MATMUL DIAGNOSTICS COMPLETE ═══', 'info');
+  } catch (e) {
+    log(`ERROR: ${(e as Error).message}`, 'err');
+    if (hasDeviceLost()) stopDeviceLost();
+  } finally {
+    _running = false;
   }
 }
 
 async function runCorrectnessTests() {
   if (_running) return;
   _running = true;
-
   try {
-    log('═══ CORRECTNESS TESTS ═══', 'info');
     await initBenchmark();
-    try {
-      getDevice().onuncapturederror = (ev) => {
-        const msg = (ev.error as GPUError)?.message || 'unknown GPU error';
-        log(`UNCAPTURED GPU ERROR: ${msg}`, 'err');
-      };
-    } catch { /* ignore */ }
+    installListeners();
+    log('═══ CORRECTNESS TESTS ═══', 'info');
     const testFunctions = [
       { name: 'Vector Add', fn: testVecAdd },
       { name: 'Matmul', fn: testMatmul },
@@ -342,9 +135,10 @@ async function runCorrectnessTests() {
       { name: 'RMSNorm', fn: testRMSNorm },
       { name: 'Attention', fn: testAttention },
     ];
-    
+
     let allPass = true;
     for (const t of testFunctions) {
+      if (hasDeviceLost()) { stopDeviceLost(); return; }
       try {
         const res = await t.fn();
         log(`${res.pass ? '✓' : '✗'} ${res.name}: ${res.details || ''} (max err: ${res.maxError.toExponential(2)})`, res.pass ? 'ok' : 'err');
@@ -358,81 +152,38 @@ async function runCorrectnessTests() {
     log(allPass ? 'ALL TESTS PASSED' : 'SOME TESTS FAILED', allPass ? 'ok' : 'err');
   } catch (e) {
     log(`ERROR: ${(e as Error).message}`, 'err');
+    if (hasDeviceLost()) stopDeviceLost();
   } finally {
     _running = false;
   }
 }
 
-async function exportBenchmarkJSON() {
-  try {
-    const runs = await getAllRuns();
-    if (runs.length === 0) {
-      log('No results to export. Run a benchmark first.', 'warn');
-      return;
-    }
-    const latest = runs[runs.length - 1];
-    const json = exportJSON(latest.results, {
-      adapter: latest.adapter,
-      os: latest.os,
-      browser: latest.browser,
-      timestamp: latest.timestamp,
-    });
-    downloadJSON(json);
-    log('JSON exported', 'ok');
-  } catch (e) {
-    log(`Export error: ${(e as Error).message}`, 'err');
-  }
-}
-
-async function showHistory() {
-  try {
-    const runs = await getAllRuns();
-    log(`── HISTORY: ${runs.length} saved runs ──`, 'info');
-    for (const r of runs.slice(-5)) {
-      log(`  ${r.timestamp} — ${r.results.length} results — ${r.adapter}`, '');
-    }
-  } catch (e) {
-    log(`History error: ${(e as Error).message}`, 'err');
-  }
-}
-
-async function clearHistory() {
-  try {
-    await clearAllRuns();
-    log('History cleared', 'ok');
-  } catch (e) {
-    log(`Clear error: ${(e as Error).message}`, 'err');
-  }
-}
-
-function detectOS(): string {
-  const ua = navigator.userAgent;
-  if (ua.includes('iPhone') || ua.includes('iPad')) {
-    const m = ua.match(/OS (\d+_\d+)/);
-    return `iOS ${m ? m[1].replace('_', '.') : '?'}`;
-  }
-  if (ua.includes('Mac')) return 'macOS';
-  if (ua.includes('Windows')) return 'Windows';
-  if (ua.includes('Android')) return 'Android';
-  return 'Unknown';
-}
-
-function detectBrowser(): string {
-  const ua = navigator.userAgent;
-  if (ua.includes('Safari') && !ua.includes('Chrome')) return 'Safari';
-  if (ua.includes('Chrome') && !ua.includes('Edg')) return 'Chrome';
-  if (ua.includes('Edg')) return 'Edge';
-  if (ua.includes('Firefox')) return 'Firefox';
-  return 'Unknown';
+function renderDiagnostics(el: HTMLElement) {
+  const panel = el.querySelector('#diag-panel') as HTMLElement;
+  if (!panel) return;
+  const rows: Array<[string, string]> = [
+    ['location.href', location.href],
+    ['location.hash', location.hash],
+    ['location.protocol', location.protocol],
+    ['window.isSecureContext', String(window.isSecureContext)],
+    ['navigator.userAgent', navigator.userAgent],
+    ['AETHER_BUILD_ID', AETHER_BUILD_ID],
+    ['Benchmark code revision', AETHER_BUILD_ID],
+  ];
+  panel.innerHTML = rows
+    .map(([k, v]) => `<div style="font-size:11px;font-family:var(--mono);word-break:break-all">
+        <span style="color:var(--text-dim)">${k}:</span> <b style="color:var(--text)">${v}</b>
+      </div>`)
+    .join('');
 }
 
 export function render(el: HTMLElement) {
   _container = el;
+  _listenersInstalled = false;
   el.innerHTML = `
-    <h2>GPU Compute Benchmark</h2>
+    <h2>GPU Compute Benchmark — Diagnostics</h2>
     <p style="color:var(--text-dim);margin-bottom:16px;font-size:13px">
-      Real WebGPU compute benchmarks running on the device GPU.
-      All measurements from actual timed execution.
+      Isolated GPU checks. Performance benchmarks are disabled until correctness is proven.
     </p>
 
     <div class="card" style="border-color:var(--border)">
@@ -443,48 +194,42 @@ export function render(el: HTMLElement) {
       <div id="device-info" style="font-size:12px;color:var(--text-dim);margin-top:8px"></div>
     </div>
 
-    <div class="btn-row">
-      <button class="btn" id="btn-correctness">✓ CORRECTNESS ONLY</button>
-      <button class="btn btn-outline" id="btn-quick">⚡ QUICK BENCHMARK</button>
-      <button class="btn btn-outline" id="btn-full">FULL BENCHMARK</button>
-      <button class="btn btn-outline" id="btn-sustained">SUSTAINED (270s)</button>
+    <div class="card" style="border-color:var(--border);margin-top:12px">
+      <div class="card-header">
+        <span class="card-title">Runtime Source Verification</span>
+      </div>
+      <div id="diag-panel" style="margin-top:8px"></div>
     </div>
 
     <div class="btn-row">
-      <button class="btn btn-outline" id="btn-export">EXPORT JSON</button>
-      <button class="btn btn-outline" id="btn-history">HISTORY</button>
-      <button class="btn btn-outline" id="btn-clear">CLEAR HISTORY</button>
+      <button class="btn" id="btn-sanity">GPU SANITY</button>
+      <button class="btn btn-outline" id="btn-matmul">MATMUL</button>
+      <button class="btn btn-outline" id="btn-correctness">CORRECTNESS</button>
     </div>
-
-    <div style="display:flex;justify-content:space-between;align-items:center;margin:8px 0">
-      <span id="progress-label" style="font-size:12px;color:var(--text-dim)">Ready</span>
-    </div>
-    <div class="progress-bar">
-      <div class="progress-fill" id="progress-fill" style="width:0%"></div>
-    </div>
-
-    <div id="results-table"></div>
 
     <div class="log" id="bench-log"></div>
+
+    <div style="margin-top:14px;padding-top:10px;border-top:1px solid var(--border);font-size:11px;font-family:var(--mono);color:var(--text-dim)">
+      <div>Build: <b id="build-id" style="color:var(--text)">${AETHER_BUILD_ID}</b></div>
+      <div>Environment: GitHub Pages</div>
+      <div>Commit: <b id="build-commit" style="color:var(--text)">${AETHER_BUILD_ID}</b></div>
+    </div>
   `;
 
-  // Bind buttons
-  el.querySelector('#btn-quick')?.addEventListener('click', runQuickBenchmark);
-  el.querySelector('#btn-full')?.addEventListener('click', runFullBenchmark);
-  el.querySelector('#btn-sustained')?.addEventListener('click', runSustainedBenchmark);
+  renderDiagnostics(el);
+
+  el.querySelector('#btn-sanity')?.addEventListener('click', runSanityTest);
+  el.querySelector('#btn-matmul')?.addEventListener('click', runMatmulDiagnostics);
   el.querySelector('#btn-correctness')?.addEventListener('click', runCorrectnessTests);
-  el.querySelector('#btn-export')?.addEventListener('click', exportBenchmarkJSON);
-  el.querySelector('#btn-history')?.addEventListener('click', showHistory);
-  el.querySelector('#btn-clear')?.addEventListener('click', clearHistory);
 
-
-  // Suppress unhandled errors from benchmark to prevent crash dialogs
+  // Suppress unhandled errors so failures render in the log instead of a crash dialog.
   const errorHandler = (e: Event) => { e.preventDefault(); };
   window.addEventListener('error', errorHandler);
   window.addEventListener('unhandledrejection', errorHandler);
 
-  // Auto-initialize on load to show device info
+  // Auto-initialize on load to show device info + diagnostics.
   initBenchmark().then(diag => {
+    installListeners();
     const badge = el.querySelector('#device-badge') as HTMLElement;
     const info = el.querySelector('#device-info') as HTMLElement;
     if (badge) {
@@ -512,6 +257,9 @@ export function render(el: HTMLElement) {
     if (badge) {
       badge.textContent = 'WEBGPU UNAVAILABLE';
       badge.className = 'badge badge-fail';
+    }
+    if (el.querySelector('#diag-panel')) {
+      log(`WEBGPU not available: ${(e as Error).message}`, 'err');
     }
   });
 }

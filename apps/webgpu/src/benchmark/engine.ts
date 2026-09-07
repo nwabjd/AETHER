@@ -37,6 +37,8 @@ export interface DeviceDiagnostics {
 let _device: GPUDevice | null = null;
 let _adapter: GPUAdapter | null = null;
 let _diagnostics: DeviceDiagnostics | null = null;
+let _deviceLostReason: string | null = null;
+let _deviceLostMessage: string | null = null;
 
 export async function initBenchmark(): Promise<DeviceDiagnostics> {
   // If device was lost, clear state and reinitialize
@@ -61,8 +63,14 @@ export async function initBenchmark(): Promise<DeviceDiagnostics> {
     requiredLimits: {},
   });
 
+  // Reset device-lost state on (re)initialization.
+  _deviceLostReason = null;
+  _deviceLostMessage = null;
+
   device.lost.then(info => {
-    console.error('Benchmark device lost:', info.message);
+    console.error('Benchmark device lost:', info.reason, info.message);
+    _deviceLostReason = (info.reason as string) ?? 'unknown';
+    _deviceLostMessage = info.message ?? '';
     _device = null;
     _adapter = null;
     _diagnostics = null;
@@ -125,6 +133,14 @@ export async function initBenchmark(): Promise<DeviceDiagnostics> {
 export function getDevice(): GPUDevice {
   if (!_device) throw new Error('Benchmark not initialized. Call initBenchmark() first.');
   return _device;
+}
+
+export function getDeviceLostInfo(): { reason: string | null; message: string | null } {
+  return { reason: _deviceLostReason, message: _deviceLostMessage };
+}
+
+export function hasDeviceLost(): boolean {
+  return _deviceLostReason !== null;
 }
 
 export function destroyBenchmark(): void {

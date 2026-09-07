@@ -1,49 +1,33 @@
 import { defineConfig } from 'vite';
-import { VitePWA } from 'vite-plugin-pwa';
+import { execSync } from 'node:child_process';
+
+// Build ID: current git commit SHA when available, otherwise a timestamp.
+// Injected into the bundle at build time so the deployed HTML can be verified
+// against the source commit (cache-busting / stale-code detection).
+function getBuildId(): string {
+  try {
+    const sha = execSync('git rev-parse HEAD', { encoding: 'utf-8' }).trim();
+    if (sha) return sha;
+  } catch {
+    // Not a git checkout — fall through to timestamp.
+  }
+  return new Date().toISOString().replace(/[:]/g, '-');
+}
 
 const basePath = process.env.BASE_PATH || '/';
+const buildId = getBuildId();
 
 export default defineConfig({
   base: basePath,
-  plugins: [
-    VitePWA({
-      registerType: 'autoUpdate',
-      includeAssets: ['favicon.svg'],
-      manifest: {
-        name: 'AETHER WebGPU',
-        short_name: 'AETHER',
-        description: 'Local on-device AI inference via WebGPU',
-        theme_color: '#0a0a0f',
-        background_color: '#0a0a0f',
-        display: 'standalone',
-        scope: basePath,
-        start_url: basePath,
-        icons: [
-          { src: `${basePath}icon-192.png`, sizes: '192x192', type: 'image/png' },
-          { src: `${basePath}icon-512.png`, sizes: '512x512', type: 'image/png' }
-        ]
-      },
-      workbox: {
-        globPatterns: ['**/*.{js,css,html,woff2,svg,png}'],
-        runtimeCaching: [
-          {
-            urlPattern: /^https:\/\/.*/i,
-            handler: 'CacheFirst',
-            options: {
-              cacheName: 'external-cache',
-              expiration: { maxEntries: 10, maxAgeSeconds: 60 * 60 * 24 }
-            }
-          }
-        ]
-      }
-    })
-  ],
+  define: {
+    __AETHER_BUILD_ID__: JSON.stringify(buildId),
+  },
   server: {
     host: '0.0.0.0',
     port: 5173,
   },
   build: {
     target: 'es2022',
-    outDir: 'dist'
-  }
+    outDir: 'dist',
+  },
 });

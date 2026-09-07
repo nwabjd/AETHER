@@ -75,12 +75,9 @@ function init() {
     const id = getScreenIdFromHash();
     if (id !== currentScreen) navigateTo(id);
   });
-
-  // Register service worker
-  if ('serviceWorker' in navigator) {
-    const base = (import.meta as any).env?.BASE_URL ?? '/';
-    navigator.serviceWorker.register(`${base}sw.js`).catch(() => {});
-  }
 }
+
+// NOTE: No service worker registration. The benchmark runs as a normal static
+// HTTPS app so Safari can never execute stale cached JavaScript.
 
 init();
