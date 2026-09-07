@@ -7,6 +7,11 @@ import {
   assertBindingCount,
   type StorageAccess,
 } from './layout';
+import {
+  trackPipelineDevice,
+  trackBindGroupDevice,
+  registerDeviceLost,
+} from './device-identity';
 
 export interface BenchmarkResult {
   id: string;
@@ -72,6 +77,7 @@ export async function initBenchmark(): Promise<DeviceDiagnostics> {
   // Reset device-lost state on (re)initialization.
   _deviceLostReason = null;
   _deviceLostMessage = null;
+  registerDeviceLost(device);
 
   device.lost.then(info => {
     console.error('Benchmark device lost:', info.reason, info.message);
@@ -269,6 +275,7 @@ export function createPipeline(
       entryPoint: 'main',
     },
   });
+  trackPipelineDevice(pipeline, device);
 
   // Capture shader compilation information where available. This is a
   // diagnostic aid only — it never substitutes for the explicit layout above.
@@ -293,7 +300,9 @@ export function createBindGroup(
 ): GPUBindGroup {
   const device = getDevice();
   const layout = pipeline.getBindGroupLayout(0);
-  return device.createBindGroup({ layout, entries });
+  const bg = device.createBindGroup({ layout, entries });
+  trackBindGroupDevice(bg, device);
+  return bg;
 }
 
 // Validates that the number of entries matches the pipeline's binding types
@@ -307,7 +316,9 @@ export function createBindGroupForPipeline(
   const device = getDevice();
   assertBindingCount(bindingTypes, entries, 'createBindGroupForPipeline');
   const layout = pipeline.getBindGroupLayout(0);
-  return device.createBindGroup({ layout, entries });
+  const bg = device.createBindGroup({ layout, entries });
+  trackBindGroupDevice(bg, device);
+  return bg;
 }
 
 // ─── Benchmark runner ───

@@ -49,7 +49,7 @@ export async function benchmarkAttention(): Promise<BenchmarkResult[]> {
     ],
   });
 
-  const testResult = await runGpuTest({
+  const testResult = await runGpuTest(device, {
     name: 'Attention',
     pipeline,
     bindGroup,

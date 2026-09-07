@@ -41,6 +41,10 @@ export interface KernelCaseResult {
   expectedRange: [number, number] | null;
   actualRange: [number, number] | null;
   nonFiniteIndex: number;
+  pipelineDeviceId?: number | null;
+  executionDeviceId?: number;
+  bindGroupDeviceId?: number | null;
+  mismatch?: boolean;
 }
 
 export interface TestResult {
@@ -131,6 +135,11 @@ interface RunCaseOptions {
 // validation) and captures validation/out-of-memory/internal/exception
 // failures. Buffers created for the case are always destroyed afterwards.
 async function runComputeCase(o: RunCaseOptions): Promise<KernelCaseResult> {
+  // TASK 2 — capture the EXACT device before creating the pipeline, bind group
+  // and (via the shared factories which resolve to the same object) buffers.
+  // runGpuTest receives this same object; execution cannot drift to another
+  // GPUDevice.
+  const device = getDevice();
   let gpu: Float32Array | null = null;
   let stage = 'pipeline';
   let errorType: string | null = null;
@@ -143,7 +152,7 @@ async function runComputeCase(o: RunCaseOptions): Promise<KernelCaseResult> {
     stage = 'bind-group';
     const bg = createBindGroupForPipeline(pipeline, o.bindingTypes, o.entries);
 
-    const outcome = await runGpuTest({
+    const outcome = await runGpuTest(device, {
       name: o.name,
       pipeline,
       bindGroup: bg,
@@ -158,7 +167,13 @@ async function runComputeCase(o: RunCaseOptions): Promise<KernelCaseResult> {
 
     stage = outcome.stage;
     if (!outcome.pass) {
-      return failedCase(o.config, stage, outcome.errorType ?? 'gpu-error', outcome.error ?? 'GPU execution failed');
+      return {
+        ...failedCase(o.config, stage, outcome.errorType ?? 'gpu-error', outcome.error ?? 'GPU execution failed'),
+        pipelineDeviceId: outcome.pipelineDeviceId,
+        executionDeviceId: outcome.executionDeviceId,
+        bindGroupDeviceId: outcome.bindGroupDeviceId,
+        mismatch: outcome.mismatch,
+      };
     }
     if (gpu === null) throw new Error('GPU returned no data after readback');
 
@@ -198,6 +213,10 @@ async function runComputeCase(o: RunCaseOptions): Promise<KernelCaseResult> {
       expectedRange: num.expectedRange,
       actualRange: num.actualRange,
       nonFiniteIndex: num.nonFiniteIndex,
+      pipelineDeviceId: outcome.pipelineDeviceId,
+      executionDeviceId: outcome.executionDeviceId,
+      bindGroupDeviceId: outcome.bindGroupDeviceId,
+      mismatch: outcome.mismatch,
     };
   } catch (e) {
     return failedCase(o.config, stage, errorType ?? 'exception', errorMessage ?? (e as Error).message);

@@ -40,7 +40,7 @@ export async function benchmarkSoftmax(): Promise<BenchmarkResult[]> {
       ],
     });
 
-    const testResult = await runGpuTest({
+    const testResult = await runGpuTest(device, {
       name: 'Softmax',
       pipeline,
       bindGroup,

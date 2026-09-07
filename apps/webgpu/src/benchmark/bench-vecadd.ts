@@ -40,7 +40,7 @@ export async function benchmarkVectorAdd(): Promise<BenchmarkResult[]> {
       ],
     });
 
-    const testResult = await runGpuTest({
+    const testResult = await runGpuTest(device, {
       name: 'Vector Addition',
       pipeline,
       bindGroup,

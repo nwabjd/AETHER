@@ -39,7 +39,7 @@ export async function benchmarkRMSNorm(): Promise<BenchmarkResult[]> {
       ],
     });
 
-    const testResult = await runGpuTest({
+    const testResult = await runGpuTest(device, {
       name: 'RMSNorm',
       pipeline,
       bindGroup,

@@ -19,6 +19,7 @@ import {
 } from './tests';
 import { runGpuSanity } from './sanity';
 import { runStandaloneMatmul } from './standalone-matmul';
+import { runSharedDeviceDirectMatmul } from './harness-matmul';
 import { AETHER_BUILD_ID, AETHER_COMMIT, AETHER_BUILD_TIME } from '../build-info';
 import { runPerfSuite, isSuiteRunning, type PerfMode } from './perf-suite';
 import {
@@ -40,10 +41,10 @@ let _sustainedArmed = localStorage.getItem('aether.sustained.armed') === '1';
 let _lastPerfReport: PerfReport | null = null;
 
 // CORRECTNESS stays locked until these all pass.
-const _gateStatus = { sanity: false, standaloneMatmul: false, harnessMatmul: false };
+const _gateStatus = { sanity: false, standaloneMatmul: false, directMatmul: false, harnessMatmul: false };
 
 function gatesPassed(): boolean {
-  return _gateStatus.sanity && _gateStatus.standaloneMatmul && _gateStatus.harnessMatmul;
+  return _gateStatus.sanity && _gateStatus.standaloneMatmul && _gateStatus.directMatmul && _gateStatus.harnessMatmul;
 }
 
 function updateCorrectnessButton() {
@@ -340,6 +341,43 @@ async function runStandaloneMatmulHandler() {
   }
 }
 
+// SHARED-DEVICE DIRECT MATMUL — engine device, inline flow (no runGpuTest).
+async function runSharedDeviceDirectMatmulHandler() {
+  if (_running) return;
+  _running = true;
+  try {
+    await initBenchmark();
+    installListeners();
+    log('═══ SHARED-DEVICE DIRECT MATMUL (engine device, inline) ═══', 'info');
+    const r = await runSharedDeviceDirectMatmul();
+    _gateStatus.directMatmul = r.pass;
+    updateCorrectnessButton();
+    renderResultCard('res-direct', {
+      title: r.name,
+      pass: r.pass,
+      stage: r.stage || 'complete',
+      errorType: r.errorType,
+      errorMessage: r.errorMessage,
+      notes: [
+        `execution device id: ${r.executionDeviceId}`,
+        `pipeline device id: ${r.pipelineDeviceId ?? 'unknown'}`,
+        `bind group device id: ${r.bindGroupDeviceId ?? 'unknown'}`,
+        `device mismatch: ${r.mismatch ? 'YES' : 'NO'}`,
+        `max error: ${r.maxError !== null ? r.maxError.toExponential(2) : '—'}`,
+      ],
+    });
+    log(`SHARED-DEVICE DIRECT MATMUL: ${r.pass ? 'PASS' : 'FAIL'}`, r.pass ? 'ok' : 'err');
+    if (r.errorType) log(`  error type: ${r.errorType}`, 'err');
+    if (r.errorMessage) log(`  error message: ${r.errorMessage}`, 'err');
+    if (hasDeviceLost()) stopDeviceLost();
+  } catch (e) {
+    log(`ERROR: ${(e as Error).message}`, 'err');
+    if (hasDeviceLost()) stopDeviceLost();
+  } finally {
+    _running = false;
+  }
+}
+
 // HARNESS MATMUL — engine device via runGpuTest.
 async function runHarnessMatmulHandler() {
   if (_running) return;
@@ -352,13 +390,26 @@ async function runHarnessMatmulHandler() {
     _gateStatus.harnessMatmul = h.pass;
     updateCorrectnessButton();
     const caseSummary = h.cases.map((c) => `${c.config}:${c.pass ? 'PASS' : 'FAIL'}`).join(' ');
+    const failed = h.cases.find((c) => !c.pass);
+    const idNotes = failed
+      ? [
+          `pipeline device id: ${failed.pipelineDeviceId ?? 'unknown'}`,
+          `execution device id: ${failed.executionDeviceId ?? 'unknown'}`,
+          `bind group device id: ${failed.bindGroupDeviceId ?? 'unknown'}`,
+          `device mismatch: ${failed.mismatch ? 'YES' : 'NO'}`,
+        ]
+      : [];
     renderResultCard('res-harness', {
       title: 'HARNESS MATMUL',
       pass: h.pass,
-      stage: h.pass ? 'complete' : h.cases.find((c) => !c.pass)?.stage ?? 'runGpuTest',
-      errorType: h.pass ? null : h.cases.find((c) => !c.pass)?.errorType ?? null,
-      errorMessage: h.pass ? null : h.cases.find((c) => !c.pass)?.errorMessage ?? h.details,
-      notes: [`cases: ${caseSummary || '—'}`, `max error: ${h.maxError >= 0 ? h.maxError.toExponential(2) : '—'}`],
+      stage: h.pass ? 'complete' : failed?.stage ?? 'runGpuTest',
+      errorType: h.pass ? null : failed?.errorType ?? null,
+      errorMessage: h.pass ? null : failed?.errorMessage ?? h.details,
+      notes: [
+        `cases: ${caseSummary || '—'}`,
+        `max error: ${h.maxError >= 0 ? h.maxError.toExponential(2) : '—'}`,
+        ...idNotes,
+      ],
     });
     log(`HARNESS MATMUL: ${h.pass ? 'PASS' : 'FAIL'} — ${h.details || ''}`, h.pass ? 'ok' : 'err');
     if (hasDeviceLost()) stopDeviceLost();
@@ -781,7 +832,7 @@ export function render(el: HTMLElement) {
   el.innerHTML = `
     <h2>GPU Compute Benchmark — Isolated Diagnostics</h2>
     <p style="color:var(--text-dim);margin-bottom:16px;font-size:13px">
-      Three independent checks — each requests its own GPU device. Kick the performance gates (GPU SANITY → STANDALONE MATMUL → HARNESS MATMUL → CORRECTNESS) to unlock the GPU performance benchmarks below.
+      Three independent checks — GPU SANITY and STANDALONE MATMUL each request their own GPU device; SHARED-DEVICE DIRECT MATMUL and HARNESS MATMUL share the AETHER engine device. Kick the performance gates (GPU SANITY → STANDALONE MATMUL → SHARED-DEVICE DIRECT MATMUL → HARNESS MATMUL → CORRECTNESS) to unlock the GPU performance benchmarks below.
     </p>
 
     <div class="card" style="border-color:var(--border)">
@@ -802,12 +853,14 @@ export function render(el: HTMLElement) {
     <div class="btn-row" style="margin-top:16px">
       <button class="btn" id="btn-sanity">GPU SANITY</button>
       <button class="btn btn-outline" id="btn-standalone">STANDALONE MATMUL</button>
+      <button class="btn btn-outline" id="btn-direct">SHARED-DEVICE DIRECT MATMUL</button>
       <button class="btn btn-outline" id="btn-harness">HARNESS MATMUL</button>
       <button class="btn btn-outline" id="btn-correctness">CORRECTNESS (LOCKED)</button>
     </div>
 
     <div id="res-sanity"></div>
     <div id="res-standalone"></div>
+    <div id="res-direct"></div>
     <div id="res-harness"></div>
 
     <div id="validation-panel"></div>
@@ -828,6 +881,7 @@ export function render(el: HTMLElement) {
 
   el.querySelector('#btn-sanity')?.addEventListener('click', runGpuSanityHandler);
   el.querySelector('#btn-standalone')?.addEventListener('click', runStandaloneMatmulHandler);
+  el.querySelector('#btn-direct')?.addEventListener('click', runSharedDeviceDirectMatmulHandler);
   el.querySelector('#btn-harness')?.addEventListener('click', runHarnessMatmulHandler);
 
   const correctBtn = el.querySelector('#btn-correctness') as HTMLButtonElement | null;

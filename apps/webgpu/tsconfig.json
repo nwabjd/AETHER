@@ -7,6 +7,8 @@
     "noUnusedLocals": false,
     "noUnusedParameters": false,
     "isolatedModules": true,
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
     "skipLibCheck": true,
     "outDir": "dist",
     "rootDir": "src",

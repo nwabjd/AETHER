@@ -47,7 +47,7 @@ export async function benchmarkConv2D(): Promise<BenchmarkResult[]> {
     ],
   });
 
-  const testResult = await runGpuTest({
+  const testResult = await runGpuTest(device, {
     name: 'Conv2D',
     pipeline,
     bindGroup,
