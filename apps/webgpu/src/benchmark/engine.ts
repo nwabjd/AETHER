@@ -74,13 +74,14 @@ export async function initBenchmark(): Promise<DeviceDiagnostics> {
     requiredLimits: {},
   });
 
-  // Reset device-lost state on (re)initialization.
+  // Reset device-lost state on (re)initialization. A newly-created device is
+  // healthy — it MUST NOT be registered as lost here.
   _deviceLostReason = null;
   _deviceLostMessage = null;
-  registerDeviceLost(device);
 
   device.lost.then(info => {
     console.error('Benchmark device lost:', info.reason, info.message);
+    registerDeviceLost(device);
     _deviceLostReason = (info.reason as string) ?? 'unknown';
     _deviceLostMessage = info.message ?? '';
     _device = null;

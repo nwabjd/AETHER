@@ -85,6 +85,16 @@ test('bind group identity is recorded per binding device and readable', () => {
   assert.notEqual(getBindGroupDeviceIdentity(bg), getDeviceIdentity(b));
 });
 
+test('newly-created device is NOT registered as lost (root-cause guard)', () => {
+  const a = fakeDevice();
+  assert.equal(isDeviceLost(a), false, 'fresh device must report not-lost');
+  assert.equal(
+    isDeviceLost(fakeDevice()),
+    false,
+    'a second fresh device must also report not-lost (no cross-device contamination)'
+  );
+});
+
 test('device lost registration blocks later execution checks', () => {
   const a = fakeDevice();
   assert.equal(isDeviceLost(a), false);
