@@ -270,7 +270,11 @@ export async function opSoftmax(data: Tensor, rows: number, cols: number): Promi
   const pass = encoder.beginComputePass();
   pass.setPipeline(pipeline);
   pass.setBindGroup(0, bg);
-  pass.dispatchWorkgroups(Math.ceil(rows));
+  // Row-per-invocation kernel (@workgroup_size(256), row = gid.x): dispatch
+  // ceil(rows/256) in X, NOT rows (rows workgroups would run rows*256
+  // invocations and race every row 256× — same bug class fixed in the
+  // benchmark's softmaxWorkgroups). See docs/WORKGROUP_DISPATCH_AUDIT.md.
+  pass.dispatchWorkgroups(Math.max(1, Math.ceil(rows / 256)));
   pass.end();
   ctx.device.queue.submit([encoder.finish()]);
 

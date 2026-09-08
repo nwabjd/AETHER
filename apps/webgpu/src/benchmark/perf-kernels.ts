@@ -30,8 +30,9 @@ import {
   logMatmulUniformDiagnostic,
 } from './uniforms';
 import type { StorageAccess } from './layout';
-import { MATMUL, VEC_ADD, CONV2D, SOFTMAX, RMS_NORM, ATTENTION, ATTENTION_OUTPUT_SENTINEL } from './kernels';
+import { MATMUL, VEC_ADD, CONV2D, SOFTMAX, RMS_NORM, ATTENTION, ATTENTION_OUTPUT_SENTINEL, softmaxWorkgroups, softmaxDispatchInfo, assertSoftmaxDispatch, type SoftmaxDispatchInfo } from './kernels';
 import { cpuVecAdd, cpuMatmul, cpuConv2D, cpuSoftmax, cpuRMSNorm, cpuAttention } from './cpu-refs';
+import { analyzeNumeric, rowSums } from './numeric';
 
 const QKT_BINDINGS = ['uniform', 'read-only-storage', 'read-only-storage', 'storage'] as const satisfies readonly StorageAccess[];
 const PV_BINDINGS = ['uniform', 'read-only-storage', 'read-only-storage', 'storage'] as const satisfies readonly StorageAccess[];
@@ -99,6 +100,29 @@ function allFinite(data: Float32Array): boolean {
 function findSentinel(data: Float32Array): number {
   for (let i = 0; i < data.length; i++) if (data[i] === ATTENTION_OUTPUT_SENTINEL) return i;
   return -1;
+}
+
+// TASK 6 — dispatch diagnostic text: "rows=256 wgSize=64 wgX=4 total=256".
+function dispatchText(info: SoftmaxDispatchInfo): string {
+  return `rows=${info.rows} wgSize=${info.workgroupSize} wgX=${info.workgroupsX} total=${info.totalInvocations}`;
+}
+
+// Row-sum check: every softmax row must sum ≈ 1 (each row is normalized).
+function checkRowSums(data: Float32Array, rows: number, cols: number): { ok: boolean; maxDev: number } {
+  let maxDev = 0;
+  for (let r = 0; r < rows; r++) {
+    let s = 0;
+    for (let c = 0; c < cols; c++) s += data[r * cols + c];
+    maxDev = Math.max(maxDev, Math.abs(s - 1));
+  }
+  return { ok: maxDev <= 1e-2, maxDev };
+}
+
+// Number of output elements still holding the sentinel (unwritten rows).
+function countSentinels(data: Float32Array): number {
+  let n = 0;
+  for (let i = 0; i < data.length; i++) if (data[i] === ATTENTION_OUTPUT_SENTINEL) n++;
+  return n;
 }
 
 function maxAbsDiff(a: Float32Array, b: Float32Array): number {
@@ -389,7 +413,7 @@ export async function benchSoftmax(tm: TimingManager, subset?: ReadonlySet<strin
       { binding: 1, resource: { buffer: bufIn } },
       { binding: 2, resource: { buffer: bufOut } },
     ]);
-    const wg: [number, number, number] = [rows, 1, 1];
+    const wg: [number, number, number] = softmaxWorkgroups(rows);
 
     try {
       const got = await dispatchToAndRead(pipeline, bg, wg, bufOut, bytes, `softmax-${rows}`);
@@ -614,17 +638,20 @@ async function measureAttentionPhases(
   // TASK 11: dispatch dims must match each phase kernel's index mapping:
   //   ATTN_QKT → i=gid.x (row), b=gid.y (batch)
   //   ATTN_PV  → i=gid.x (row), d=gid.y (dim), b=gid.z (batch)
-  // Softmax shader → gid.x = row (dispatch [seq,1,1]).
+  // Softmax shader → gid.x = row, @workgroup_size(64): dispatch ceil(seq/64)
+  // in X, NOT seq (TASK 1 — dispatching [seq,1,1] races rows across workgroups).
   const batch = ctx.batch;
   const wgQ: [number, number, number] = [Math.ceil(seq / 64), batch, 1];
   const wgP: [number, number, number] = [Math.ceil(seq / 64), dim, batch];
+  const wgSoft: [number, number, number] = softmaxWorkgroups(seq);
+  const softInfo = softmaxDispatchInfo(seq);
   const scoresBytes = seq * seq * 4;
   const outBytes = seq * dim * 4;
 
   // warmup the phase composition path (qkt → softmax → pv)
   for (let i = 0; i < 3; i++) {
     await dispatchToAndRead(ctx.pipelines.qkt, ctx.groups.qkt, wgQ, ctx.bufs.scores, scoresBytes, 'warmup-qkt');
-    await dispatchToAndRead(ctx.pipelines.soft, ctx.groups.soft, [seq, 1, 1], ctx.bufs.probs, scoresBytes, 'warmup-soft');
+    await dispatchToAndRead(ctx.pipelines.soft, ctx.groups.soft, wgSoft, ctx.bufs.probs, scoresBytes, 'warmup-soft');
     await dispatchToAndRead(ctx.pipelines.pv, ctx.groups.pv, wgP, ctx.bufs.out, outBytes, 'warmup-pv');
   }
 
@@ -650,13 +677,16 @@ async function measureAttentionPhases(
     for (let i = 0; i < iterations; i++) {
       await dispatchToAndRead(ctx.pipelines.qkt, ctx.groups.qkt, wgQ, ctx.bufs.scores, scoresBytes, `soft-prep-${seq}`);
       times.push(await tm.timeOne(
-        (pass) => { pass.setPipeline(ctx.pipelines.soft); pass.setBindGroup(0, ctx.groups.soft); pass.dispatchWorkgroups(seq, 1, 1); },
+        (pass) => { pass.setPipeline(ctx.pipelines.soft); pass.setBindGroup(0, ctx.groups.soft); pass.dispatchWorkgroups(wgSoft[0], wgSoft[1], wgSoft[2]); },
         waitFor(ctx.bufs.probs, scoresBytes, `soft-${seq}`)
       ));
     }
     const p = await ReadbackManager.getInstance().copyAndRead(getDevice(), ctx.bufs.probs, scoresBytes, `soft-val-${seq}`);
+    if (p.length !== ctx.ref.probs.length || !allFinite(p)) throw fail('attention.softmax', `seq=${seq}`, 'softmax output invalid', `len=${p.length}`);
     if (maxAbsDiff(p, ctx.ref.probs) > 1e-2) throw fail('attention.softmax', `seq=${seq}`, 'phase correctness check failed', `maxErr=${maxAbsDiff(p, ctx.ref.probs).toExponential(2)}`);
-    out.push(sample(`attention-softmax-${seq}`, 'Softmax on scores', `seq=${seq} rows=${seq}`, statsOfTimes(times, tm.mode)));
+    const softProbsSums = checkRowSums(p, seq, seq);
+    if (!softProbsSums.ok) throw fail('attention.softmax', `seq=${seq}`, 'softmax row sums deviate from 1', `max dev=${softProbsSums.maxDev.toExponential(3)}`);
+    out.push(sample(`attention-softmax-${seq}`, 'Softmax on scores', `seq=${seq} rows=${seq} ${dispatchText(softInfo)}`, statsOfTimes(times, tm.mode)));
   }
 
   // Softmax × V — prep qkt→softmax so probs are in place, then measure PV.
@@ -664,7 +694,7 @@ async function measureAttentionPhases(
     const times: number[] = [];
     for (let i = 0; i < iterations; i++) {
       await dispatchToAndRead(ctx.pipelines.qkt, ctx.groups.qkt, wgQ, ctx.bufs.scores, scoresBytes, `pv-prep1-${seq}`);
-      await dispatchToAndRead(ctx.pipelines.soft, ctx.groups.soft, [seq, 1, 1], ctx.bufs.probs, scoresBytes, `pv-prep2-${seq}`);
+      await dispatchToAndRead(ctx.pipelines.soft, ctx.groups.soft, wgSoft, ctx.bufs.probs, scoresBytes, `pv-prep2-${seq}`);
       times.push(await tm.timeOne(
         (pass) => { pass.setPipeline(ctx.pipelines.pv); pass.setBindGroup(0, ctx.groups.pv); pass.dispatchWorkgroups(wgP[0], wgP[1], wgP[2]); },
         waitFor(ctx.bufs.out, outBytes, `pv-${seq}`)
@@ -757,4 +787,119 @@ async function setupAttention(seq: number, dim: number, batch: number): Promise<
     bufs: { q: bufQ, k: bufK, v: bufV, out: bufOut, scores: bufScores, probs: bufProbs },
     ref: { scores: ref.scores, probs: ref.probs, out: ref.out },
   };
+}
+
+// ─── Phase-Softmax Correctness (TASK 10/11/15) ───
+// Isolated QKT → Softmax path, batch=1, dim=64, seq=4/16/64/128/256.
+// Validates output length, finiteness, per-row sum ≈ 1, CPU/GPU max error,
+// first mismatch index, expected/actual ranges, and a sentinel prefill that
+// proves every row was written (no stale/reused buffer content).
+
+export interface PhaseSoftmaxCase {
+  seq: number;
+  pass: boolean;
+  stage: string;
+  errorType: string | null;
+  errorMessage: string | null;
+  rows: number;
+  workgroupsX: number;
+  totalInvocations: number;
+  maxError: number;
+  errorIndex: number;
+  cpuValue: number | null;
+  gpuValue: number | null;
+  expectedRange: [number, number] | null;
+  actualRange: [number, number] | null;
+  rowSumsMin: number;
+  rowSumsMax: number;
+  sentinelCount: number;
+}
+
+export async function runPhaseSoftmaxCorrectness(seqs: number[] = [4, 16, 64, 128, 256]): Promise<PhaseSoftmaxCase[]> {
+  const device = getDevice();
+  const dim = 64;
+  const batch = 1;
+  const results: PhaseSoftmaxCase[] = [];
+
+  for (const seq of seqs) {
+    const seqsRows = batch * seq;
+    const info = assertSoftmaxDispatch(seqsRows);
+    const ctx = await setupAttention(seq, dim, batch);
+    try {
+      let stage = 'qkt';
+      let errorType: string | null = null;
+      let errorMessage: string | null = null;
+
+      // Phase 1: QK^T → scores, validate against CPU reference.
+      const wgQ: [number, number, number] = [Math.ceil(seqsRows / 64), batch, 1];
+      const scoresGot = await dispatchToAndRead(ctx.pipelines.qkt, ctx.groups.qkt, wgQ, ctx.bufs.scores, seq * seq * 4, `phase-softmax-qkt-${seq}`);
+      if (maxAbsDiff(scoresGot, ctx.ref.scores) > 1e-2) {
+        errorType = 'phase-qkt-mismatch';
+        errorMessage = `QK^T scores maxErr=${maxAbsDiff(scoresGot, ctx.ref.scores).toExponential(2)}`;
+      }
+
+      // Sentinel-fill probs so unwritten rows are visible after the softmax pass.
+      device.queue.writeBuffer(ctx.bufs.probs, 0, new Float32Array(seq * seq).fill(ATTENTION_OUTPUT_SENTINEL));
+
+      // Phase 2: Softmax(scores) → probs, with the correct ceil(rows/64) dispatch.
+      const wgSoft: [number, number, number] = softmaxWorkgroups(seqsRows);
+      const probsGot = await dispatchToAndRead(ctx.pipelines.soft, ctx.groups.soft, wgSoft, ctx.bufs.probs, seq * seq * 4, `phase-softmax-soft-${seq}`);
+
+      stage = errorType === null ? 'softmax-validation' : 'qkt';
+      let num = analyzeNumeric(probsGot, ctx.ref.probs, 1e-2);
+      if (errorType === null && !num.pass) {
+        errorType = 'softmax-mismatch';
+        errorMessage = `maxErr=${num.maxError.toExponential(2)} @ idx ${num.errorIndex} (cpu ${num.cpuValue?.toExponential(4)} gpu ${num.gpuValue?.toExponential(4)})`;
+      }
+
+      // Row sums must ≈ 1 for every row.
+      const sums = rowSums(probsGot, seqsRows, seq);
+      let sumsMin = Infinity, sumsMax = -Infinity;
+      for (const s of sums) {
+        sumsMin = Math.min(sumsMin, s);
+        sumsMax = Math.max(sumsMax, s);
+      }
+      if (errorType === null && (sumsMin < 1 - 1e-2 || sumsMax > 1 + 1e-2)) {
+        errorType = 'softmax-row-sum';
+        errorMessage = `row sums deviate: min=${sumsMin.toExponential(3)} max=${sumsMax.toExponential(3)}`;
+      }
+
+      // Unwritten rows: any sentinel leftover proves a row was never written.
+      const sentinelCount = countSentinels(probsGot);
+      if (errorType === null && sentinelCount > 0) {
+        errorType = 'softmax-unwritten-output';
+        errorMessage = `${sentinelCount} sentinel(s) remain after softmax`;
+      }
+
+      results.push({
+        seq,
+        pass: errorType === null,
+        stage,
+        errorType,
+        errorMessage,
+        rows: seqsRows,
+        workgroupsX: info.workgroupsX,
+        totalInvocations: info.totalInvocations,
+        maxError: num.maxError,
+        errorIndex: num.errorIndex,
+        cpuValue: num.cpuValue,
+        gpuValue: num.gpuValue,
+        expectedRange: num.expectedRange,
+        actualRange: num.actualRange,
+        rowSumsMin: sumsMin === Infinity ? -1 : sumsMin,
+        rowSumsMax: sumsMax === -Infinity ? -1 : sumsMax,
+        sentinelCount,
+      });
+    } finally {
+      try {
+        ctx.bufs.q.destroy();
+        ctx.bufs.k.destroy();
+        ctx.bufs.v.destroy();
+        ctx.bufs.out.destroy();
+        ctx.bufs.scores.destroy();
+        ctx.bufs.probs.destroy();
+      } catch {}
+    }
+  }
+  return results;
 }

@@ -28,6 +28,9 @@ import {
   SOFTMAX,
   RMS_NORM,
   ATTENTION,
+  softmaxWorkgroups,
+  softmaxDispatchInfo,
+  assertSoftmaxDispatch,
 } from '../src/benchmark/kernels.ts';
 
 const KERNELS: Record<string, string> = { VEC_ADD, MATMUL, CONV2D, SOFTMAX, RMS_NORM, ATTENTION };
@@ -104,6 +107,32 @@ assert.doesNotMatch(ATTENTION, /for \(var i = 0u; i < u\.seq; i\+\+\)/, 'ATTENTI
 assert.throws(
   () => assertBindingCount(MATMUL_BINDINGS, [{ binding: 0 }, { binding: 1 }]),
   /binding count mismatch/
+);
+
+// TASK 4 — the shared SOFTMAX shader stays a row-per-invocation kernel:
+// @workgroup_size(64) with gid.x → row and a bounds check. It must NOT be
+// rewritten into a multi-row/in-place variant until the correctness gate is
+// fully green.
+assert.match(SOFTMAX, /@compute\s*@workgroup_size\(64\)/, 'SOFTMAX must keep @workgroup_size(64)');
+assert.match(SOFTMAX, /let\s+row\s*=\s*gid\.x/, 'SOFTMAX must map gid.x → row');
+assert.match(SOFTMAX, /if\s*\(row\s*>=\s*u\.rows\)\s*\{\s*return;\s*\}/, 'SOFTMAX must bounds-check row against u.rows');
+
+// TASK 5/6/7 — dispatch single source of truth + invariant: ceil(rows/64) in X.
+// Rows are 1:1 with invocations; total invocations covers [rows, rows+64).
+assert.deepEqual(softmaxWorkgroups(4), [1, 1, 1]);
+assert.deepEqual(softmaxWorkgroups(64), [1, 1, 1]);
+assert.deepEqual(softmaxWorkgroups(65), [2, 1, 1]);
+assert.deepEqual(softmaxWorkgroups(128), [2, 1, 1]);
+assert.deepEqual(softmaxWorkgroups(256), [4, 1, 1]);
+assert.deepEqual(softmaxWorkgroups(512), [8, 1, 1]);
+assert.deepEqual(softmaxDispatchInfo(128), { rows: 128, workgroupSize: 64, workgroupsX: 2, totalInvocations: 128 });
+const inv = assertSoftmaxDispatch(256);
+assert.equal(inv.workgroupsX, 4);
+assert.equal(inv.totalInvocations, 256);
+assert.throws(
+  () => assertSoftmaxDispatch(-1),
+  /softmax dispatch invariant violated/,
+  'assertSoftmaxDispatch must reject a negative row count'
 );
 
 console.log(`PASS: layout regression — read-only-storage bindings preserved for all ${Object.keys(KERNELS).length} kernels`);

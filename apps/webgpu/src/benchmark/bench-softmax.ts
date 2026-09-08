@@ -4,7 +4,7 @@ import {
   createPipeline, formatBytes,
   type BenchmarkResult,
 } from './engine';
-import { SOFTMAX } from './kernels';
+import { SOFTMAX, softmaxWorkgroups } from './kernels';
 import { SOFTMAX_BINDINGS } from './bindings';
 import { createSoftmaxUniform } from './uniforms';
 import { runGpuTest } from './gpu-test';
@@ -41,7 +41,9 @@ export async function benchmarkSoftmax(): Promise<BenchmarkResult[]> {
       name: 'Softmax',
       pipeline,
       bindGroup,
-      workgroups: [t.rows, 1, 1],
+      // TASK 3 — SOFTMAX maps gid.x → row with @workgroup_size(64); dispatch
+      // ceil(rows/64) in X, NOT rows (rows workgroups would race each row 64×).
+      workgroups: softmaxWorkgroups(t.rows),
       outputBuffer: bufOutput,
       outputBytes: bytes,
       validator: (data) => {

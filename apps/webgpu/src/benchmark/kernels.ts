@@ -105,6 +105,46 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 `;
 
+// ─── SOFTMAX dispatch (single source of truth) ───
+// The shared SOFTMAX shader above is `@workgroup_size(64)` and maps
+// `gid.x` → `row` (one invocation per row). Therefore dispatch X must be
+// `ceil(rows/64)`, NOT `rows`. Dispatching `[rows,1,1]` launches 64× the rows
+// as invocations; invocations from different workgroups then own the SAME row
+// (e.g. gid.x=0 and gid.x=64 both target row 0), racing on `output[...]`.
+
+// TASK 5 — single source of truth. Every dispatch of the shared SOFTMAX
+// pipeline must route through this helper.
+export function softmaxWorkgroups(rows: number): [number, number, number] {
+  const wgX = Math.max(1, Math.ceil(rows / 64));
+  return [wgX, 1, 1];
+}
+
+export interface SoftmaxDispatchInfo {
+  rows: number;
+  workgroupSize: number;
+  workgroupsX: number;
+  totalInvocations: number;
+}
+
+// TASK 6 — the dispatch diagnostic (rows / workgroupSize / workgroupsX /
+// totalInvocations) that makes an accidental 64× over-dispatch impossible to miss.
+export function softmaxDispatchInfo(rows: number): SoftmaxDispatchInfo {
+  const wgX = Math.max(1, Math.ceil(rows / 64));
+  return { rows, workgroupSize: 64, workgroupsX: wgX, totalInvocations: wgX * 64 };
+}
+
+// TASK 7 — row-ownership assertion: totalInvocations must cover every row and
+// leave every row owned by exactly one invocation (final partial workgroup OK).
+export function assertSoftmaxDispatch(rows: number): SoftmaxDispatchInfo {
+  const info = softmaxDispatchInfo(rows);
+  if (!(info.totalInvocations >= info.rows && info.totalInvocations < info.rows + 64)) {
+    throw new Error(
+      `softmax dispatch invariant violated: rows=${info.rows} wgX=${info.workgroupsX} ` +
+      `total=${info.totalInvocations} (expected ${info.rows} ≤ total < ${info.rows + 64})`
+    );
+  }
+  return info;
+}
 
 // ─── RMSNorm - single-pass approach (for now) ───
 

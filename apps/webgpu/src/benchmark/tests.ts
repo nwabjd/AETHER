@@ -14,6 +14,7 @@ import {
 } from './engine';
 import {
   VEC_ADD, MATMUL, CONV2D, SOFTMAX, RMS_NORM, ATTENTION, ATTENTION_OUTPUT_SENTINEL,
+  softmaxWorkgroups, softmaxDispatchInfo,
 } from './kernels';
 import {
   VEC_ADD_BINDINGS, MATMUL_BINDINGS, CONV2D_BINDINGS,
@@ -435,6 +436,7 @@ async function softmaxCase(caseNum: number): Promise<KernelCaseResult> {
   const d = softmaxData(caseNum);
   const rows = d.rows, cols = d.cols;
   const bytes = d.data.byteLength;
+  const diag = softmaxDispatchInfo(rows);
 
   const bufIn = createStorageBuffer(bytes, d.data);
   const bufOut = createStorageBuffer(bytes);
@@ -442,10 +444,10 @@ async function softmaxCase(caseNum: number): Promise<KernelCaseResult> {
 
   return runComputeCase({
     name: 'Softmax',
-    config: `${rows}×${cols}`,
+    config: `${rows}×${cols} (wgX=${diag.workgroupsX}, total=${diag.totalInvocations})`,
     code: SOFTMAX,
     bindingTypes: SOFTMAX_BINDINGS,
-    workgroups: [rows, 1, 1],
+    workgroups: softmaxWorkgroups(rows),
     entries: [
       { binding: 0, resource: { buffer: uBuf } },
       { binding: 1, resource: { buffer: bufIn } },

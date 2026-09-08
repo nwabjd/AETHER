@@ -25,6 +25,10 @@ import { ReadbackManager } from './readback.ts';
 import { AETHER_BUILD_ID, AETHER_COMMIT, AETHER_BUILD_TIME } from '../build-info';
 import { runPerfSuite, isSuiteRunning, type PerfMode } from './perf-suite';
 import {
+  runPhaseSoftmaxCorrectness,
+  type PhaseSoftmaxCase,
+} from './perf-kernels';
+import {
   interpretResults,
   buildIphoneBaseline,
   type PerfReport,
@@ -670,6 +674,53 @@ async function runAttentionCorrectnessHandler() {
   }
 }
 
+async function runPhaseSoftmaxHandler() {
+  if (_running) return;
+  _running = true;
+  try {
+    await initBenchmark();
+    installListeners();
+    drainUncaptured();
+    installUncapturedCollector();
+    log('═══ RUN ATTENTION PHASE SOFTMAX (seq=4/16/64/128/256) ═══', 'info');
+    const cases = await runPhaseSoftmaxCorrectness();
+    const mount = _container?.querySelector('#res-phase-softmax') as HTMLElement | null;
+    if (mount) {
+      mount.innerHTML = cases
+        .map((c) => {
+          const lines = [
+            `rows: ${c.rows} · workgroupsX: ${c.workgroupsX} · total invocations: ${c.totalInvocations}`,
+            `maxError: ${c.maxError >= 0 ? c.maxError.toExponential(3) : 'n/a'}`,
+            `errorIndex: ${c.errorIndex >= 0 ? c.errorIndex : 'n/a'}`,
+            `cpuValue: ${c.cpuValue !== null ? c.cpuValue.toExponential(4) : 'n/a'}`,
+            `gpuValue: ${c.gpuValue !== null ? c.gpuValue.toExponential(4) : 'n/a'}`,
+            `expected range: ${c.expectedRange ? `[${c.expectedRange[0].toExponential(3)}, ${c.expectedRange[1].toExponential(3)}]` : 'n/a'}`,
+            `actual range: ${c.actualRange ? `[${c.actualRange[0].toExponential(3)}, ${c.actualRange[1].toExponential(3)}]` : 'n/a'}`,
+            `row sums: [${c.rowSumsMin.toExponential(3)}, ${c.rowSumsMax.toExponential(3)}] (≈1)`,
+            `sentinel count: ${c.sentinelCount}`,
+          ];
+          if (!c.pass) lines.push(`stage: ${c.stage} · ${c.errorType ?? 'gpu-error'} · ${c.errorMessage ?? ''}`);
+          const body = lines.map((l) => `<div style="color:var(--text-dim)">${esc(l)}</div>`).join('');
+          return `
+            <div class="card" style="border-color:${c.pass ? 'var(--green)' : 'var(--red)'};margin-top:12px">
+              <div class="card-header">
+                <span class="card-title">Phase Softmax seq=${c.seq}</span>
+                <span class="badge ${c.pass ? 'badge-pass' : 'badge-fail'}">${c.pass ? 'PASS' : 'FAIL'}</span>
+              </div>
+              <div style="margin-top:8px;font-size:12px;font-family:var(--mono);display:grid;gap:2px;word-break:break-all">${body}</div>
+            </div>`;
+        })
+        .join('');
+    }
+    log(`PHASE SOFTMAX: ${cases.every((c) => c.pass) ? 'ALL PASS' : 'FAILED'} — ${cases.map((c) => `s${c.seq}:${c.pass ? 'PASS' : 'FAIL'}`).join(' ')}`, cases.every((c) => c.pass) ? 'ok' : 'err');
+  } catch (e) {
+    log(`ERROR: ${(e as Error).message}`, 'err');
+    if (hasDeviceLost()) stopDeviceLost();
+  } finally {
+    _running = false;
+  }
+}
+
 async function runCorrectnessTests() {
   if (_running) return;
   if (!gatesPassed()) {
@@ -1118,6 +1169,7 @@ export function render(el: HTMLElement) {
       <button class="btn btn-outline" id="btn-readback-test">RUN READBACK TEST (4B → 1MB)</button>
       <button class="btn btn-outline" id="btn-readback-stress">RUN READBACK STRESS</button>
       <button class="btn btn-outline" id="btn-attention">RUN ATTENTION CORRECTNESS</button>
+      <button class="btn btn-outline" id="btn-phase-softmax">RUN ATTENTION PHASE SOFTMAX</button>
     </div>
 
     <div id="res-minimal-64"></div>
@@ -1125,6 +1177,7 @@ export function render(el: HTMLElement) {
     <div id="res-readback-test"></div>
     <div id="res-readback-stress"></div>
     <div id="res-attention"></div>
+    <div id="res-phase-softmax"></div>
     <div id="res-readback-engine"></div>
 
     <div id="validation-panel"></div>
@@ -1151,6 +1204,7 @@ export function render(el: HTMLElement) {
   el.querySelector('#btn-readback-test')?.addEventListener('click', runReadbackTestHandler);
   el.querySelector('#btn-readback-stress')?.addEventListener('click', runReadbackStressHandler);
   el.querySelector('#btn-attention')?.addEventListener('click', runAttentionCorrectnessHandler);
+  el.querySelector('#btn-phase-softmax')?.addEventListener('click', runPhaseSoftmaxHandler);
   el.querySelector('#btn-harness')?.addEventListener('click', runHarnessMatmulHandler);
 
   const correctBtn = el.querySelector('#btn-correctness') as HTMLButtonElement | null;
