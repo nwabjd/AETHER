@@ -34,6 +34,7 @@ import type { StorageAccess } from './layout.ts';
 import { MATMUL, VEC_ADD, CONV2D, SOFTMAX, RMS_NORM, ATTENTION, ATTENTION_OUTPUT_SENTINEL, softmaxWorkgroups, softmaxDispatchInfo, assertSoftmaxDispatch, type SoftmaxDispatchInfo } from './kernels.ts';
 import { cpuVecAdd, cpuMatmul, cpuConv2D, cpuSoftmax, cpuRMSNorm, cpuAttention } from './cpu-refs.ts';
 import { analyzeNumeric, rowSums } from './numeric.ts';
+import { calculateVectorDispatchForDevice, formatVectorDispatch } from './vector-dispatch.ts';
 
 const QKT_BINDINGS = ['uniform', 'read-only-storage', 'read-only-storage', 'storage'] as const satisfies readonly StorageAccess[];
 const PV_BINDINGS = ['uniform', 'read-only-storage', 'read-only-storage', 'storage'] as const satisfies readonly StorageAccess[];
@@ -280,7 +281,9 @@ export async function benchVecAdd(tm: TimingManager, subset?: ReadonlySet<string
     const bufA = createStorageBuffer(bytes, a);
     const bufB = createStorageBuffer(bytes, b);
     const bufC = createStorageBuffer(bytes);
-    const uniform = createUniformBuffer(createVecAddUniform(n));
+    const device = getDevice();
+    const dispatch = calculateVectorDispatchForDevice(device, n);
+    const uniform = createUniformBuffer(createVecAddUniform(n, dispatch.dispatchStride));
     const pipeline = createPipeline(VEC_ADD, ['uniform', 'read-only-storage', 'read-only-storage', 'storage']);
     const bg = createBindGroupForPipeline(pipeline, ['uniform', 'read-only-storage', 'read-only-storage', 'storage'], [
       { binding: 0, resource: { buffer: uniform } },
@@ -288,8 +291,7 @@ export async function benchVecAdd(tm: TimingManager, subset?: ReadonlySet<string
       { binding: 2, resource: { buffer: bufB } },
       { binding: 3, resource: { buffer: bufC } },
     ]);
-    const count = Math.ceil(n / 64);
-    const wg: [number, number, number] = [count, 1, 1];
+    const wg: [number, number, number] = [dispatch.workgroupsX, dispatch.workgroupsY, 1];
 
     try {
       const got = await dispatchToAndRead(pipeline, bg, wg, bufC, bytes, `vecadd-${n}`);
@@ -304,8 +306,9 @@ export async function benchVecAdd(tm: TimingManager, subset?: ReadonlySet<string
         },
         { iterations: conf.iterations }
       );
+      const note = n === 4_194_304 ? formatVectorDispatch(dispatch, n) : undefined;
       out.push(
-        sample(`vecadd-${n}`, 'Vector Add', `${n.toLocaleString('en-US')} elements`, stats, gbytes(3 * n * 4, stats.medianMs))
+        sample(`vecadd-${n}`, 'Vector Add', `${n.toLocaleString('en-US')} elements`, stats, gbytes(3 * n * 4, stats.medianMs), note)
       );
     } finally {
       bufA.destroy();

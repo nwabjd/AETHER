@@ -4,7 +4,7 @@
 // ─── Vector Addition: C = A + B ───
 
 export const VEC_ADD = /* wgsl */ `
-struct Uniforms { N: u32 };
+struct Uniforms { N: u32, dispatchStride: u32 };
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var<storage, read> A: array<f32>;
 @group(0) @binding(2) var<storage, read> B: array<f32>;
@@ -12,7 +12,7 @@ struct Uniforms { N: u32 };
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let i = gid.x;
+  let i = gid.x + gid.y * u.dispatchStride;
   if (i >= u.N) { return; }
   C[i] = A[i] + B[i];
 }

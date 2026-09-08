@@ -1107,6 +1107,9 @@ function sampleRows(samples: PerfSample[]): string {
       if (s.note && s.note.startsWith('SKIPPED')) {
         return `<tr><td class="td-l">${esc(s.size)}</td><td colspan="7" style="color:var(--yellow)">${esc(s.note)} — not reported as a failure</td></tr>`;
       }
+      const noteRow = s.note
+        ? `<tr class="note-row"><td class="td-l"></td><td colspan="7" style="color:var(--text-dim);font-size:11px;white-space:pre-line">${esc(s.note)}</td></tr>`
+        : '';
       return `<tr ${s.error ? 'style="color:var(--red)"' : ''}>
           <td class="td-l">${esc(s.size)}</td>
           <td>${fmtMode(s.timingMode)}</td>
@@ -1116,7 +1119,7 @@ function sampleRows(samples: PerfSample[]): string {
           <td>${fmtMs(s.maxMs)}</td>
           <td>${fmtMs(s.stdDevMs)}</td>
           <td>${fmtThruput(s.throughput)}</td>
-        </tr>`;
+        </tr>${noteRow}`;
     })
     .join('');
 }

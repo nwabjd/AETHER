@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build && node scripts/verify-build.mjs",
-    "test": "node --experimental-strip-types scripts/regression-readback.test.ts && node --experimental-strip-types scripts/regression-uniforms.test.ts && node --experimental-strip-types scripts/regression-layout.test.ts && node --experimental-strip-types scripts/regression-cpu.test.ts && node --experimental-strip-types scripts/regression-device.test.ts && node --experimental-strip-types scripts/regression-perf.test.ts && node --experimental-strip-types scripts/regression-phase-isolated.test.ts && node --experimental-strip-types scripts/regression-harness.test.ts",
+    "test": "node --experimental-strip-types scripts/regression-readback.test.ts && node --experimental-strip-types scripts/regression-uniforms.test.ts && node --experimental-strip-types scripts/regression-layout.test.ts && node --experimental-strip-types scripts/regression-cpu.test.ts && node --experimental-strip-types scripts/regression-device.test.ts && node --experimental-strip-types scripts/regression-perf.test.ts && node --experimental-strip-types scripts/regression-vector-dispatch.test.ts && node --experimental-strip-types scripts/regression-phase-isolated.test.ts && node --experimental-strip-types scripts/regression-harness.test.ts",
     "preview": "vite preview"
   },
   "devDependencies": {

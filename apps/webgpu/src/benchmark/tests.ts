@@ -26,6 +26,7 @@ import {
   cpuVecAdd, cpuMatmul, cpuConv2D, cpuSoftmax, cpuRMSNorm, cpuAttention,
 } from './cpu-refs';
 import { analyzeNumeric, rowSums, type NumericInfo } from './numeric';
+import { calculateVectorDispatchForDevice } from './vector-dispatch';
 import {
   createVecAddUniform,
   createMatmulUniform,
@@ -279,14 +280,15 @@ async function vecAddCase(N: number): Promise<KernelCaseResult> {
   const bufA = makeBuf(A);
   const bufB = makeBuf(B);
   const bufC = createStorageBuffer(N * 4);
-  const uBuf = createUniformBuffer(createVecAddUniform(N));
+  const dispatch = calculateVectorDispatchForDevice(getDevice(), N);
+  const uBuf = createUniformBuffer(createVecAddUniform(N, dispatch.dispatchStride));
 
   return runComputeCase({
     name: 'VecAdd',
     config: `N=${N}`,
     code: VEC_ADD,
     bindingTypes: VEC_ADD_BINDINGS,
-    workgroups: [Math.ceil(N / 64), 1, 1],
+    workgroups: [dispatch.workgroupsX, dispatch.workgroupsY, 1],
     entries: [
       { binding: 0, resource: { buffer: uBuf } },
       { binding: 1, resource: { buffer: bufA } },

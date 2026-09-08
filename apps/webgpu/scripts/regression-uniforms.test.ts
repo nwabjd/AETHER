@@ -40,14 +40,26 @@ import {
   assert.notEqual(f32[0], 256.0);
 }
 
-// VecAdd 1024 uniform byte layout
+// VecAdd 1024 uniform byte layout (N + dispatchStride, both u32)
 {
-  const buf = createVecAddUniform(1024);
+  const buf = createVecAddUniform(1024, 16 * 64);
   const u32 = new Uint32Array(buf);
 
   assert.equal(buf.byteLength, 16);
   assert.equal(u32[0], 1024);
-  assert.equal(u32[1], 0);
+  assert.equal(u32[1], 16 * 64); // dispatchStride = workgroupsX * 64
+  assert.equal(u32[2], 0);
+  assert.equal(u32[3], 0);
+}
+
+// VecAdd 4,194,304 uniform — dispatchStride = 65,535 * 64 = 4,194,240
+{
+  const buf = createVecAddUniform(4194304, 65535 * 64);
+  const u32 = new Uint32Array(buf);
+
+  assert.equal(buf.byteLength, 16);
+  assert.equal(u32[0], 4194304);
+  assert.equal(u32[1], 65535 * 64);
   assert.equal(u32[2], 0);
   assert.equal(u32[3], 0);
 }

@@ -9,6 +9,7 @@ import {
 import { VEC_ADD } from './kernels';
 import { VEC_ADD_BINDINGS } from './bindings';
 import { createVecAddUniform } from './uniforms';
+import { calculateVectorDispatchForDevice } from './vector-dispatch';
 import { runGpuTest } from './gpu-test';
 
 export async function benchmarkVectorAdd(): Promise<BenchmarkResult[]> {
@@ -27,7 +28,8 @@ export async function benchmarkVectorAdd(): Promise<BenchmarkResult[]> {
     const bufA = createStorageBuffer(bytes, aData);
     const bufB = createStorageBuffer(bytes, bData);
     const bufC = createStorageBuffer(bytes);
-    const uBuf = createUniformBuffer(createVecAddUniform(N));
+    const dispatch = calculateVectorDispatchForDevice(device, N);
+    const uBuf = createUniformBuffer(createVecAddUniform(N, dispatch.dispatchStride));
 
     const bindGroup = device.createBindGroup({
       layout: pipeline.getBindGroupLayout(0),
@@ -43,7 +45,7 @@ export async function benchmarkVectorAdd(): Promise<BenchmarkResult[]> {
       name: 'Vector Addition',
       pipeline,
       bindGroup,
-      workgroups: [Math.ceil(N / 64), 1, 1], // Conservative workgroups
+      workgroups: [dispatch.workgroupsX, dispatch.workgroupsY, 1], // Safe 2D tiling
       outputBuffer: bufC,
       outputBytes: bytes,
       validator: (data) => {

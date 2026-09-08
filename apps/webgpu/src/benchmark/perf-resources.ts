@@ -15,6 +15,7 @@ import {
 } from './engine';
 import { VEC_ADD } from './kernels';
 import { createVecAddUniform } from './uniforms';
+import { calculateVectorDispatchForDevice } from './vector-dispatch';
 
 const RESOURCE_ITERS = 30;
 const RESOURCE_N = 65536; // 256 KiB per buffer
@@ -102,14 +103,15 @@ export async function benchBufferReuse(): Promise<{ allocateDestroy: OverheadSam
   const { pipeline } = makeVecAddPipeline();
   const n = RESOURCE_N;
   const bytes = n * 4;
-  const wg: [number, number, number] = [Math.ceil(n / 64), 1, 1];
+  const dispatch = calculateVectorDispatchForDevice(getDevice(), n);
+  const wg: [number, number, number] = [dispatch.workgroupsX, dispatch.workgroupsY, 1];
   const a = new Float32Array(n);
   const b = new Float32Array(n);
   for (let i = 0; i < n; i++) {
     a[i] = (i % 100) / 25 - 2;
     b[i] = (i % 77) / 13 - 3;
   }
-  const uniform = createUniformBuffer(createVecAddUniform(n));
+  const uniform = createUniformBuffer(createVecAddUniform(n, dispatch.dispatchStride));
 
   // allocate + destroy every operation
   const allocTimes: number[] = [];
@@ -195,17 +197,18 @@ export async function benchBufferReuse(): Promise<{ allocateDestroy: OverheadSam
 export async function benchPipelineCache(): Promise<{ recreate: OverheadSample; cached: OverheadSample }> {
   const n = RESOURCE_N;
   const bytes = n * 4;
-  const wg: [number, number, number] = [Math.ceil(n / 64), 1, 1];
+  const dispatch = calculateVectorDispatchForDevice(getDevice(), n);
+  const wg: [number, number, number] = [dispatch.workgroupsX, dispatch.workgroupsY, 1];
   const a = new Float32Array(n);
   const b = new Float32Array(n);
   for (let i = 0; i < n; i++) {
     a[i] = (i % 100) / 25 - 2;
     b[i] = (i % 77) / 13 - 3;
   }
-const bufA = createStorageBuffer(bytes, a);
+  const bufA = createStorageBuffer(bytes, a);
   const bufB = createStorageBuffer(bytes, b);
   const bufC = createStorageBuffer(bytes);
-  const uniform = createUniformBuffer(createVecAddUniform(n));
+  const uniform = createUniformBuffer(createVecAddUniform(n, dispatch.dispatchStride));
 
   // recreate pipeline + bind group every operation
   const recreateTimes: number[] = [];
@@ -290,14 +293,15 @@ const BATCH_N = 4096;
 export async function benchCommandBatching(): Promise<CommandBatchingResult[]> {
   const n = BATCH_N;
   const bytes = n * 4;
-  const wg: [number, number, number] = [Math.ceil(n / 64), 1, 1];
+  const dispatch = calculateVectorDispatchForDevice(getDevice(), n);
+  const wg: [number, number, number] = [dispatch.workgroupsX, dispatch.workgroupsY, 1];
   const a = new Float32Array(n);
   const b = new Float32Array(n);
   for (let i = 0; i < n; i++) {
     a[i] = (i % 100) / 25 - 2;
     b[i] = (i % 77) / 13 - 3;
   }
-  const uniform = createUniformBuffer(createVecAddUniform(n));
+  const uniform = createUniformBuffer(createVecAddUniform(n, dispatch.dispatchStride));
   const stored = createStorageBuffer(bytes, a);
   const stored2 = createStorageBuffer(bytes, b);
   const bufC = createStorageBuffer(bytes);

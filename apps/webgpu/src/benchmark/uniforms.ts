@@ -22,13 +22,15 @@ export function createMatmulUniform(M: number, N: number, K: number): ArrayBuffe
 }
 
 /**
- * struct Uniforms { N: u32 }  — 16 bytes padded
+ * struct Uniforms { N: u32, dispatchStride: u32 }  — 16 bytes padded
+ * dispatchStride = workgroupsX * 64, used to tile a large Vector Add across a
+ * 2D grid: index = gid.x + gid.y * dispatchStride.
  */
-export function createVecAddUniform(N: number): ArrayBuffer {
+export function createVecAddUniform(N: number, dispatchStride: number): ArrayBuffer {
   const data = new ArrayBuffer(16);
   const u32 = new Uint32Array(data);
   u32[0] = N >>> 0;
-  u32[1] = 0;
+  u32[1] = dispatchStride >>> 0;
   u32[2] = 0;
   u32[3] = 0;
   return data;
