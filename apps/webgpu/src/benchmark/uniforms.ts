@@ -160,3 +160,40 @@ export function logMatmulUniformDiagnostic(buffer: ArrayBuffer): void {
   console.log(`K: ${u32[2]}`);
   console.log(`Uniform bytes: ${hexBytes}`);
 }
+
+/**
+ * TASK 13 — Attention Uniform Diagnostic
+ * Decodes batch/seq/dim/scale from the actual 16-byte ArrayBuffer and verifies
+ * they match the values requested for the kernel (guards the u32/f32 packing).
+ */
+export function logAttentionUniformDiagnostic(
+  buffer: ArrayBuffer,
+  expected: { batch: number; seq: number; dim: number; scale: number }
+): string | null {
+  const u32 = new Uint32Array(buffer);
+  const f32 = new Float32Array(buffer);
+  const bytes = new Uint8Array(buffer);
+  const hexBytes = Array.from(bytes.slice(0, 16))
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join(' ');
+
+  const decoded = {
+    batch: u32[0],
+    seq: u32[1],
+    dim: u32[2],
+    scale: f32[3],
+  };
+
+  console.log(`ATTENTION UNIFORM DIAGNOSTIC:`);
+  console.log(`batch: ${decoded.batch} (expected ${expected.batch})`);
+  console.log(`seq: ${decoded.seq} (expected ${expected.seq})`);
+  console.log(`dim: ${decoded.dim} (expected ${expected.dim})`);
+  console.log(`scale: ${decoded.scale} (expected ${expected.scale})`);
+  console.log(`Uniform bytes: ${hexBytes}`);
+
+  if (decoded.batch !== (expected.batch >>> 0)) return `uniform batch ${decoded.batch} != ${expected.batch}`;
+  if (decoded.seq !== (expected.seq >>> 0)) return `uniform seq ${decoded.seq} != ${expected.seq}`;
+  if (decoded.dim !== (expected.dim >>> 0)) return `uniform dim ${decoded.dim} != ${expected.dim}`;
+  if (Math.abs(decoded.scale - expected.scale) > 1e-6) return `uniform scale ${decoded.scale} != ${expected.scale}`;
+  return null;
+}

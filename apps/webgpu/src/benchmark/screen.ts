@@ -10,6 +10,7 @@ import { initBenchmark, getDevice, getDeviceLostInfo, hasDeviceLost, createStora
 import {
   runAllTests,
   testMatmul,
+  testAttention,
   installUncapturedCollector,
   drainUncaptured,
   type TestResult,
@@ -618,6 +619,52 @@ async function runHarnessMatmulHandler() {
   }
 }
 
+async function runAttentionCorrectnessHandler() {
+  if (_running) return;
+  _running = true;
+  try {
+    await initBenchmark();
+    installListeners();
+    drainUncaptured();
+    installUncapturedCollector();
+    log('═══ RUN ATTENTION CORRECTNESS (seq=4/16/64/128/256) ═══', 'info');
+    const result = await testAttention();
+    const mount = _container?.querySelector('#res-attention') as HTMLElement | null;
+    if (mount) {
+      mount.innerHTML = result.cases
+        .map((c) => {
+          const lines = [
+            `sequence length: ${c.config}`,
+            `maxError: ${c.maxError >= 0 ? c.maxError.toExponential(3) : 'n/a'}`,
+            `errorIndex: ${c.errorIndex >= 0 ? c.errorIndex : 'n/a'}`,
+            `cpuValue: ${c.cpuValue !== null ? c.cpuValue.toExponential(4) : 'n/a'}`,
+            `gpuValue: ${c.gpuValue !== null ? c.gpuValue.toExponential(4) : 'n/a'}`,
+            `expected range: ${c.expectedRange ? `[${c.expectedRange[0].toExponential(3)}, ${c.expectedRange[1].toExponential(3)}]` : 'n/a'}`,
+            `actual range: ${c.actualRange ? `[${c.actualRange[0].toExponential(3)}, ${c.actualRange[1].toExponential(3)}]` : 'n/a'}`,
+            `non-finite count: ${c.nonFiniteIndex >= 0 ? 1 : 0}`,
+          ];
+          if (!c.pass) lines.push(`stage: ${c.stage} · ${c.errorType ?? 'gpu-error'} · ${c.errorMessage ?? ''}`);
+          const body = lines.map((l) => `<div style="color:var(--text-dim)">${esc(l)}</div>`).join('');
+          return `
+            <div class="card" style="border-color:${c.pass ? 'var(--green)' : 'var(--red)'};margin-top:12px">
+              <div class="card-header">
+                <span class="card-title">Attention ${esc(c.config)}</span>
+                <span class="badge ${c.pass ? 'badge-pass' : 'badge-fail'}">${c.pass ? 'PASS' : 'FAIL'}</span>
+              </div>
+              <div style="margin-top:8px;font-size:12px;font-family:var(--mono);display:grid;gap:2px;word-break:break-all">${body}</div>
+            </div>`;
+        })
+        .join('');
+    }
+    log(`ATTENTION CORRECTNESS: ${result.pass ? 'ALL PASS' : 'FAILED'} — ${result.details}`, result.pass ? 'ok' : 'err');
+  } catch (e) {
+    log(`ERROR: ${(e as Error).message}`, 'err');
+    if (hasDeviceLost()) stopDeviceLost();
+  } finally {
+    _running = false;
+  }
+}
+
 async function runCorrectnessTests() {
   if (_running) return;
   if (!gatesPassed()) {
@@ -1065,12 +1112,14 @@ export function render(el: HTMLElement) {
       <button class="btn btn-outline" id="btn-minimal-128">RUN MINIMAL HARNESS MATMUL 128×128</button>
       <button class="btn btn-outline" id="btn-readback-test">RUN READBACK TEST (4B → 1MB)</button>
       <button class="btn btn-outline" id="btn-readback-stress">RUN READBACK STRESS</button>
+      <button class="btn btn-outline" id="btn-attention">RUN ATTENTION CORRECTNESS</button>
     </div>
 
     <div id="res-minimal-64"></div>
     <div id="res-minimal-128"></div>
     <div id="res-readback-test"></div>
     <div id="res-readback-stress"></div>
+    <div id="res-attention"></div>
     <div id="res-readback-engine"></div>
 
     <div id="validation-panel"></div>
@@ -1096,6 +1145,7 @@ export function render(el: HTMLElement) {
   el.querySelector('#btn-minimal-128')?.addEventListener('click', () => runMinimalHarnessHandler(128, 'res-minimal-128'));
   el.querySelector('#btn-readback-test')?.addEventListener('click', runReadbackTestHandler);
   el.querySelector('#btn-readback-stress')?.addEventListener('click', runReadbackStressHandler);
+  el.querySelector('#btn-attention')?.addEventListener('click', runAttentionCorrectnessHandler);
   el.querySelector('#btn-harness')?.addEventListener('click', runHarnessMatmulHandler);
 
   const correctBtn = el.querySelector('#btn-correctness') as HTMLButtonElement | null;

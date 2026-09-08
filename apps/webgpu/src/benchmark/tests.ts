@@ -32,6 +32,7 @@ import {
   createSoftmaxUniform,
   createRMSNormUniform,
   createAttentionUniform,
+  logAttentionUniformDiagnostic,
 } from './uniforms';
 
 // ─── Result shapes ───
@@ -509,35 +510,114 @@ export async function testRMSNorm(): Promise<TestResult> {
   return summarize('RMSNorm', cases);
 }
 
-// ─── Scaled Dot-Product Attention ───
-// batch=1 seq=4 dim=4, then seq=8 dim=8. Q × Kᵀ → scale → stable softmax →
-// softmax × V. Separate score and output buffers.
+// ─── Scaled Dot-Product Attention (Monolithic & Phase Checks) ───
 
-function attentionData(caseNum: number): { batch: number; seq: number; dim: number; scale: number; Q: Float32Array; K: Float32Array; V: Float32Array } {
+// TASK 6 — verify shader compilation BEFORE any attention execution. A
+// compilation error fails the case at the "shader-compilation" stage.
+async function shaderCompilationError(code: string): Promise<string | null> {
+  const device = getDevice();
+  const module = device.createShaderModule({ code });
+  if (typeof module.getCompilationInfo !== 'function') return null;
+  let info: GPUCompilationInfo;
+  try {
+    info = await module.getCompilationInfo();
+  } catch (e) {
+    return `getCompilationInfo failed: ${(e as Error).message}`;
+  }
+  const errors = info.messages.filter((m) => m.type === 'error');
+  if (errors.length === 0) return null;
+  return errors.map((m) => `[line ${m.lineNum}:${m.linePos}] ${m.message}`).join(' | ');
+}
+
+export async function attentionSimpleCase(): Promise<KernelCaseResult> {
   const batch = 1;
-  const seq = caseNum === 1 ? 4 : 8;
-  const dim = seq;
+  const seq = 4;
+  const dim = 4;
+  const scale = 0.5;
+
+  const Q = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+  const K = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+  const V = new Float32Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+
+  const qkv = batch * seq * dim;
+  const scores = batch * seq * seq;
+
+  const uData = createAttentionUniform(batch, seq, dim, scale);
+  const uniformErr = logAttentionUniformDiagnostic(uData, { batch, seq, dim, scale });
+  if (uniformErr) {
+    return failedCase(`Attention 4x4 Identity (b${batch}-s${seq}-d${dim})`, 'uniform', 'uniform-packing', uniformErr);
+  }
+
+  const compileErr = await shaderCompilationError(ATTENTION);
+  if (compileErr) {
+    return failedCase(`Attention 4x4 Identity (b${batch}-s${seq}-d${dim})`, 'shader-compilation', 'shader-compilation', compileErr);
+  }
+
+  const bufQ = makeBuf(Q);
+  const bufK = makeBuf(K);
+  const bufV = makeBuf(V);
+  const bufOut = createStorageBuffer(qkv * 4);
+  const bufScores = createStorageBuffer(scores * 4);
+  const uBuf = createUniformBuffer(uData);
+
+  return runComputeCase({
+    name: 'Attention',
+    config: `4x4 Identity (b${batch}-s${seq}-d${dim})`,
+    code: ATTENTION,
+    bindingTypes: ATTENTION_BINDINGS,
+    workgroups: [batch, 1, 1],
+    entries: [
+      { binding: 0, resource: { buffer: uBuf } },
+      { binding: 1, resource: { buffer: bufQ } },
+      { binding: 2, resource: { buffer: bufK } },
+      { binding: 3, resource: { buffer: bufV } },
+      { binding: 4, resource: { buffer: bufOut } },
+      { binding: 5, resource: { buffer: bufScores } },
+    ],
+    outputBuffer: bufOut,
+    outputBytes: qkv * 4,
+    reference: cpuAttention(Q, K, V, batch, seq, dim, scale),
+    tolerance: 1e-3,
+    dispose: () => {
+      bufQ.destroy(); bufK.destroy(); bufV.destroy();
+      bufOut.destroy(); bufScores.destroy(); uBuf.destroy();
+    },
+  });
+}
+
+export async function attentionSeqCase(seq: number): Promise<KernelCaseResult> {
+  const batch = 1;
+  const dim = 64;
   const scale = 1 / Math.sqrt(dim);
   const makeVals = () => {
     const a = new Float32Array(batch * seq * dim);
     for (let i = 0; i < a.length; i++) a[i] = (i % dim + 1) * 0.1;
     return a;
   };
-  return { batch, seq, dim, scale, Q: makeVals(), K: makeVals(), V: makeVals() };
-}
+  const Q = makeVals();
+  const K = makeVals();
+  const V = makeVals();
 
-async function attentionCase(caseNum: number): Promise<KernelCaseResult> {
-  const a = attentionData(caseNum);
-  const { batch, seq, dim, scale } = a;
   const qkv = batch * seq * dim;
   const scores = batch * seq * seq;
 
-  const bufQ = makeBuf(a.Q);
-  const bufK = makeBuf(a.K);
-  const bufV = makeBuf(a.V);
+  const uData = createAttentionUniform(batch, seq, dim, scale);
+  const uniformErr = logAttentionUniformDiagnostic(uData, { batch, seq, dim, scale });
+  if (uniformErr) {
+    return failedCase(`Attention b${batch}-s${seq}-d${dim}`, 'uniform', 'uniform-packing', uniformErr);
+  }
+
+  const compileErr = await shaderCompilationError(ATTENTION);
+  if (compileErr) {
+    return failedCase(`Attention b${batch}-s${seq}-d${dim}`, 'shader-compilation', 'shader-compilation', compileErr);
+  }
+
+  const bufQ = makeBuf(Q);
+  const bufK = makeBuf(K);
+  const bufV = makeBuf(V);
   const bufOut = createStorageBuffer(qkv * 4);
   const bufScores = createStorageBuffer(scores * 4);
-  const uBuf = createUniformBuffer(createAttentionUniform(batch, seq, dim, scale));
+  const uBuf = createUniformBuffer(uData);
 
   return runComputeCase({
     name: 'Attention',
@@ -555,7 +635,7 @@ async function attentionCase(caseNum: number): Promise<KernelCaseResult> {
     ],
     outputBuffer: bufOut,
     outputBytes: qkv * 4,
-    reference: cpuAttention(a.Q, a.K, a.V, batch, seq, dim, scale),
+    reference: cpuAttention(Q, K, V, batch, seq, dim, scale),
     tolerance: 1e-3,
     dispose: () => {
       bufQ.destroy(); bufK.destroy(); bufV.destroy();
@@ -566,8 +646,11 @@ async function attentionCase(caseNum: number): Promise<KernelCaseResult> {
 
 export async function testAttention(): Promise<TestResult> {
   const cases: KernelCaseResult[] = [];
-  for (const caseNum of [1, 2]) {
-    cases.push(await attentionCase(caseNum));
+  cases.push(await attentionSimpleCase());
+  if (!cases[cases.length - 1].pass) return summarize('Attention', cases);
+
+  for (const seq of [4, 16, 64, 128, 256]) {
+    cases.push(await attentionSeqCase(seq));
     if (!cases[cases.length - 1].pass) break;
   }
   return summarize('Attention', cases);

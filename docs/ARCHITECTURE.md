@@ -112,3 +112,18 @@ All conversion and optimization happens on the HP workstation. The P600's 2 GB V
 See [TWO_DEVICE_STRATEGY.md](TWO_DEVICE_STRATEGY.md) for the full development workflow between the HP workstation, GitHub, and the iPhone.
 
 See [IOS_BUILD.md](IOS_BUILD.md) for the Xcode build pipeline via GitHub Actions.
+
+## Attention Kernel � Correctness-First Architecture (TASK 1�17)
+
+The monolithic ATTENTION shader (`kernels.ts`) is CURRENTLY a correctness implementation, not an optimized one. It uses `@workgroup_size(1)` so that exactly ONE invocation owns ONE batch: no two invocations ever write the same `scores`/`out` locations, which eliminates the data race seen when 16 invocations concurrently ran the full QK^T -> softmax -> PV loop for batch=1. Worker-scope loops over all i/j/d make determinism the priority.
+
+The math is deliberately preserved: QK^T -> scale by 1/sqrt(dim) -> numerically stable softmax (max subtraction) -> softmax x V. Nothing about the algorithm was changed for the correctness fix.
+
+Once correctness is fully green (seq=4/16/64/128/256), we will COMPARE performance architectures � NOT before:
+
+- A) Safe monolithic correctness kernel (current: @workgroup_size(1)).
+- B) Phase-split ATTN_QKT -> Softmax -> ATTN_PV (bench-only path in perf-kernels.ts, structurally closer to a parallel design).
+- C) Tiled attention (shared-memory blocking).
+- D) Future fused optimized attention.
+
+No shared memory, tiling, subgroups, SIMD tricks, vectorization, atomics, half precision, or quantization is introduced until the correctness suite is fully green.

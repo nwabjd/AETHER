@@ -596,8 +596,13 @@ async function measureAttentionPhases(
   dim: number,
   iterations: number
 ): Promise<PerfSample[]> {
-  const wgQ: [number, number, number] = [Math.ceil(seq / 64), 1, 1];
-  const wgP: [number, number, number] = [Math.ceil(seq / 64), dim, 1];
+  // TASK 11: dispatch dims must match each phase kernel's index mapping:
+  //   ATTN_QKT → i=gid.x (row), b=gid.y (batch)
+  //   ATTN_PV  → i=gid.x (row), d=gid.y (dim), b=gid.z (batch)
+  // Softmax shader → gid.x = row (dispatch [seq,1,1]).
+  const batch = ctx.batch;
+  const wgQ: [number, number, number] = [Math.ceil(seq / 64), batch, 1];
+  const wgP: [number, number, number] = [Math.ceil(seq / 64), dim, batch];
   const scoresBytes = seq * seq * 4;
   const outBytes = seq * dim * 4;
 

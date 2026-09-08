@@ -156,4 +156,51 @@ import { analyzeNumeric, rowSums } from '../src/benchmark/numeric.ts';
   assert.equal(r.lengthMismatch, false);
 }
 
+// ── cpuAttention: ultra-simple 4x4 identity test ──
+{
+  const Q = new Float32Array([
+    1, 0, 0, 0,
+    0, 1, 0, 0,
+    0, 0, 1, 0,
+    0, 0, 0, 1,
+  ]);
+  const K = new Float32Array([
+    1, 0, 0, 0,
+    0, 1, 0, 0,
+    0, 0, 1, 0,
+    0, 0, 0, 1,
+  ]);
+  const V = new Float32Array([
+    1, 2, 3, 4,
+    5, 6, 7, 8,
+    9, 10, 11, 12,
+    13, 14, 15, 16,
+  ]);
+  const out = cpuAttention(Q, K, V, 1, 4, 4, 0.5);
+  assert.equal(out.length, 16);
+  assert.ok(out.every((v) => Number.isFinite(v)));
+
+  // Analytic expectations for Q=K=Identity, scale=0.5.
+  // Each scores row r = 0.5 at column r, 0 elsewhere (Q·K^T = Identity).
+  // softmax([...,0.5,...]) = [1..e^0.5..1] / (e^0.5 + 3).
+  const s = Math.exp(0.5);
+  const denom = s + 3;
+  const diagW = s / denom; // weight on matched position
+  const offW = 1 / denom;  // weight on the three unmatched positions
+  // Row r of the output = diagW*V[r] + offW*(V[0]+V[1]+V[2]+V[3] - V[r])
+  //                     = offW*ΣV + (diagW - offW)*V[r]
+  const vSumPerCol = [
+    (1 + 5 + 9 + 13),
+    (2 + 6 + 10 + 14),
+    (3 + 7 + 11 + 15),
+    (4 + 8 + 12 + 16),
+  ];
+  for (let r = 0; r < 4; r++) {
+    for (let d = 0; d < 4; d++) {
+      const expected = offW * vSumPerCol[d] + (diagW - offW) * V[r * 4 + d];
+      assert.ok(Math.abs(out[r * 4 + d] - expected) < 1e-5, `out[${r * 4 + d}] ${out[r * 4 + d]} != ${expected}`);
+    }
+  }
+}
+
 console.log('PASS: CPU reference + numeric unit tests');

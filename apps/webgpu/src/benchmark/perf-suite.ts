@@ -16,6 +16,7 @@ import {
 } from './perf-kernels';
 import { benchMemory, benchBufferReuse, benchPipelineCache, benchCommandBatching } from './perf-resources';
 import { benchSustained } from './perf-sustained';
+import { attentionSeqCase } from './tests';
 import {
   buildPerfReport,
   captureBrowserInfo,
@@ -46,6 +47,20 @@ const QUICK = {
   attentionSeqs: [256] as number[],
 };
 
+// TASK 14 — the QUICK benchmark refuses to start timing until attention
+// correctness passes for seq=128 and seq=256. No performance number is
+// produced for a failed configuration.
+async function attentionCorrectnessGate(seqs: number[]): Promise<string | null> {
+  for (const seq of seqs) {
+    const res = await attentionSeqCase(seq);
+    if (!res.pass) {
+      const detail = res.errorMessage ? ` (${res.errorMessage})` : '';
+      return `attention seq=${seq} ${res.errorType ?? 'failed'}${detail}`;
+    }
+  }
+  return null;
+}
+
 export async function runPerfSuite(opts: PerfOpts): Promise<PerfReport> {
   if (_suiteRunning) throw new Error('A benchmark suite is already running.');
   _suiteRunning = true;
@@ -70,6 +85,15 @@ export async function runPerfSuite(opts: PerfOpts): Promise<PerfReport> {
     };
 
     const step = (msg: string) => opts.onProgress?.(msg);
+
+    // TASK 14: gate QUICK timing on attention correctness (seq=128 and seq=256).
+    if (opts.mode === 'quick') {
+      step('attention correctness gate (seq=128,256)');
+      const gateErr = await attentionCorrectnessGate([128, 256]);
+      if (gateErr) {
+        throw new Error(`Attention correctness failed — fix correctness before benchmarking. (${gateErr})`);
+      }
+    }
 
     step('matmul');
     tests.matmul = await benchMatmul(tm, full ? undefined : QUICK.matmul);

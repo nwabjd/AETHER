@@ -139,7 +139,11 @@ struct Uniforms { batch: u32, seq: u32, dim: u32, scale: f32 };
 @group(0) @binding(4) var<storage, read_write> out: array<f32>;
 @group(0) @binding(5) var<storage, read_write> scores: array<f32>;
 
-@compute @workgroup_size(16)
+// ONE INVOCATION OWNS ONE BATCH:
+// @workgroup_size(1) is intentionally used here for deterministic correctness
+// so exactly one GPU thread computes all sequence rows for a given batch without
+// intra-workgroup data races on the scores/out storage buffers.
+@compute @workgroup_size(1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let b = gid.x;
   if (b >= u.batch) { return; }

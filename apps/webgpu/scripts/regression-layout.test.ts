@@ -90,6 +90,14 @@ assert.deepEqual(attentionRendered, [
   'storage',
 ]);
 
+// TASK 7 — the monolithic ATTENTION shader must stay a single-invocation
+// correctness kernel (one invocation owns one batch => no data race on the
+// shared scores/out buffers). Any reintroduction of @workgroup_size(>1) or a
+// concurrent writer layout must fail here.
+assert.match(ATTENTION, /@compute\s*@workgroup_size\(1\)/, 'ATTENTION must use @workgroup_size(1)');
+assert.match(ATTENTION, /ONE INVOCATION OWNS ONE BATCH/, 'ATTENTION must document the single-owner contract');
+assert.match(ATTENTION, /for \(var i = 0u; i < u\.seq; i\+\+\)/, 'ATTENTION must keep the serial row loop');
+
 // Count validation must fail clearly on mismatch.
 assert.throws(
   () => assertBindingCount(MATMUL_BINDINGS, [{ binding: 0 }, { binding: 1 }]),
