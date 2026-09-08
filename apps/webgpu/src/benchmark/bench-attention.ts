@@ -48,7 +48,7 @@ export async function benchmarkAttention(): Promise<BenchmarkResult[]> {
     name: 'Attention',
     pipeline,
     bindGroup,
-    workgroups: [batch, 1, 1],
+    workgroups: [Math.max(1, Math.ceil((batch * seq) / 64)), 1, 1],
     outputBuffer: bufOut,
     outputBytes: qkvSize * 4,
     validator: (data) => {

@@ -115,13 +115,17 @@ See [IOS_BUILD.md](IOS_BUILD.md) for the Xcode build pipeline via GitHub Actions
 
 ## Attention Kernel � Correctness-First Architecture (TASK 1�17)
 
-The monolithic ATTENTION shader (`kernels.ts`) is CURRENTLY a correctness implementation, not an optimized one. It uses `@workgroup_size(1)` so that exactly ONE invocation owns ONE batch: no two invocations ever write the same `scores`/`out` locations, which eliminates the data race seen when 16 invocations concurrently ran the full QK^T -> softmax -> PV loop for batch=1. Worker-scope loops over all i/j/d make determinism the priority.
+The monolithic ATTENTION shader (`kernels.ts`) is CURRENTLY a correctness implementation, not an optimized one. It is ROW-PARALLEL: `@workgroup_size(64)`, with ONE invocation owning ONE output row (`let rowIndex = gid.x; let totalRows = u.batch * u.seq; let b = rowIndex / u.seq; let i = rowIndex % u.seq;`). Dispatch is `ceil(batch*seq/64)` workgroups (seq=256 -> 4 groups). Each invocation writes only its own `scores[base + j]` row and `out[row*seq + ...]` row, so no two invocations ever write the same memory.
+
+Why row-parallel instead of a single-invocation monolith: the previous `@workgroup_size(1)` fix was still WRONG on iPhone — seq=256 left output rows 128..255 unwritten (observed stale GPU memory: exact 64.0 at row 128, identical to the reused MatMul-128 output buffer). A single invocation processing all rows exercised the same trap; independent row invocations make every row an independent thread.
 
 The math is deliberately preserved: QK^T -> scale by 1/sqrt(dim) -> numerically stable softmax (max subtraction) -> softmax x V. Nothing about the algorithm was changed for the correctness fix.
 
+Buffers are NEVER assumed zero-initialized (TASK 16): all attention output buffers are pre-filled with sentinel `-12345.0` (`ATTENTION_OUTPUT_SENTINEL`) before dispatch, and any sentinel remaining after execution is reported as UNWRITTEN ATTENTION OUTPUT with the first index. Row coverage is derived from the sentinel readback (mass-equivalent to a dedicated `rowCoverage[]` buffer): `rows covered X/N, first missing row R`.
+
 Once correctness is fully green (seq=4/16/64/128/256), we will COMPARE performance architectures � NOT before:
 
-- A) Safe monolithic correctness kernel (current: @workgroup_size(1)).
+- A) Row-parallel reference kernel (the current correctness implementation).
 - B) Phase-split ATTN_QKT -> Softmax -> ATTN_PV (bench-only path in perf-kernels.ts, structurally closer to a parallel design).
 - C) Tiled attention (shared-memory blocking).
 - D) Future fused optimized attention.

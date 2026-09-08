@@ -643,6 +643,11 @@ async function runAttentionCorrectnessHandler() {
             `actual range: ${c.actualRange ? `[${c.actualRange[0].toExponential(3)}, ${c.actualRange[1].toExponential(3)}]` : 'n/a'}`,
             `non-finite count: ${c.nonFiniteIndex >= 0 ? 1 : 0}`,
           ];
+          // TASK 13 — row coverage / unwritten-output diagnostics.
+          if (c.rowsExpected !== undefined) {
+            lines.push(`rows: ${c.rowsCovered ?? 0}/${c.rowsExpected} covered` + (c.firstMissingRow !== null && c.firstMissingRow !== undefined ? ` (first missing row ${c.firstMissingRow})` : ''));
+            lines.push(`sentinel count: ${c.sentinelCount ?? 0}` + (c.firstSentinelIndex !== null && c.firstSentinelIndex !== undefined ? ` (first @ ${c.firstSentinelIndex}, last @ ${c.lastSentinelIndex})` : ''));
+          }
           if (!c.pass) lines.push(`stage: ${c.stage} · ${c.errorType ?? 'gpu-error'} · ${c.errorMessage ?? ''}`);
           const body = lines.map((l) => `<div style="color:var(--text-dim)">${esc(l)}</div>`).join('');
           return `

@@ -128,7 +128,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 `;
 
-// ─── Scaled Dot-Product Attention ───
+// ─── Scaled Dot-Product Attention (row-parallel correctness kernel) ───
+// FIX: The previous single-threaded @workgroup_size(1) monolith caused the
+// GPU to stall/skip later rows on iOS Safari, leaving stale buffer content
+// in the output (observed as 64.0 at row 128 of seq=256 from reused
+// MatMul-128 output memory). Row-parallelism ensures every row is an
+// independent invocation.
+
+// TASK 8/17 — sentinel used to prove every output row was written. Correctness
+// buffers are pre-filled with it before dispatch; any leftover after execution
+// means that output row/region was never written (buffer reuse / partial
+// dispatch), never a legitimate computed result (computed values ≈ 0.1–n).
+export const ATTENTION_OUTPUT_SENTINEL = -12345.0;
 
 export const ATTENTION = /* wgsl */ `
 struct Uniforms { batch: u32, seq: u32, dim: u32, scale: f32 };
@@ -139,45 +150,43 @@ struct Uniforms { batch: u32, seq: u32, dim: u32, scale: f32 };
 @group(0) @binding(4) var<storage, read_write> out: array<f32>;
 @group(0) @binding(5) var<storage, read_write> scores: array<f32>;
 
-// ONE INVOCATION OWNS ONE BATCH:
-// @workgroup_size(1) is intentionally used here for deterministic correctness
-// so exactly one GPU thread computes all sequence rows for a given batch without
-// intra-workgroup data races on the scores/out storage buffers.
-@compute @workgroup_size(1)
+@compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let b = gid.x;
-  if (b >= u.batch) { return; }
+  let totalRows = u.batch * u.seq;
+  let rowIndex = gid.x;
+  if (rowIndex >= totalRows) { return; }
 
-  for (var i = 0u; i < u.seq; i++) {
-    var max_val: f32 = -1e30;
-    for (var j = 0u; j < u.seq; j++) {
-      var dot: f32 = 0.0;
-      for (var d = 0u; d < u.dim; d++) {
-        dot += Q[(b * u.seq + i) * u.dim + d] * K[(b * u.seq + j) * u.dim + d];
-      }
-      let s = dot * u.scale;
-      scores[b * u.seq * u.seq + i * u.seq + j] = s;
-      if (s > max_val) { max_val = s; }
-    }
+  let b = rowIndex / u.seq;
+  let i = rowIndex % u.seq;
+  let base = b * u.seq * u.seq + i * u.seq;
 
-    var sum_exp: f32 = 0.0;
-    for (var j = 0u; j < u.seq; j++) {
-      let idx = b * u.seq * u.seq + i * u.seq + j;
-      let e = exp(scores[idx] - max_val);
-      scores[idx] = e;
-      sum_exp += e;
-    }
-    for (var j = 0u; j < u.seq; j++) {
-      scores[b * u.seq * u.seq + i * u.seq + j] /= sum_exp;
-    }
-
+  var max_val: f32 = -1e30;
+  for (var j = 0u; j < u.seq; j++) {
+    var dot: f32 = 0.0;
     for (var d = 0u; d < u.dim; d++) {
-      var sum: f32 = 0.0;
-      for (var j = 0u; j < u.seq; j++) {
-        sum += scores[b * u.seq * u.seq + i * u.seq + j] * V[(b * u.seq + j) * u.dim + d];
-      }
-      out[(b * u.seq + i) * u.dim + d] = sum;
+      dot += Q[(b * u.seq + i) * u.dim + d] * K[(b * u.seq + j) * u.dim + d];
     }
+    let s = dot * u.scale;
+    scores[base + j] = s;
+    if (s > max_val) { max_val = s; }
+  }
+
+  var sum_exp: f32 = 0.0;
+  for (var j = 0u; j < u.seq; j++) {
+    let e = exp(scores[base + j] - max_val);
+    scores[base + j] = e;
+    sum_exp += e;
+  }
+  for (var j = 0u; j < u.seq; j++) {
+    scores[base + j] /= sum_exp;
+  }
+
+  for (var d = 0u; d < u.dim; d++) {
+    var sum: f32 = 0.0;
+    for (var j = 0u; j < u.seq; j++) {
+      sum += scores[base + j] * V[(b * u.seq + j) * u.dim + d];
+    }
+    out[(b * u.seq + i) * u.dim + d] = sum;
   }
 }
 `;

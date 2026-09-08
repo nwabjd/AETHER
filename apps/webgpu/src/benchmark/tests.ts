@@ -13,7 +13,7 @@ import {
   createBindGroupForPipeline,
 } from './engine';
 import {
-  VEC_ADD, MATMUL, CONV2D, SOFTMAX, RMS_NORM, ATTENTION,
+  VEC_ADD, MATMUL, CONV2D, SOFTMAX, RMS_NORM, ATTENTION, ATTENTION_OUTPUT_SENTINEL,
 } from './kernels';
 import {
   VEC_ADD_BINDINGS, MATMUL_BINDINGS, CONV2D_BINDINGS,
@@ -54,6 +54,13 @@ export interface KernelCaseResult {
   executionDeviceId?: number;
   bindGroupDeviceId?: number | null;
   mismatch?: boolean;
+  // Row-coverage / unwritten-output diagnostics (attention correctness, TASK 8–10).
+  rowsExpected?: number;
+  rowsCovered?: number;
+  firstMissingRow?: number | null;
+  sentinelCount?: number;
+  firstSentinelIndex?: number | null;
+  lastSentinelIndex?: number | null;
 }
 
 export interface TestResult {
@@ -137,6 +144,8 @@ interface RunCaseOptions {
   reference: Float32Array;
   tolerance: number;
   extraCheck?: (gpu: Float32Array) => string | null;
+  // TASK 8–10: async post-readback check (row coverage / sentinel scan).
+  postValidate?: (gpu: Float32Array) => Promise<{ error: string | null; diag?: Partial<KernelCaseResult> }>;
 }
 
 // Executes one kernel configuration on the shared AETHER device with exact
@@ -189,10 +198,24 @@ async function runComputeCase(o: RunCaseOptions): Promise<KernelCaseResult> {
     stage = 'validation';
     const num: NumericInfo = analyzeNumeric(gpu, o.reference, o.tolerance);
     const extraErr = o.extraCheck ? o.extraCheck(gpu) : null;
-    const pass = num.pass && extraErr === null;
+    let postErr: string | null = null;
+    let postDiag: Partial<KernelCaseResult> = {};
+    if (o.postValidate) {
+      try {
+        const p = await o.postValidate(gpu);
+        postErr = p.error;
+        postDiag = p.diag ?? {};
+      } catch (e) {
+        postErr = (e as Error).message;
+      }
+    }
+    const pass = num.pass && extraErr === null && postErr === null;
 
     if (!pass) {
-      if (!num.allFinite) {
+      if (postErr !== null) {
+        errorType = 'output-incomplete';
+        errorMessage = postErr;
+      } else if (!num.allFinite) {
         errorType = 'non-finite';
         errorMessage = `non-finite output at index ${num.nonFiniteIndex}`;
       } else if (num.lengthMismatch) {
@@ -226,6 +249,7 @@ async function runComputeCase(o: RunCaseOptions): Promise<KernelCaseResult> {
       executionDeviceId: outcome.executionDeviceId,
       bindGroupDeviceId: outcome.bindGroupDeviceId,
       mismatch: outcome.mismatch,
+      ...postDiag,
     };
   } catch (e) {
     return failedCase(o.config, stage, errorType ?? 'exception', errorMessage ?? (e as Error).message);
@@ -512,6 +536,75 @@ export async function testRMSNorm(): Promise<TestResult> {
 
 // ─── Scaled Dot-Product Attention (Monolithic & Phase Checks) ───
 
+// TASK 3 — row-parallel dispatch: ceil(batch*seq/64) workgroups, 64 invocations
+// each, one invocation per output row.
+function attentionWorkgroups(batch: number, seq: number): [number, number, number] {
+  return [Math.max(1, Math.ceil((batch * seq) / 64)), 1, 1];
+}
+
+// TASK 8 / TASK 17 — correctness-only output initialization. Every attention
+// buffer is pre-filled with a sentinel before dispatch. Any element still equal
+// to the sentinel after execution proves that output row was never written
+// (buffer reuse / partial dispatch), because computed values never approach it.
+// (ATTENTION_OUTPUT_SENTINEL defined in kernels.ts alongside ATTENTION.)
+
+// TASK 9 / TASK 10 — row coverage + unwritten-output diagnostics. Uses the
+// sentinel readback (rather than a separate GPU buffer) so coverage and
+// unwritten-output are proven directly from the actual kernel output.
+interface CoverageStats {
+  rowsExpected: number;
+  rowsCovered: number;
+  firstMissingRow: number | null;
+  sentinelCount: number;
+  firstSentinelIndex: number | null;
+  lastSentinelIndex: number | null;
+}
+
+function attentionCoverage(gpu: Float32Array, rows: number, dim: number): CoverageStats {
+  let sentinelCount = 0;
+  let firstSentinelIndex: number | null = null;
+  let lastSentinelIndex: number | null = null;
+  const rowHasSentinel = new Array<boolean>(rows).fill(false);
+  for (let idx = 0; idx < gpu.length; idx++) {
+    if (gpu[idx] === ATTENTION_OUTPUT_SENTINEL) {
+      sentinelCount++;
+      if (firstSentinelIndex === null) firstSentinelIndex = idx;
+      lastSentinelIndex = idx;
+      rowHasSentinel[Math.floor(idx / dim)] = true;
+    }
+  }
+  let rowsCovered = 0;
+  let firstMissingRow: number | null = null;
+  for (let r = 0; r < rows; r++) {
+    if (!rowHasSentinel[r]) rowsCovered++;
+    else if (firstMissingRow === null) firstMissingRow = r;
+  }
+  return { rowsExpected: rows, rowsCovered, firstMissingRow, sentinelCount, firstSentinelIndex, lastSentinelIndex };
+}
+
+function attentionPostValidate(batch: number, seq: number, dim: number): RunCaseOptions['postValidate'] {
+  return async (gpu) => {
+    const c = attentionCoverage(gpu, batch * seq, dim);
+    const diag: Partial<KernelCaseResult> = {
+      rowsExpected: c.rowsExpected,
+      rowsCovered: c.rowsCovered,
+      firstMissingRow: c.firstMissingRow,
+      sentinelCount: c.sentinelCount,
+      firstSentinelIndex: c.firstSentinelIndex,
+      lastSentinelIndex: c.lastSentinelIndex,
+    };
+    let error: string | null = null;
+    if (c.sentinelCount > 0) {
+      error =
+        `UNWRITTEN ATTENTION OUTPUT — ${c.sentinelCount} sentinel(s) remain ` +
+        `(first @ ${c.firstSentinelIndex}, last @ ${c.lastSentinelIndex}) — ` +
+        `rows covered ${c.rowsCovered}/${c.rowsExpected}` +
+        (c.firstMissingRow !== null ? `, first missing row ${c.firstMissingRow}` : '');
+    }
+    return { error, diag };
+  };
+}
+
 // TASK 6 — verify shader compilation BEFORE any attention execution. A
 // compilation error fails the case at the "shader-compilation" stage.
 async function shaderCompilationError(code: string): Promise<string | null> {
@@ -556,7 +649,8 @@ export async function attentionSimpleCase(): Promise<KernelCaseResult> {
   const bufQ = makeBuf(Q);
   const bufK = makeBuf(K);
   const bufV = makeBuf(V);
-  const bufOut = createStorageBuffer(qkv * 4);
+  // TASK 17 — pre-fill output with sentinel; any leftover proves unwritten rows.
+  const bufOut = createStorageBuffer(qkv * 4, new Float32Array(qkv).fill(ATTENTION_OUTPUT_SENTINEL));
   const bufScores = createStorageBuffer(scores * 4);
   const uBuf = createUniformBuffer(uData);
 
@@ -565,7 +659,7 @@ export async function attentionSimpleCase(): Promise<KernelCaseResult> {
     config: `4x4 Identity (b${batch}-s${seq}-d${dim})`,
     code: ATTENTION,
     bindingTypes: ATTENTION_BINDINGS,
-    workgroups: [batch, 1, 1],
+    workgroups: attentionWorkgroups(batch, seq),
     entries: [
       { binding: 0, resource: { buffer: uBuf } },
       { binding: 1, resource: { buffer: bufQ } },
@@ -578,6 +672,7 @@ export async function attentionSimpleCase(): Promise<KernelCaseResult> {
     outputBytes: qkv * 4,
     reference: cpuAttention(Q, K, V, batch, seq, dim, scale),
     tolerance: 1e-3,
+    postValidate: attentionPostValidate(batch, seq, dim),
     dispose: () => {
       bufQ.destroy(); bufK.destroy(); bufV.destroy();
       bufOut.destroy(); bufScores.destroy(); uBuf.destroy();
@@ -615,7 +710,8 @@ export async function attentionSeqCase(seq: number): Promise<KernelCaseResult> {
   const bufQ = makeBuf(Q);
   const bufK = makeBuf(K);
   const bufV = makeBuf(V);
-  const bufOut = createStorageBuffer(qkv * 4);
+  // TASK 17 — pre-fill output with sentinel; any leftover proves unwritten rows.
+  const bufOut = createStorageBuffer(qkv * 4, new Float32Array(qkv).fill(ATTENTION_OUTPUT_SENTINEL));
   const bufScores = createStorageBuffer(scores * 4);
   const uBuf = createUniformBuffer(uData);
 
@@ -624,7 +720,7 @@ export async function attentionSeqCase(seq: number): Promise<KernelCaseResult> {
     config: `b${batch}-s${seq}-d${dim}`,
     code: ATTENTION,
     bindingTypes: ATTENTION_BINDINGS,
-    workgroups: [batch, 1, 1],
+    workgroups: attentionWorkgroups(batch, seq),
     entries: [
       { binding: 0, resource: { buffer: uBuf } },
       { binding: 1, resource: { buffer: bufQ } },
@@ -637,6 +733,7 @@ export async function attentionSeqCase(seq: number): Promise<KernelCaseResult> {
     outputBytes: qkv * 4,
     reference: cpuAttention(Q, K, V, batch, seq, dim, scale),
     tolerance: 1e-3,
+    postValidate: attentionPostValidate(batch, seq, dim),
     dispose: () => {
       bufQ.destroy(); bufK.destroy(); bufV.destroy();
       bufOut.destroy(); bufScores.destroy(); uBuf.destroy();

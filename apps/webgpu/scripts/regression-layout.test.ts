@@ -90,13 +90,15 @@ assert.deepEqual(attentionRendered, [
   'storage',
 ]);
 
-// TASK 7 — the monolithic ATTENTION shader must stay a single-invocation
-// correctness kernel (one invocation owns one batch => no data race on the
-// shared scores/out buffers). Any reintroduction of @workgroup_size(>1) or a
-// concurrent writer layout must fail here.
-assert.match(ATTENTION, /@compute\s*@workgroup_size\(1\)/, 'ATTENTION must use @workgroup_size(1)');
-assert.match(ATTENTION, /ONE INVOCATION OWNS ONE BATCH/, 'ATTENTION must document the single-owner contract');
-assert.match(ATTENTION, /for \(var i = 0u; i < u\.seq; i\+\+\)/, 'ATTENTION must keep the serial row loop');
+// TASK 1–7 — ATTENTION is a row-parallel correctness kernel: @workgroup_size(64)
+// with one invocation per output row. Any reintroduction of the serial i-loop
+// (a single invocation computing every row) must fail here.
+assert.match(ATTENTION, /@compute\s*@workgroup_size\(64\)/, 'ATTENTION must use @workgroup_size(64)');
+assert.match(ATTENTION, /let\s+rowIndex\s*=\s*gid\.x/, 'ATTENTION must derive the output row from global_invocation_id');
+assert.match(ATTENTION, /let\s+totalRows\s*=\s*u\.batch\s*\*\s*u\.seq/, 'ATTENTION must compute totalRows from batch*seq');
+assert.match(ATTENTION, /let\s+b\s*=\s*rowIndex\s*\/\s*u\.seq/, 'ATTENTION must derive batch from rowIndex');
+assert.match(ATTENTION, /let\s+i\s*=\s*rowIndex\s*%\s*u\.seq/, 'ATTENTION must derive row within batch from rowIndex');
+assert.doesNotMatch(ATTENTION, /for \(var i = 0u; i < u\.seq; i\+\+\)/, 'ATTENTION must NOT contain a serial per-row loop');
 
 // Count validation must fail clearly on mismatch.
 assert.throws(

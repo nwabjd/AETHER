@@ -30,7 +30,7 @@ import {
   logMatmulUniformDiagnostic,
 } from './uniforms';
 import type { StorageAccess } from './layout';
-import { MATMUL, VEC_ADD, CONV2D, SOFTMAX, RMS_NORM, ATTENTION } from './kernels';
+import { MATMUL, VEC_ADD, CONV2D, SOFTMAX, RMS_NORM, ATTENTION, ATTENTION_OUTPUT_SENTINEL } from './kernels';
 import { cpuVecAdd, cpuMatmul, cpuConv2D, cpuSoftmax, cpuRMSNorm, cpuAttention } from './cpu-refs';
 
 const QKT_BINDINGS = ['uniform', 'read-only-storage', 'read-only-storage', 'storage'] as const satisfies readonly StorageAccess[];
@@ -93,6 +93,12 @@ function gbytes(bytes: number, ms: number): Throughput {
 function allFinite(data: Float32Array): boolean {
   for (let i = 0; i < data.length; i++) if (!Number.isFinite(data[i])) return false;
   return true;
+}
+
+// TASK 8/17 — first index still holding the output sentinel, or -1 if fully written.
+function findSentinel(data: Float32Array): number {
+  for (let i = 0; i < data.length; i++) if (data[i] === ATTENTION_OUTPUT_SENTINEL) return i;
+  return -1;
 }
 
 function maxAbsDiff(a: Float32Array, b: Float32Array): number {
@@ -554,8 +560,17 @@ export async function benchAttention(tm: TimingManager, seqs?: number[]): Promis
     }
 
     try {
-      // monolithic validation vs CPU reference
-      const got = await dispatchToAndRead(ctx.pipelines.total, ctx.groups.total, [batch, 1, 1], ctx.bufs.out, seq * dim * 4, `attention-${seq}`);
+      // monolithic validation vs CPU reference (row-parallel dispatch: one
+      // invocation per output row, 64/workgroup => ceil(batch*seq/64) groups)
+      const wgTotal: [number, number, number] = [Math.max(1, Math.ceil((batch * seq) / 64)), 1, 1];
+      const got = await dispatchToAndRead(ctx.pipelines.total, ctx.groups.total, wgTotal, ctx.bufs.out, seq * dim * 4, `attention-${seq}`);
+      // TASK 9/10 — unwritten-output scan: any sentinel left in the output means
+      // a row (or more) was never written. Guards against buffer reuse.
+      const sentinelIdx = findSentinel(got);
+      if (sentinelIdx >= 0) {
+        const row = Math.floor(sentinelIdx / dim);
+        throw fail('attention', `seq=${seq}`, 'UNWRITTEN ATTENTION OUTPUT', `sentinel remains @ index ${sentinelIdx} (row ${row}); rows not fully written — fix correctness before benchmarking`);
+      }
       if (conf.validate) {
         assertValid('attention', `seq=${seq}`, got, ctx.ref.out, 1e-2);
       } else if (!allFinite(got)) {
@@ -566,7 +581,7 @@ export async function benchAttention(tm: TimingManager, seqs?: number[]): Promis
         (pass) => {
           pass.setPipeline(ctx.pipelines.total);
           pass.setBindGroup(0, ctx.groups.total);
-          pass.dispatchWorkgroups(batch, 1, 1);
+          pass.dispatchWorkgroups(wgTotal[0], wgTotal[1], wgTotal[2]);
         },
         { iterations, wait: waitFor(ctx.bufs.out, seq * dim * 4, `attention-${seq}`) }
       );
@@ -695,7 +710,9 @@ async function setupAttention(seq: number, dim: number, batch: number): Promise<
   const bufQ = createStorageBuffer(seq * dim * 4, ref.Q);
   const bufK = createStorageBuffer(seq * dim * 4, ref.K);
   const bufV = createStorageBuffer(seq * dim * 4, ref.V);
-  const bufOut = createStorageBuffer(seq * dim * 4);
+  // TASK 8/17 — pre-fill output with sentinel; leftover proves unwritten rows
+  // (buffer reuse guard: never rely on freshly allocated buffers being zero).
+  const bufOut = createStorageBuffer(seq * dim * 4, new Float32Array(seq * dim).fill(ATTENTION_OUTPUT_SENTINEL));
   const bufScores = createStorageBuffer(seq * seq * 4);
   const bufProbs = createStorageBuffer(seq * seq * 4);
   const uniform = createUniformBuffer(createAttentionUniform(batch, seq, dim, scale));
