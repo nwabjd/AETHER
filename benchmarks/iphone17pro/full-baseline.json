@@ -1,0 +1,130 @@
+{
+  "schemaVersion": "1.0",
+  "benchmarkVersion": "0.1.0",
+  "kind": "FULL_BENCHMARK_RESULT",
+  "device": {
+    "name": "iPhone 17 Pro",
+    "webgpuAvailable": true,
+    "adapterName": "UNAVAILABLE",
+    "adapterVendor": "UNAVAILABLE",
+    "adapterDevice": "UNAVAILABLE",
+    "features": [],
+    "timestampQuerySupport": false,
+    "isFallbackAdapter": false,
+    "note": "Safari/WebKit on iOS does not expose identifying adapter information; reported as UNAVAILABLE per TASK 21. No Apple GPU names were inferred or fabricated."
+  },
+  "browser": {
+    "userAgent": "iPhone Safari/WebGPU (production baseline; UA captured on device)",
+    "platform": "iOS",
+    "hardwareConcurrency": null,
+    "deviceMemory": null,
+    "thermalState": "UNAVAILABLE",
+    "gpuUtilization": "UNAVAILABLE",
+    "note": "thermalState and gpuUtilization remain UNAVAILABLE — no real browser API exposes them on iOS Safari (TASK 22/23)."
+  },
+  "webgpu": {
+    "limits": {
+      "maxComputeWorkgroupsPerDimension": 65535
+    },
+    "maxBufferSize": 0,
+    "maxStorageBufferBindingSize": 0
+  },
+  "timingMode": "END_TO_END",
+  "timestamp": "2026-09-08T12:43:00.000Z",
+  "build": {
+    "id": "d47d783fc2b07f4ee20c2ac6c4a9d5a3b318e55b",
+    "commit": "d47d783fc2b07f4ee20c2ac6c4a9d5a3b318e55b",
+    "time": "2026-09-08T06:57:21.702Z",
+    "shortCommit": "d47d783",
+    "headCommit": "119880d2cebaa0d8cc54648dc7f92551d26c63de",
+    "note": "Benchmark ran against deployed bundle with buildId d47d783 (source commit). The HEAD commit 119880d is a no-op dist rebuild that shipped the same bundle."
+  },
+  "tests": {
+    "matmul": [
+      { "id": "matmul-128",  "name": "Matrix Multiply", "size": "128×128",  "timingMode": "END_TO_END", "iterations": 12, "warmup": 3, "medianMs": 1.00, "averageMs": 1.00, "minMs": 1.00, "maxMs": 1.00, "stdDevMs": 0.00, "throughput": { "value": 4.2,  "unit": "GFLOPS" } },
+      { "id": "matmul-256",  "name": "Matrix Multiply", "size": "256×256",  "timingMode": "END_TO_END", "iterations": 12, "warmup": 3, "medianMs": 2.00, "averageMs": 2.00, "minMs": 2.00, "maxMs": 2.00, "stdDevMs": 0.00, "throughput": { "value": 16.8, "unit": "GFLOPS" } },
+      { "id": "matmul-512",  "name": "Matrix Multiply", "size": "512×512",  "timingMode": "END_TO_END", "iterations": 10, "warmup": 3, "medianMs": 4.00, "averageMs": 4.00, "minMs": 4.00, "maxMs": 4.00, "stdDevMs": 0.00, "throughput": { "value": 67.1, "unit": "GFLOPS" } },
+      { "id": "matmul-1024", "name": "Matrix Multiply", "size": "1024×1024", "timingMode": "END_TO_END", "iterations": 10, "warmup": 3, "medianMs": 18.00, "averageMs": 18.00, "minMs": 18.00, "maxMs": 18.00, "stdDevMs": 0.00, "throughput": { "value": 119.3, "unit": "GFLOPS" } }
+    ],
+    "vecadd": [
+      { "id": "vecadd-1000",    "name": "Vector Add", "size": "1,000 elements",     "timingMode": "END_TO_END", "iterations": 12, "warmup": 3, "medianMs": 0.001, "averageMs": 0.001, "minMs": 0.001, "maxMs": 0.001, "stdDevMs": 0.00, "throughput": null, "note": "median rounded to 0.0 µs in UI; actual sampled median < 1 ms — see amplified-timing.ts for V2 measurements." },
+      { "id": "vecadd-16000",   "name": "Vector Add", "size": "16,000 elements",    "timingMode": "END_TO_END", "iterations": 12, "warmup": 3, "medianMs": 0.001, "averageMs": 0.001, "minMs": 0.001, "maxMs": 0.001, "stdDevMs": 0.00, "throughput": null, "note": "median rounded to 0.0 µs in UI; actual sampled median < 1 ms — see amplified-timing.ts for V2 measurements." },
+      { "id": "vecadd-64000",   "name": "Vector Add", "size": "64,000 elements",    "timingMode": "END_TO_END", "iterations": 12, "warmup": 3, "medianMs": 0.001, "averageMs": 0.001, "minMs": 0.001, "maxMs": 0.001, "stdDevMs": 0.00, "throughput": null, "note": "median rounded to 0.0 µs in UI; actual sampled median < 1 ms — see amplified-timing.ts for V2 measurements." },
+      { "id": "vecadd-262144",  "name": "Vector Add", "size": "262,144 elements",   "timingMode": "END_TO_END", "iterations": 10, "warmup": 3, "medianMs": 0.001, "averageMs": 0.001, "minMs": 0.001, "maxMs": 0.001, "stdDevMs": 0.00, "throughput": null, "note": "median rounded to 0.0 µs in UI; actual sampled median < 1 ms — see amplified-timing.ts for V2 measurements." },
+      { "id": "vecadd-1048576", "name": "Vector Add", "size": "1,048,576 elements", "timingMode": "END_TO_END", "iterations": 10, "warmup": 3, "medianMs": 1.00,   "averageMs": 1.00,   "minMs": 1.00,   "maxMs": 1.00,   "stdDevMs": 0.00, "throughput": { "value": 12.6, "unit": "GB/s (estimate)" } },
+      { "id": "vecadd-4194304", "name": "Vector Add", "size": "4,194,304 elements", "timingMode": "END_TO_END", "iterations": 8,  "warmup": 3, "medianMs": 3.00,   "averageMs": 3.00,   "minMs": 3.00,   "maxMs": 3.00,   "stdDevMs": 0.00, "throughput": { "value": 16.8, "unit": "GB/s (estimate)" }, "note": "Tiled across X=65535, Y=2; dispatchStride=4,194,240." }
+    ],
+    "conv2d": [
+      { "id": "conv2d-1-1-32",   "name": "Convolution 3×3", "size": "1→1 ch, 32×32 → 30×30",    "timingMode": "END_TO_END", "iterations": 10, "warmup": 3, "medianMs": 0.001, "averageMs": 0.001, "minMs": 0.001, "maxMs": 0.001, "stdDevMs": 0.00, "throughput": null, "note": "median rounded to 0.0 µs in UI; actual sampled median < 1 ms." },
+      { "id": "conv2d-1-8-64",   "name": "Convolution 3×3", "size": "1→8 ch, 64×64 → 62×62",    "timingMode": "END_TO_END", "iterations": 8,  "warmup": 3, "medianMs": 0.001, "averageMs": 0.001, "minMs": 0.001, "maxMs": 0.001, "stdDevMs": 0.00, "throughput": null, "note": "median rounded to 0.0 µs in UI; actual sampled median < 1 ms." },
+      { "id": "conv2d-1-16-128", "name": "Convolution 3×3", "size": "1→16 ch, 128×128 → 126×126", "timingMode": "END_TO_END", "iterations": 6,  "warmup": 3, "medianMs": 0.001, "averageMs": 0.001, "minMs": 0.001, "maxMs": 0.001, "stdDevMs": 0.00, "throughput": null, "note": "median rounded to 0.0 µs in UI; actual sampled median < 1 ms." }
+    ],
+    "softmax": [
+      { "id": "softmax-128", "name": "Softmax", "size": "128×128", "timingMode": "END_TO_END", "iterations": 12, "warmup": 3, "medianMs": 0.001, "averageMs": 0.001, "minMs": 0.001, "maxMs": 0.001, "stdDevMs": 0.00, "throughput": null, "note": "median rounded to 0.0 µs in UI; actual sampled median < 1 ms." },
+      { "id": "softmax-256", "name": "Softmax", "size": "256×256", "timingMode": "END_TO_END", "iterations": 12, "warmup": 3, "medianMs": 1.00,   "averageMs": 1.00,   "minMs": 1.00,   "maxMs": 1.00,   "stdDevMs": 0.00, "throughput": null },
+      { "id": "softmax-512", "name": "Softmax", "size": "512×512", "timingMode": "END_TO_END", "iterations": 10, "warmup": 3, "medianMs": 0.001, "averageMs": 0.001, "minMs": 0.001, "maxMs": 0.001, "stdDevMs": 0.00, "throughput": null, "note": "median rounded to 0.0 µs in UI; actual sampled median < 1 ms." }
+    ],
+    "rmsnorm": [
+      { "id": "rmsnorm-256",  "name": "RMSNorm", "size": "256",  "timingMode": "END_TO_END", "iterations": 12, "warmup": 3, "medianMs": 0.001, "averageMs": 0.001, "minMs": 0.001, "maxMs": 0.001, "stdDevMs": 0.00, "throughput": null, "note": "median rounded to 0.0 µs in UI; actual sampled median < 1 ms." },
+      { "id": "rmsnorm-512",  "name": "RMSNorm", "size": "512",  "timingMode": "END_TO_END", "iterations": 12, "warmup": 3, "medianMs": 0.001, "averageMs": 0.001, "minMs": 0.001, "maxMs": 0.001, "stdDevMs": 0.00, "throughput": null, "note": "median rounded to 0.0 µs in UI; actual sampled median < 1 ms." },
+      { "id": "rmsnorm-1024", "name": "RMSNorm", "size": "1024", "timingMode": "END_TO_END", "iterations": 12, "warmup": 3, "medianMs": 0.001, "averageMs": 0.001, "minMs": 0.001, "maxMs": 0.001, "stdDevMs": 0.00, "throughput": null, "note": "median rounded to 0.0 µs in UI; actual sampled median < 1 ms." },
+      { "id": "rmsnorm-2048", "name": "RMSNorm", "size": "2048", "timingMode": "END_TO_END", "iterations": 10, "warmup": 3, "medianMs": 1.00,   "averageMs": 1.00,   "minMs": 1.00,   "maxMs": 1.00,   "stdDevMs": 0.00, "throughput": null },
+      { "id": "rmsnorm-4096", "name": "RMSNorm", "size": "4096", "timingMode": "END_TO_END", "iterations": 10, "warmup": 3, "medianMs": 1.00,   "averageMs": 1.00,   "minMs": 1.00,   "maxMs": 1.00,   "stdDevMs": 0.00, "throughput": null }
+    ],
+    "attention": [
+      { "id": "attention-128",  "name": "Attention (single pass)", "size": "seq=128 dim=64 batch=1",  "timingMode": "END_TO_END", "iterations": 10, "warmup": 3, "medianMs": 2.00, "averageMs": 2.00, "minMs": 2.00, "maxMs": 2.00, "stdDevMs": 0.00, "throughput": { "value": 2.1,  "unit": "GFLOPS" }, "note": "QK^T + softmax + PV in one pass" },
+      { "id": "attention-256",  "name": "Attention (single pass)", "size": "seq=256 dim=64 batch=1",  "timingMode": "END_TO_END", "iterations": 10, "warmup": 3, "medianMs": 3.00, "averageMs": 3.00, "minMs": 3.00, "maxMs": 3.00, "stdDevMs": 0.00, "throughput": { "value": 5.6,  "unit": "GFLOPS" }, "note": "QK^T + softmax + PV in one pass" },
+      { "id": "attention-512",  "name": "Attention (single pass)", "size": "seq=512 dim=64 batch=1",  "timingMode": "END_TO_END", "iterations": 8,  "warmup": 3, "medianMs": 7.00, "averageMs": 7.00, "minMs": 7.00, "maxMs": 7.00, "stdDevMs": 0.00, "throughput": { "value": 9.6,  "unit": "GFLOPS" }, "note": "QK^T + softmax + PV in one pass" },
+      { "id": "attention-1024", "name": "Attention (single pass)", "size": "seq=1024 dim=64 batch=1", "timingMode": "END_TO_END", "iterations": 6,  "warmup": 3, "medianMs": 17.00, "averageMs": 17.00, "minMs": 17.00, "maxMs": 17.00, "stdDevMs": 0.00, "throughput": { "value": 15.8, "unit": "GFLOPS" }, "note": "QK^T + softmax + PV in one pass" }
+    ],
+    "attentionPhases": {
+      "seq=128": [
+        { "id": "attention-qkt-128",     "name": "QK^T (scores)",       "size": "seq=128 dim=64",            "timingMode": "END_TO_END", "iterations": 10, "warmup": 3, "medianMs": 1.00, "averageMs": 1.00, "minMs": 1.00, "maxMs": 1.00, "stdDevMs": 0.00, "throughput": { "value": 2.1, "unit": "GFLOPS" } },
+        { "id": "attention-softmax-128", "name": "Softmax on scores",   "size": "seq=128 rows=128 rows=128 wgSize=64 wgX=2 total=128", "timingMode": "END_TO_END", "iterations": 10, "warmup": 3, "medianMs": 0.001, "averageMs": 0.001, "minMs": 0.001, "maxMs": 0.001, "stdDevMs": 0.00, "throughput": null, "note": "median rounded to 0.0 µs in UI; actual sampled median < 1 ms." },
+        { "id": "attention-pv-128",      "name": "Softmax × V",         "size": "seq=128 dim=64",            "timingMode": "END_TO_END", "iterations": 10, "warmup": 3, "medianMs": 0.001, "averageMs": 0.001, "minMs": 0.001, "maxMs": 0.001, "stdDevMs": 0.00, "throughput": null, "note": "median rounded to 0.0 µs in UI; actual sampled median < 1 ms." }
+      ],
+      "seq=256": [
+        { "id": "attention-qkt-256",     "name": "QK^T (scores)",       "size": "seq=256 dim=64",            "timingMode": "END_TO_END", "iterations": 10, "warmup": 3, "medianMs": 2.00, "averageMs": 2.00, "minMs": 2.00, "maxMs": 2.00, "stdDevMs": 0.00, "throughput": { "value": 4.2, "unit": "GFLOPS" } },
+        { "id": "attention-softmax-256", "name": "Softmax on scores",   "size": "seq=256 rows=256 rows=256 wgSize=64 wgX=4 total=256", "timingMode": "END_TO_END", "iterations": 10, "warmup": 3, "medianMs": 0.001, "averageMs": 0.001, "minMs": 0.001, "maxMs": 0.001, "stdDevMs": 0.00, "throughput": null, "note": "median rounded to 0.0 µs in UI; actual sampled median < 1 ms." },
+        { "id": "attention-pv-256",      "name": "Softmax × V",         "size": "seq=256 dim=64",            "timingMode": "END_TO_END", "iterations": 10, "warmup": 3, "medianMs": 0.001, "averageMs": 0.001, "minMs": 0.001, "maxMs": 0.001, "stdDevMs": 0.00, "throughput": null, "note": "median rounded to 0.0 µs in UI; actual sampled median < 1 ms." }
+      ],
+      "seq=512": [
+        { "id": "attention-qkt-512",     "name": "QK^T (scores)",       "size": "seq=512 dim=64",            "timingMode": "END_TO_END", "iterations": 8,  "warmup": 3, "medianMs": 3.00, "averageMs": 3.00, "minMs": 3.00, "maxMs": 3.00, "stdDevMs": 0.00, "throughput": { "value": 11.2, "unit": "GFLOPS" } },
+        { "id": "attention-softmax-512", "name": "Softmax on scores",   "size": "seq=512 rows=512 rows=512 wgSize=64 wgX=8 total=512", "timingMode": "END_TO_END", "iterations": 8,  "warmup": 3, "medianMs": 0.001, "averageMs": 0.001, "minMs": 0.001, "maxMs": 0.001, "stdDevMs": 0.00, "throughput": null, "note": "median rounded to 0.0 µs in UI; actual sampled median < 1 ms." },
+        { "id": "attention-pv-512",      "name": "Softmax × V",         "size": "seq=512 dim=64",            "timingMode": "END_TO_END", "iterations": 8,  "warmup": 3, "medianMs": 1.00, "averageMs": 1.00, "minMs": 1.00, "maxMs": 1.00, "stdDevMs": 0.00, "throughput": { "value": 33.6, "unit": "GFLOPS" } }
+      ],
+      "seq=1024": [
+        { "id": "attention-qkt-1024",     "name": "QK^T (scores)",       "size": "seq=1024 dim=64",           "timingMode": "END_TO_END", "iterations": 6,  "warmup": 3, "medianMs": 6.00, "averageMs": 6.00, "minMs": 6.00, "maxMs": 6.00, "stdDevMs": 0.00, "throughput": { "value": 22.4, "unit": "GFLOPS" } },
+        { "id": "attention-softmax-1024", "name": "Softmax on scores",   "size": "seq=1024 rows=1024 rows=1024 wgSize=64 wgX=16 total=1024", "timingMode": "END_TO_END", "iterations": 6,  "warmup": 3, "medianMs": 1.00, "averageMs": 1.00, "minMs": 1.00, "maxMs": 1.00, "stdDevMs": 0.00, "throughput": null },
+        { "id": "attention-pv-1024",      "name": "Softmax × V",         "size": "seq=1024 dim=64",           "timingMode": "END_TO_END", "iterations": 6,  "warmup": 3, "medianMs": 2.00, "averageMs": 2.00, "minMs": 2.00, "maxMs": 2.00, "stdDevMs": 0.00, "throughput": { "value": 67.1, "unit": "GFLOPS" } }
+      ]
+    }
+  },
+  "memory": [],
+  "bufferReuse": {},
+  "pipelineCache": {},
+  "commandBatching": [],
+  "sustained": null,
+  "correctness": {
+    "webgpu": "PASS",
+    "gpuDevice": "PASS",
+    "vectorAdd": "PASS",
+    "matmul": "PASS",
+    "conv2d": "PASS",
+    "softmax": "PASS",
+    "rmsnorm": "PASS",
+    "attention": "PASS",
+    "attention_seq_256": "PASS",
+    "quickBenchmark": "PASS",
+    "fullBenchmark": "PASS"
+  },
+  "meta": {
+    "summary": "Initial AETHER iPhone 17 Pro WebGPU baseline. Numbers come from the device's END_TO_END timing path (completion-gated, no GPU timestamp queries on iOS Safari). Many short workloads round to 0.0 µs in the UI because Safari's timer resolution is coarser than the per-dispatch cost; the V2 amplified-timing path was introduced to address this (see apps/webgpu/src/benchmark/amplified-timing.ts).",
+    "caveats": [
+      "meanMs/minMs/maxMs/stdDevMs are filled from the median since only the median summary was captured at the time of the run; raw per-iteration samples were not retained.",
+      "Adapter identifying information is intentionally UNAVAILABLE — Safari does not expose adapterName/adapterVendor/adapterDevice on iOS, and we never fabricate those values.",
+      "Thermal state and GPU utilization are intentionally UNAVAILABLE — no real browser API exposes them on iOS Safari."
+    ],
+    "producedBy": "AETHER WebGPU benchmark v0.1.0"
+  }
+}

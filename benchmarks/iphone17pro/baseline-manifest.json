@@ -1,0 +1,11 @@
+{
+  "device": "iPhone 17 Pro",
+  "os": "iOS",
+  "browser": "Safari/WebKit",
+  "buildId": "d47d783fc2b07f4ee20c2ac6c4a9d5a3b318e55b",
+  "commit": "119880d2cebaa0d8cc54648dc7f92551d26c63de",
+  "benchmarkVersion": "0.1.0",
+  "timestamp": "2026-09-08T12:43:00.000Z",
+  "resultFileSHA256": "3A9420632C7037EF5D0272AC01D15A901B63CC4C01EAE3ADAC5057A8C0FBD920",
+  "resultFile": "full-baseline.json"
+}
