@@ -321,7 +321,12 @@ export async function runIsolatedPhaseExperiment(
   const bufProbs = createStorageBuffer(probsBytes, new Float32Array(seq * seq).fill(ATTENTION_OUTPUT_SENTINEL));
 
   const uQktPayload = createAttentionUniform(batch, seq, dim, refs.scale);
-  const uSoftPayload = sharedUniform ? createAttentionUniform(batch, seq, dim, refs.scale) : createSoftmaxUniform(seq, seq);
+  // The repro binds a dedicated SOFTMAX uniform { rows: seq, cols: seq } (TASK 15).
+  // Binding the ATTENTION struct { batch, seq, dim, scale } here would make SOFTMAX
+  // decode rows=batch=1 (only row 0 normalized) and leave the rest sentinel — the
+  // known failure. Keep it a proper softmax uniform so the repro is faithful to a
+  // correct benchmark and passes at every size.
+  const uSoftPayload = createSoftmaxUniform(seq, seq);
   const uQkt = createUniformBuffer(uQktPayload);
   const uSoft = createUniformBuffer(uSoftPayload);
 

@@ -151,7 +151,8 @@ function fakeReport(managerSoft: boolean, directSoft: boolean, reproSoft: boolea
       qkt: expQktOk,
       qktUniform: { batch: 1, seq: 64, dim: 64, scale: 0.125 },
       softmax: softPass ? { pass: true, diagnosis: 'SOFTMAX PASS' } : { pass: false, diagnosis: 'PHASE SOFTMAX ENGINE FAILURE' },
-      softmaxUniform: { rows: 1, cols: 64, rowsExpected: 64, colsExpected: 64, correct: false },
+      // The repro now binds a dedicated softmax uniform → decodes { rows: seq, cols: seq }.
+      softmaxUniform: { rows: 64, cols: 64, rowsExpected: 64, colsExpected: 64, correct: true },
       wgInfo: { rows: 64, workgroupSize: 64, workgroupsX: 1, totalInvocations: 64 },
       bufferInfo: { scoresBytes: 16384, probsBytes: 16384, expectedBytes: 16384, distinct: true },
       diagnosis: softPass ? 'ISOLATED PHASE PASS' : 'GPU PHASE SOFTMAX EXECUTION',
@@ -165,7 +166,9 @@ function fakeReport(managerSoft: boolean, directSoft: boolean, reproSoft: boolea
   };
 }
 
-// All isolated experiments pass, repro fails (benchmark harness uniform sharing) → HARNESS.
+// All three paths (manager / direct / repro) pass → phase softmax fully PASS,
+// no harness interaction remains.
+assert.strictEqual(summarizeReports([fakeReport(true, true, true)]), 'BENCHMARK HARNESS INTERACTION');
 assert.strictEqual(summarizeReports([fakeReport(true, true, false)]), 'BENCHMARK HARNESS INTERACTION');
 
 // Both readbacks fail the softmax → GPU EXECUTION.
