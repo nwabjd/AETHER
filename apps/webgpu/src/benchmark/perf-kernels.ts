@@ -9,8 +9,8 @@
 // any timing is recorded (TASK 23): a mismatch throws, and the suite aborts
 // ("fix correctness first") instead of publishing a number.
 
-import { TimingManager } from './timing';
-import type { PerfSample, Throughput } from './perf-report';
+import { TimingManager } from './timing.ts';
+import type { PerfSample, Throughput } from './perf-report.ts';
 import {
   createPipeline,
   createBindGroupForPipeline,
@@ -18,7 +18,7 @@ import {
   createUniformBuffer,
   readbackBuffer,
   getDevice,
-} from './engine';
+} from './engine.ts';
 import { ReadbackManager } from './readback.ts';
 import {
   createMatmulUniform,
@@ -28,18 +28,18 @@ import {
   createRMSNormUniform,
   createAttentionUniform,
   logMatmulUniformDiagnostic,
-} from './uniforms';
-import type { StorageAccess } from './layout';
-import { MATMUL, VEC_ADD, CONV2D, SOFTMAX, RMS_NORM, ATTENTION, ATTENTION_OUTPUT_SENTINEL, softmaxWorkgroups, softmaxDispatchInfo, assertSoftmaxDispatch, type SoftmaxDispatchInfo } from './kernels';
-import { cpuVecAdd, cpuMatmul, cpuConv2D, cpuSoftmax, cpuRMSNorm, cpuAttention } from './cpu-refs';
-import { analyzeNumeric, rowSums } from './numeric';
+} from './uniforms.ts';
+import type { StorageAccess } from './layout.ts';
+import { MATMUL, VEC_ADD, CONV2D, SOFTMAX, RMS_NORM, ATTENTION, ATTENTION_OUTPUT_SENTINEL, softmaxWorkgroups, softmaxDispatchInfo, assertSoftmaxDispatch, type SoftmaxDispatchInfo } from './kernels.ts';
+import { cpuVecAdd, cpuMatmul, cpuConv2D, cpuSoftmax, cpuRMSNorm, cpuAttention } from './cpu-refs.ts';
+import { analyzeNumeric, rowSums } from './numeric.ts';
 
 const QKT_BINDINGS = ['uniform', 'read-only-storage', 'read-only-storage', 'storage'] as const satisfies readonly StorageAccess[];
 const PV_BINDINGS = ['uniform', 'read-only-storage', 'read-only-storage', 'storage'] as const satisfies readonly StorageAccess[];
 
 // ─── bench-only attention phase shaders (mirror the monolithic ATTENTION) ───
 
-const ATTN_QKT = /* wgsl */ `
+export const ATTN_QKT = /* wgsl */ `
 struct Uniforms { batch: u32, seq: u32, dim: u32, scale: f32 };
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var<storage, read> Q: array<f32>;

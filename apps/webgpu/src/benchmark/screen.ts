@@ -29,6 +29,12 @@ import {
   type PhaseSoftmaxCase,
 } from './perf-kernels';
 import {
+  runIsolatedQktOnly,
+  runFullIsolatedPhase,
+  summarizeReports,
+  type IsolatedPhaseReport,
+} from './phase-softmax-isolated';
+import {
   interpretResults,
   buildIphoneBaseline,
   type PerfReport,
@@ -721,6 +727,170 @@ async function runPhaseSoftmaxHandler() {
   }
 }
 
+// ─── Isolated Phase Softmax Diagnostics (TASK 1–21) ───
+
+const _isoSeq = [4, 16, 64, 128, 256];
+
+function isoQktLines(q: { length: number; expectedLength: number; finiteCount: number; maxAbsError: number; errorIndex: number; cpuFirst16: number[]; gpuFirst16: number[]; scoresMin: number; scoresMax: number; scoresFiniteCount: number }): string[] {
+  return [
+    `length: ${q.length}/${q.expectedLength} · finite: ${q.finiteCount}`,
+    `maxAbsError: ${q.maxAbsError.toExponential(3)} @ idx ${q.errorIndex} (≤ 1e-2)`,
+    `cpu first16: [${q.cpuFirst16.map((n) => n.toFixed(4)).join(', ')}]`,
+    `gpu first16: [${q.gpuFirst16.map((n) => n.toFixed(4)).join(', ')}]`,
+    `scores: min ${q.scoresMin.toExponential(3)} · max ${q.scoresMax.toExponential(3)} · finite ${q.scoresFiniteCount}`,
+  ];
+}
+
+function isoSoftLines(s: { length: number; expectedLength: number; finiteCount: number; maxError: number; errorIndex: number; cpuValue: number | null; gpuValue: number | null; rowSumMin: number; rowSumMax: number; sentinelCount: number }): string[] {
+  return [
+    `length: ${s.length}/${s.expectedLength} · finite: ${s.finiteCount}`,
+    `maxError: ${s.maxError.toExponential(3)} @ idx ${s.errorIndex} (≤ 1e-2)`,
+    `cpu @ idx: ${s.cpuValue !== null ? s.cpuValue.toExponential(4) : 'n/a'} · gpu @ idx: ${s.gpuValue !== null ? s.gpuValue.toExponential(4) : 'n/a'}`,
+    `row sums: [${s.rowSumMin.toExponential(3)}, ${s.rowSumMax.toExponential(3)}] (≈1)`,
+    `sentinel count: ${s.sentinelCount}`,
+  ];
+}
+
+function isoUniformSoft(u: { rows: number; cols: number; rowsExpected: number; colsExpected: number; correct: boolean }): string {
+  return `softmax uniform {rows:${u.rows}, cols:${u.cols}} expected {rows:${u.rowsExpected}, cols:${u.colsExpected}} → ${u.correct ? 'MATCH' : 'MISMATCH'}`;
+}
+
+function isoUniformQkt(q: { batch: number; seq: number; dim: number; scale: number }): string {
+  return `qkt uniform {batch:${q.batch}, seq:${q.seq}, dim:${q.dim}, scale:${q.scale.toFixed(4)}}`;
+}
+
+function isoWgLines(w: { rows: number; workgroupSize: number; workgroupsX: number; totalInvocations: number }): string {
+  return `dispatch: seq=${w.rows} · workgroup_size=64 · wgX=${w.workgroupsX} · total invocations=${w.totalInvocations}`;
+}
+
+function isoBufferLines(b: { scoresBytes: number; probsBytes: number; expectedBytes: number; distinct: boolean }): string {
+  return `buffers: scores ${b.scoresBytes}B · probs ${b.probsBytes}B · expected ${b.expectedBytes}B · distinct=${b.distinct}`;
+}
+
+function renderIsolatedQkt(seq: number, rep: { manager: { qkt: { pass: boolean; diagnosis: string } }; direct: { qkt: { pass: boolean; diagnosis: string } }; overall: string }): string {
+  const pass = rep.overall === 'QKT PASS';
+  return `
+    <div class="card" style="border-color:${pass ? 'var(--green)' : 'var(--red)'};margin-top:12px">
+      <div class="card-header">
+        <span class="card-title">Isolated QKT seq=${seq} (once)</span>
+        <span class="badge ${pass ? 'badge-pass' : 'badge-fail'}">${pass ? 'PASS' : 'FAIL'}</span>
+      </div>
+      <div style="margin-top:8px;font-size:12px;font-family:var(--mono);display:grid;gap:2px;word-break:break-all">
+        <div style="color:var(--text-dim)">manager readback: ${rep.manager.qkt.pass ? 'PASS' : 'FAIL'} · direct staging: ${rep.direct.qkt.pass ? 'PASS' : 'FAIL'}</div>
+        <div style="color:var(--text-dim)">overall: ${rep.overall}</div>
+      </div>
+    </div>`;
+}
+
+async function runIsolatedQktHandler() {
+  if (_running) return;
+  _running = true;
+  try {
+    await initBenchmark();
+    installListeners();
+    drainUncaptured();
+    installUncapturedCollector();
+    log('═══ ISOLATED QKT (once · no warmup · no timing) ═══', 'info');
+    const reports = await runIsolatedQktOnly(_isoSeq);
+    const mount = _container?.querySelector('#res-iso-qkt') as HTMLElement | null;
+    if (mount) {
+      mount.innerHTML = reports.map((r) => renderIsolatedQkt(r.seq, r)).join('');
+    }
+    log(`ISOLATED QKT: ${reports.every((r) => r.overall === 'QKT PASS') ? 'ALL PASS' : 'FAILED'} — ${reports.map((r) => `s${r.seq}:${r.overall}`).join(' ')}`, reports.every((r) => r.overall === 'QKT PASS') ? 'ok' : 'err');
+  } catch (e) {
+    log(`ERROR: ${(e as Error).message}`, 'err');
+    if (hasDeviceLost()) stopDeviceLost();
+  } finally {
+    _running = false;
+  }
+}
+
+function renderPhaseExperiments(reports: IsolatedPhaseReport[]): string {
+  return reports
+    .map((r) => {
+      const good =
+        r.manager.qkt.pass && r.direct.qkt.pass && (r.manager.softmax?.pass ?? false) && (r.direct.softmax?.pass ?? false);
+      const softLines = (exp: IsolatedPhaseReport['manager']): string[] => {
+        const lines = [...isoQktLines(exp.qkt)];
+        if (exp.softmax) lines.push(...isoSoftLines(exp.softmax), isoUniformSoft(exp.softmaxUniform), isoUniformQkt(exp.qktUniform), isoBufferLines(exp.bufferInfo));
+        else lines.push('(softmax SKIPPED — QKT FAILED, TASK 3 STOP)');
+        lines.push(isoWgLines(exp.wgInfo));
+        return lines;
+      };
+      const column = (label: string, exp: IsolatedPhaseReport['manager'], note: string): string => `
+        <div style="min-width:280px;flex:1">
+          <div class="card-header" style="padding:4px 0;border:none">
+            <span class="card-title">${label}</span>
+            <span class="badge ${exp.qkt.pass && (exp.softmax?.pass ?? false) ? 'badge-pass' : 'badge-fail'}">${exp.qkt.pass ? (exp.softmax ? (exp.softmax.pass ? 'PASS' : 'SOFT MAX FAIL') : 'QKT STOP') : 'QKT FAIL'}</span>
+          </div>
+          <div style="font-size:12px;font-family:var(--mono);display:grid;gap:2px;word-break:break-all;color:var(--text-dim)">${softLines(exp).map((l) => `<div>${esc(l)}</div>`).join('')}</div>
+          <div style="font-size:11px;color:var(--text-dim)">${esc(note)} · ${esc(exp.diagnosis)}</div>
+        </div>`;
+      return `
+        <div class="card" style="border-color:${good ? 'var(--green)' : 'var(--red)'};margin-top:12px">
+          <div class="card-header">
+            <span class="card-title">Isolated Phase seq=${r.seq}</span>
+            <span class="badge ${good ? 'badge-pass' : 'badge-fail'}">${good ? 'PASS' : 'FAIL'}</span>
+          </div>
+          <div style="margin-top:8px;display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px">
+            ${column('manager readback', r.manager, 'ReadbackManager')}
+            ${column('direct staging', r.direct, 'mapAsync → read → unmap')}
+            ${column('repro: shared uniform', r.repro, 'benchmark setupAttention() uniform binding')}
+          </div>
+          <div style="margin-top:8px;font-weight:600;color:var(--text-strong)">diagnosis: ${esc(r.overall)}</div>
+        </div>`;
+    })
+    .join('');
+}
+
+async function runIsolatedPhaseSoftmaxHandler() {
+  if (_running) return;
+  _running = true;
+  try {
+    await initBenchmark();
+    installListeners();
+    drainUncaptured();
+    installUncapturedCollector();
+    log('═══ ISOLATED PHASE SOFTMAX (QKT once → verify → Softmax once → verify) ═══', 'info');
+    // TASK: phase-softmax only = QKT once → verify → Softmax once → verify. Full
+    // isolation (both readbacks + repro) is the full-phase button.
+    const reports = await runFullIsolatedPhase(_isoSeq);
+    const mount = _container?.querySelector('#res-iso-phase') as HTMLElement | null;
+    if (mount) mount.innerHTML = renderPhaseExperiments(reports);
+    const summary = summarizeReports(reports);
+    log(`ISOLATED PHASE SOFTMAX: ${summary} — ${reports.map((r) => `s${r.seq}:${r.overall}`).join(' ')}`, summary.includes('FAILURE') || summary.includes('EXECUTION') || summary.includes('INTERACTION') ? 'err' : 'ok');
+  } catch (e) {
+    log(`ERROR: ${(e as Error).message}`, 'err');
+    if (hasDeviceLost()) stopDeviceLost();
+  } finally {
+    _running = false;
+  }
+}
+
+async function runFullIsolatedPhaseHandler() {
+  if (_running) return;
+  _running = true;
+  try {
+    await initBenchmark();
+    installListeners();
+    drainUncaptured();
+    installUncapturedCollector();
+    log('═══ FULL ISOLATED PHASE (manager + direct + repro) ═══', 'info');
+    const reports = await runFullIsolatedPhase(_isoSeq);
+    const mount = _container?.querySelector('#res-iso-full') as HTMLElement | null;
+    if (mount) {
+      mount.innerHTML = renderPhaseExperiments(reports);
+    }
+    const summary = summarizeReports(reports);
+    log(`FULL ISOLATED PHASE: ${summary}`, summary.includes('FAILURE') || summary.includes('EXECUTION') || summary.includes('INTERACTION') ? 'err' : 'ok');
+  } catch (e) {
+    log(`ERROR: ${(e as Error).message}`, 'err');
+    if (hasDeviceLost()) stopDeviceLost();
+  } finally {
+    _running = false;
+  }
+}
+
 async function runCorrectnessTests() {
   if (_running) return;
   if (!gatesPassed()) {
@@ -1170,6 +1340,9 @@ export function render(el: HTMLElement) {
       <button class="btn btn-outline" id="btn-readback-stress">RUN READBACK STRESS</button>
       <button class="btn btn-outline" id="btn-attention">RUN ATTENTION CORRECTNESS</button>
       <button class="btn btn-outline" id="btn-phase-softmax">RUN ATTENTION PHASE SOFTMAX</button>
+      <button class="btn btn-outline" id="btn-iso-qkt">RUN ISOLATED QKT</button>
+      <button class="btn btn-outline" id="btn-iso-phase">RUN ISOLATED PHASE SOFTMAX</button>
+      <button class="btn btn-outline" id="btn-iso-full">RUN FULL ISOLATED PHASE</button>
     </div>
 
     <div id="res-minimal-64"></div>
@@ -1178,6 +1351,9 @@ export function render(el: HTMLElement) {
     <div id="res-readback-stress"></div>
     <div id="res-attention"></div>
     <div id="res-phase-softmax"></div>
+    <div id="res-iso-qkt"></div>
+    <div id="res-iso-phase"></div>
+    <div id="res-iso-full"></div>
     <div id="res-readback-engine"></div>
 
     <div id="validation-panel"></div>
@@ -1205,6 +1381,9 @@ export function render(el: HTMLElement) {
   el.querySelector('#btn-readback-stress')?.addEventListener('click', runReadbackStressHandler);
   el.querySelector('#btn-attention')?.addEventListener('click', runAttentionCorrectnessHandler);
   el.querySelector('#btn-phase-softmax')?.addEventListener('click', runPhaseSoftmaxHandler);
+  el.querySelector('#btn-iso-qkt')?.addEventListener('click', runIsolatedQktHandler);
+  el.querySelector('#btn-iso-phase')?.addEventListener('click', runIsolatedPhaseSoftmaxHandler);
+  el.querySelector('#btn-iso-full')?.addEventListener('click', runFullIsolatedPhaseHandler);
   el.querySelector('#btn-harness')?.addEventListener('click', runHarnessMatmulHandler);
 
   const correctBtn = el.querySelector('#btn-correctness') as HTMLButtonElement | null;

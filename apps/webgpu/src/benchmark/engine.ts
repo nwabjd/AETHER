@@ -6,12 +6,12 @@ import {
   createBindGroupLayoutForBindings,
   assertBindingCount,
   type StorageAccess,
-} from './layout';
+} from './layout.ts';
 import {
   trackPipelineDevice,
   trackBindGroupDevice,
   registerDeviceLost,
-} from './device-identity';
+} from './device-identity.ts';
 
 export interface BenchmarkResult {
   id: string;
