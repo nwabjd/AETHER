@@ -174,7 +174,7 @@ async function dispatchToAndRead(
   return readbackMgr.readSubmittedCopy(device, staging, bytes, contextInfo);
 }
 
-function fillDeterministic(data: Float32Array): void {
+export function fillDeterministic(data: Float32Array): void {
   let s = 0x9e3779b9;
   for (let i = 0; i < data.length; i++) {
     s = (s * 1664525 + 1013904223) >>> 0;
