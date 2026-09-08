@@ -9,7 +9,7 @@
 // any timing is recorded (TASK 23): a mismatch throws, and the suite aborts
 // ("fix correctness first") instead of publishing a number.
 
-import { TimingManager } from './timing.ts';
+import { TimingManager, type TimingStats } from './timing.ts';
 import type { PerfSample, Throughput } from './perf-report.ts';
 import {
   createPipeline,
@@ -20,6 +20,7 @@ import {
   getDevice,
 } from './engine.ts';
 import { ReadbackManager } from './readback.ts';
+import { harnessCounters } from './harness-counters.ts';
 import {
   createMatmulUniform,
   createVecAddUniform,
@@ -61,7 +62,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 `;
 
-const ATTN_PV = /* wgsl */ `
+export const ATTN_PV = /* wgsl */ `
 struct Uniforms { batch: u32, seq: u32, dim: u32, scale: f32 };
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var<storage, read> scores: array<f32>;
@@ -159,6 +160,7 @@ async function dispatchToAndRead(
   const staging = readbackMgr.acquire(device, bytes);
 
   const enc = device.createCommandEncoder({ label: `Enc_${contextInfo}` });
+  harnessCounters.onCommandBufferCreated();
   const pass = enc.beginComputePass();
   pass.setPipeline(pipeline);
   pass.setBindGroup(0, bg);
@@ -166,16 +168,9 @@ async function dispatchToAndRead(
   pass.end();
   enc.copyBufferToBuffer(outBuffer, 0, staging, 0, bytes);
   device.queue.submit([enc.finish()]);
+  harnessCounters.onCommandBufferSubmitted('other');
 
   return readbackMgr.readSubmittedCopy(device, staging, bytes, contextInfo);
-}
-
-/** END_TO_END completion wait using ReadbackManager. */
-function waitFor(outBuffer: GPUBuffer, bytes: number, contextInfo = 'waitFor'): () => Promise<void> {
-  return async () => {
-    const device = getDevice();
-    await ReadbackManager.getInstance().copyAndRead(device, outBuffer, bytes, contextInfo);
-  };
 }
 
 function fillDeterministic(data: Float32Array): void {
@@ -247,7 +242,7 @@ export async function benchMatmul(tm: TimingManager, subset?: ReadonlySet<string
           pass.setBindGroup(0, bg);
           pass.dispatchWorkgroups(wg[0], wg[1], wg[2]);
         },
-        { iterations: conf.iterations, wait: waitFor(bufC, bytes, `matmul-${n}`) }
+        { iterations: conf.iterations }
       );
       out.push(sample(`matmul-${n}`, 'Matrix Multiply', `${n}×${n}`, stats, gflops(2 * n * n * n, stats.medianMs)));
     } finally {
@@ -307,7 +302,7 @@ export async function benchVecAdd(tm: TimingManager, subset?: ReadonlySet<string
           pass.setBindGroup(0, bg);
           pass.dispatchWorkgroups(wg[0], wg[1], wg[2]);
         },
-        { iterations: conf.iterations, wait: waitFor(bufC, bytes, `vecadd-${n}`) }
+        { iterations: conf.iterations }
       );
       out.push(
         sample(`vecadd-${n}`, 'Vector Add', `${n.toLocaleString('en-US')} elements`, stats, gbytes(3 * n * 4, stats.medianMs))
@@ -374,7 +369,7 @@ export async function benchConv2D(tm: TimingManager, subset?: ReadonlySet<string
           pass.setBindGroup(0, bg);
           pass.dispatchWorkgroups(wg[0], wg[1], wg[2]);
         },
-        { iterations: conf.iterations, wait: waitFor(bufOut, outBytes, `conv2d-${C}-${F}-${H}`) }
+        { iterations: conf.iterations }
       );
       out.push(sample(`conv2d-${C}-${F}-${H}`, 'Convolution 3×3', `${C}→${F} ch, ${H}×${W} → ${OH}×${OW}`, stats));
     } finally {
@@ -426,7 +421,7 @@ export async function benchSoftmax(tm: TimingManager, subset?: ReadonlySet<strin
           pass.setBindGroup(0, bg);
           pass.dispatchWorkgroups(wg[0], wg[1], wg[2]);
         },
-        { iterations, wait: waitFor(bufOut, bytes, `softmax-${rows}`) }
+        { iterations }
       );
       out.push(sample(`softmax-${rows}`, 'Softmax', `${rows}×${cols}`, stats));
     } finally {
@@ -484,7 +479,7 @@ export async function benchRMSNorm(tm: TimingManager, subset?: ReadonlySet<strin
           pass.setBindGroup(0, bg);
           pass.dispatchWorkgroups(wg[0], wg[1], wg[2]);
         },
-        { iterations, wait: waitFor(bufOut, bytes, `rmsnorm-${size}`) }
+        { iterations }
       );
       out.push(sample(`rmsnorm-${size}`, 'RMSNorm', String(size), stats));
     } finally {
@@ -511,15 +506,20 @@ export interface AttentionResult {
   phases: { [size: string]: PerfSample[] };
 }
 
-/** Deterministic Q,K,V + CPU scores/probs/out references (TASK 4 data). */
-function attentionRefs(seq: number, dim: number, batch = 1) {
+/** Deterministic Q,K,V input vectors (no O(n³) references). */
+function attentionInputs(seq: number, dim: number, batch = 1) {
   const Q = new Float32Array(batch * seq * dim);
   const K = new Float32Array(batch * seq * dim);
   const V = new Float32Array(batch * seq * dim);
   fillDeterministic(Q);
   fillDeterministic(K);
   fillDeterministic(V);
-  const scale = 1 / Math.sqrt(dim);
+  return { Q, K, V, scale: 1 / Math.sqrt(dim) };
+}
+
+/** Deterministic Q,K,V + CPU scores/probs/out references (TASK 4 data). */
+function attentionRefs(seq: number, dim: number, batch = 1) {
+  const { Q, K, V, scale } = attentionInputs(seq, dim, batch);
   const scores = new Float32Array(batch * seq * seq);
   for (let b = 0; b < batch; b++) {
     for (let i = 0; i < seq; i++) {
@@ -536,6 +536,9 @@ function attentionRefs(seq: number, dim: number, batch = 1) {
 }
 
 interface AttentionCtx {
+  kind: 'main' | 'correctness' | 'benchmark';
+  ctxId: number;
+  destroyed: boolean;
   seq: number;
   dim: number;
   batch: number;
@@ -552,7 +555,22 @@ interface AttentionCtx {
     pv: GPUBindGroup;
   };
   bufs: { q: GPUBuffer; k: GPUBuffer; v: GPUBuffer; out: GPUBuffer; scores: GPUBuffer; probs: GPUBuffer };
-  ref: { scores: Float32Array; probs: Float32Array; out: Float32Array };
+  softUniform: GPUBuffer;
+  ref: { scores: Float32Array; probs: Float32Array; out: Float32Array } | null;
+}
+
+let attentionContextSeq = 0;
+
+export interface AttentionContextTraceEntry {
+  id: number;
+  kind: 'main' | 'correctness' | 'benchmark';
+  destroyed: boolean;
+}
+const attentionContextLog: AttentionContextTraceEntry[] = [];
+
+/** Observed history of created/destroyed attention contexts (TASK 16/22). */
+export function attentionContextTrace(): AttentionContextTraceEntry[] {
+  return attentionContextLog.slice();
 }
 
 export async function benchAttention(tm: TimingManager, seqs?: number[]): Promise<AttentionResult> {
@@ -596,7 +614,7 @@ export async function benchAttention(tm: TimingManager, seqs?: number[]): Promis
         throw fail('attention', `seq=${seq}`, 'UNWRITTEN ATTENTION OUTPUT', `sentinel remains @ index ${sentinelIdx} (row ${row}); rows not fully written — fix correctness before benchmarking`);
       }
       if (conf.validate) {
-        assertValid('attention', `seq=${seq}`, got, ctx.ref.out, 1e-2);
+        assertValid('attention', `seq=${seq}`, got, ctx.ref!.out, 1e-2);
       } else if (!allFinite(got)) {
         throw fail('attention', `seq=${seq}`, 'non-finite output', '');
       }
@@ -607,145 +625,220 @@ export async function benchAttention(tm: TimingManager, seqs?: number[]): Promis
           pass.setBindGroup(0, ctx.groups.total);
           pass.dispatchWorkgroups(wgTotal[0], wgTotal[1], wgTotal[2]);
         },
-        { iterations, wait: waitFor(ctx.bufs.out, seq * dim * 4, `attention-${seq}`) }
+        { iterations }
       );
       main.push(
         sample(`attention-${seq}`, 'Attention (single pass)', `seq=${seq} dim=64 batch=1`, total, gflops(4 * seq * seq * dim, total.medianMs), 'QK^T + softmax + PV in one pass')
       );
 
-      phases[`seq=${seq}`] = await measureAttentionPhases(tm, ctx, seq, dim, iterations);
+      phases[`seq=${seq}`] = await measureAttentionPhases(tm, seq, dim, iterations);
     } finally {
-      try {
-        ctx.bufs.q.destroy();
-        ctx.bufs.k.destroy();
-        ctx.bufs.v.destroy();
-        ctx.bufs.out.destroy();
-        ctx.bufs.scores.destroy();
-        ctx.bufs.probs.destroy();
-      } catch {}
+      destroyAttentionContext(ctx);
     }
   }
   return { main, phases };
 }
 
-async function measureAttentionPhases(
+// ─── Attention phase correctness + performance (TASK 2/3/5/6/13) ─────────
+//
+// SEPARATION CONTRACT:
+//   * runAttentionPhaseCorrectness() — full-output readbacks ONLY; never touches
+//     a TimingManager (no performance.now, no warmup, no completion token).
+//     Builds its own FRESH correctness context and destroys it when done.
+//   * measureAttentionPhasePerformance() — timing ONLY via CompletionToken;
+//     zero full-output readbacks; runs against a separate FRESH benchmark
+//     context created AFTER the correctness context was destroyed.
+//   * measureAttentionPhases() — the orchestration used by benchAttention. It
+//     GATES on correctness first and aborts with the TASK 5 message before any
+//     benchmark context is created if a phase is wrong.
+
+export interface PhaseDimensionInfo {
+  seq: number;
+  dim: number;
+  batch: number;
+  wgQ: [number, number, number];
+  wgP: [number, number, number];
+  wgSoft: [number, number, number];
+  softInfo: SoftmaxDispatchInfo;
+  scoresBytes: number;
+  outBytes: number;
+}
+
+/** Dispatch dimensions must match each phase kernel's index mapping. */
+export function attentionPhaseDispatch(seq: number, dim = 64, batch = 1): PhaseDimensionInfo {
+  return {
+    seq,
+    dim,
+    batch,
+    wgQ: [Math.ceil(seq / 64), batch, 1],
+    wgP: [Math.ceil(seq / 64), dim, batch],
+    wgSoft: softmaxWorkgroups(seq),
+    softInfo: softmaxDispatchInfo(seq),
+    scoresBytes: seq * seq * 4,
+    outBytes: seq * dim * 4,
+  };
+}
+
+export interface PhaseCorrectnessReport {
+  maxErrs: { qkt: number; soft: number; pv: number };
+  rowSumMaxDev: number;
+}
+
+/**
+ * Validate all three phase kernels against the CPU reference in a FRESH
+ * correctness context (TASK 2/4/16). Full-output readbacks exclusively. The
+ * context is destroyed — and flagged destroyed — before returning.
+ */
+export async function runAttentionPhaseCorrectness(seq: number, dim = 64, batch = 1): Promise<PhaseCorrectnessReport> {
+  const d = attentionPhaseDispatch(seq, dim, batch);
+  const ctx = await setupAttention(seq, dim, batch, 'correctness', true);
+  if (!ctx.ref) throw fail('attention.phase', `seq=${seq}`, 'internal', 'ref missing for correctness context');
+  try {
+    // QK^T → scores, validate against CPU reference.
+    const scoresGot = await dispatchToAndRead(ctx.pipelines.qkt, ctx.groups.qkt, d.wgQ, ctx.bufs.scores, d.scoresBytes, `attention.qkt-correctness-${seq}`);
+    const qktErr = maxAbsDiff(scoresGot, ctx.ref.scores);
+    if (!allFinite(scoresGot) || qktErr > 1e-2) {
+      throw fail('attention.qkt', `seq=${seq}`, 'phase correctness check failed', `maxErr=${qktErr.toExponential(2)}`);
+    }
+
+    // Softmax(scores) → probs, validate against CPU reference + row sums.
+    await dispatchToAndRead(ctx.pipelines.qkt, ctx.groups.qkt, d.wgQ, ctx.bufs.scores, d.scoresBytes, `attention.soft-prep-${seq}`);
+    const probsGot = await dispatchToAndRead(ctx.pipelines.soft, ctx.groups.soft, d.wgSoft, ctx.bufs.probs, d.scoresBytes, `attention.soft-correctness-${seq}`);
+    const softErr = maxAbsDiff(probsGot, ctx.ref.probs);
+    if (probsGot.length !== ctx.ref.probs.length || !allFinite(probsGot) || softErr > 1e-2) {
+      throw fail('attention.softmax', `seq=${seq}`, 'phase correctness check failed', `maxErr=${softErr.toExponential(2)}`);
+    }
+    const softProbsSums = checkRowSums(probsGot, seq, seq);
+    if (!softProbsSums.ok) {
+      throw fail('attention.softmax', `seq=${seq}`, 'phase correctness check failed', `row sum max dev=${softProbsSums.maxDev.toExponential(3)}`);
+    }
+
+    // PV → out, validate against CPU reference.
+    await dispatchToAndRead(ctx.pipelines.qkt, ctx.groups.qkt, d.wgQ, ctx.bufs.scores, d.scoresBytes, `attention.pv-prep1-${seq}`);
+    await dispatchToAndRead(ctx.pipelines.soft, ctx.groups.soft, d.wgSoft, ctx.bufs.probs, d.scoresBytes, `attention.pv-prep2-${seq}`);
+    const pvGot = await dispatchToAndRead(ctx.pipelines.pv, ctx.groups.pv, d.wgP, ctx.bufs.out, d.outBytes, `attention.pv-correctness-${seq}`);
+    const pvErr = maxAbsDiff(pvGot, ctx.ref.out);
+    if (!allFinite(pvGot) || pvErr > 1e-2) {
+      throw fail('attention.pv', `seq=${seq}`, 'phase correctness check failed', `maxErr=${pvErr.toExponential(2)}`);
+    }
+
+    return { maxErrs: { qkt: qktErr, soft: softErr, pv: pvErr }, rowSumMaxDev: softProbsSums.maxDev };
+  } finally {
+    destroyAttentionContext(ctx);
+  }
+}
+
+/** Single dispatch without any readback (used for benchmark setup/prep only). */
+export function dispatchOnce(pipeline: GPUComputePipeline, bg: GPUBindGroup, wg: [number, number, number], contextInfo = 'dispatchOnce'): void {
+  const device = getDevice();
+  const enc = device.createCommandEncoder({ label: `Enc_${contextInfo}` });
+  harnessCounters.onCommandBufferCreated();
+  const pass = enc.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bg);
+  pass.dispatchWorkgroups(wg[0], wg[1], wg[2]);
+  pass.end();
+  device.queue.submit([enc.finish()]);
+  harnessCounters.onCommandBufferSubmitted('other');
+}
+
+/** Build a fresh context reserved for phase benchmark timing (no refs). */
+export async function createBenchmarkAttentionContext(seq: number, dim = 64, batch = 1): Promise<AttentionCtx> {
+  return await setupAttention(seq, dim, batch, 'benchmark', false);
+}
+
+/**
+ * Time ONE phase via CompletionToken waits (TASK 10/11/13): no full-output
+ * readback during timing. One command buffer per iteration: kernel dispatch +
+ * tiny 4-byte token copy. For softmax/pv the input matrix is first produced by
+ * a single prep dispatch (no readback), then measured repeatedly.
+ */
+export async function measureAttentionPhasePerformance(
   tm: TimingManager,
   ctx: AttentionCtx,
-  seq: number,
-  dim: number,
+  phase: 'qkt' | 'softmax' | 'pv',
   iterations: number
-): Promise<PerfSample[]> {
-  // TASK 11: dispatch dims must match each phase kernel's index mapping:
-  //   ATTN_QKT → i=gid.x (row), b=gid.y (batch)
-  //   ATTN_PV  → i=gid.x (row), d=gid.y (dim), b=gid.z (batch)
-  // Softmax shader → gid.x = row, @workgroup_size(64): dispatch ceil(seq/64)
-  // in X, NOT seq (TASK 1 — dispatching [seq,1,1] races rows across workgroups).
-  const batch = ctx.batch;
-  const wgQ: [number, number, number] = [Math.ceil(seq / 64), batch, 1];
-  const wgP: [number, number, number] = [Math.ceil(seq / 64), dim, batch];
-  const wgSoft: [number, number, number] = softmaxWorkgroups(seq);
-  const softInfo = softmaxDispatchInfo(seq);
-  const scoresBytes = seq * seq * 4;
-  const outBytes = seq * dim * 4;
+): Promise<TimingStats> {
+  const d = attentionPhaseDispatch(ctx.seq, ctx.dim, ctx.batch);
+  if (phase === 'softmax') {
+    dispatchOnce(ctx.pipelines.qkt, ctx.groups.qkt, d.wgQ, `soft-prep-${ctx.seq}`);
+  } else if (phase === 'pv') {
+    dispatchOnce(ctx.pipelines.qkt, ctx.groups.qkt, d.wgQ, `pv-prep1-${ctx.seq}`);
+    dispatchOnce(ctx.pipelines.soft, ctx.groups.soft, d.wgSoft, `pv-prep2-${ctx.seq}`);
+  }
+  const { pipeline, bg, wg } =
+    phase === 'qkt'
+      ? { pipeline: ctx.pipelines.qkt, bg: ctx.groups.qkt, wg: d.wgQ }
+      : phase === 'softmax'
+        ? { pipeline: ctx.pipelines.soft, bg: ctx.groups.soft, wg: d.wgSoft }
+        : { pipeline: ctx.pipelines.pv, bg: ctx.groups.pv, wg: d.wgP };
+  return await tm.measure(
+    (pass) => {
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, bg);
+      pass.dispatchWorkgroups(wg[0], wg[1], wg[2]);
+    },
+    { iterations }
+  );
+}
 
-  // warmup the phase composition path (qkt → softmax → pv)
-  for (let i = 0; i < 3; i++) {
-    await dispatchToAndRead(ctx.pipelines.qkt, ctx.groups.qkt, wgQ, ctx.bufs.scores, scoresBytes, 'warmup-qkt');
-    await dispatchToAndRead(ctx.pipelines.soft, ctx.groups.soft, wgSoft, ctx.bufs.probs, scoresBytes, 'warmup-soft');
-    await dispatchToAndRead(ctx.pipelines.pv, ctx.groups.pv, wgP, ctx.bufs.out, outBytes, 'warmup-pv');
+/** Create a fresh benchmark context and measure a whole phase (benchmark context destroyed when done). */
+export async function measureAttentionPhases(tm: TimingManager, seq: number, dim: number, iterations: number): Promise<PerfSample[]> {
+  const batch = 1;
+  // TASK 5 — the hardware benchmark is GATED on phase correctness. A phase that
+  // is wrong aborts here, before any benchmark context exists.
+  try {
+    await runAttentionPhaseCorrectness(seq, dim, batch);
+  } catch (err) {
+    throw new Error(`Attention phase correctness failed — fix correctness before benchmarking. ${(err as Error).message}`);
   }
 
-  const out: PerfSample[] = [];
-
-  // QK^T — measure the score computation alone; validate against ref.scores.
-  {
-    const s = await dispatchToAndRead(ctx.pipelines.qkt, ctx.groups.qkt, wgQ, ctx.bufs.scores, scoresBytes, `qkt-${seq}`);
-    if (maxAbsDiff(s, ctx.ref.scores) > 1e-2) throw fail('attention.qkt', `seq=${seq}`, 'phase correctness check failed', `maxErr=${maxAbsDiff(s, ctx.ref.scores).toExponential(2)}`);
-    const times: number[] = [];
-    for (let i = 0; i < iterations; i++) {
-      times.push(await tm.timeOne(
-        (pass) => { pass.setPipeline(ctx.pipelines.qkt); pass.setBindGroup(0, ctx.groups.qkt); pass.dispatchWorkgroups(wgQ[0], wgQ[1], wgQ[2]); },
-        waitFor(ctx.bufs.scores, scoresBytes, `qkt-${seq}`)
-      ));
-    }
-    out.push(sample(`attention-qkt-${seq}`, 'QK^T (scores)', `seq=${seq} dim=64`, statsOfTimes(times, tm.mode), gflops(2 * seq * seq * dim, medianOf(times))));
+  const ctx = await createBenchmarkAttentionContext(seq, dim, batch);
+  try {
+    return await attentionPhaseSamples(tm, ctx, iterations);
+  } finally {
+    destroyAttentionContext(ctx);
   }
+}
 
-  // Softmax from raw scores into a fresh probs buffer (mirrors the monolithic).
-  {
-    const times: number[] = [];
-    for (let i = 0; i < iterations; i++) {
-      await dispatchToAndRead(ctx.pipelines.qkt, ctx.groups.qkt, wgQ, ctx.bufs.scores, scoresBytes, `soft-prep-${seq}`);
-      times.push(await tm.timeOne(
-        (pass) => { pass.setPipeline(ctx.pipelines.soft); pass.setBindGroup(0, ctx.groups.soft); pass.dispatchWorkgroups(wgSoft[0], wgSoft[1], wgSoft[2]); },
-        waitFor(ctx.bufs.probs, scoresBytes, `soft-${seq}`)
-      ));
-    }
-    const p = await ReadbackManager.getInstance().copyAndRead(getDevice(), ctx.bufs.probs, scoresBytes, `soft-val-${seq}`);
-    if (p.length !== ctx.ref.probs.length || !allFinite(p)) throw fail('attention.softmax', `seq=${seq}`, 'softmax output invalid', `len=${p.length}`);
-    if (maxAbsDiff(p, ctx.ref.probs) > 1e-2) throw fail('attention.softmax', `seq=${seq}`, 'phase correctness check failed', `maxErr=${maxAbsDiff(p, ctx.ref.probs).toExponential(2)}`);
-    const softProbsSums = checkRowSums(p, seq, seq);
-    if (!softProbsSums.ok) throw fail('attention.softmax', `seq=${seq}`, 'softmax row sums deviate from 1', `max dev=${softProbsSums.maxDev.toExponential(3)}`);
-    out.push(sample(`attention-softmax-${seq}`, 'Softmax on scores', `seq=${seq} rows=${seq} ${dispatchText(softInfo)}`, statsOfTimes(times, tm.mode)));
-  }
-
-  // Softmax × V — prep qkt→softmax so probs are in place, then measure PV.
-  {
-    const times: number[] = [];
-    for (let i = 0; i < iterations; i++) {
-      await dispatchToAndRead(ctx.pipelines.qkt, ctx.groups.qkt, wgQ, ctx.bufs.scores, scoresBytes, `pv-prep1-${seq}`);
-      await dispatchToAndRead(ctx.pipelines.soft, ctx.groups.soft, wgSoft, ctx.bufs.probs, scoresBytes, `pv-prep2-${seq}`);
-      times.push(await tm.timeOne(
-        (pass) => { pass.setPipeline(ctx.pipelines.pv); pass.setBindGroup(0, ctx.groups.pv); pass.dispatchWorkgroups(wgP[0], wgP[1], wgP[2]); },
-        waitFor(ctx.bufs.out, outBytes, `pv-${seq}`)
-      ));
-    }
-    const o = await ReadbackManager.getInstance().copyAndRead(getDevice(), ctx.bufs.out, outBytes, `pv-val-${seq}`);
-    if (maxAbsDiff(o, ctx.ref.out) > 1e-2) throw fail('attention.pv', `seq=${seq}`, 'phase correctness check failed', `maxErr=${maxAbsDiff(o, ctx.ref.out).toExponential(2)}`);
-    out.push(sample(`attention-pv-${seq}`, 'Softmax × V', `seq=${seq} dim=64`, statsOfTimes(times, tm.mode), gflops(2 * seq * seq * dim, medianOf(times))));
-  }
-  return out;
+/** Time all three phases against an existing fresh benchmark context (no readbacks in timing). */
+export async function attentionPhaseSamples(tm: TimingManager, ctx: AttentionCtx, iterations: number): Promise<PerfSample[]> {
+  const d = attentionPhaseDispatch(ctx.seq, ctx.dim, ctx.batch);
+  const qkt = await measureAttentionPhasePerformance(tm, ctx, 'qkt', iterations);
+  const softmax = await measureAttentionPhasePerformance(tm, ctx, 'softmax', iterations);
+  const pv = await measureAttentionPhasePerformance(tm, ctx, 'pv', iterations);
+  return [
+    sample(`attention-qkt-${ctx.seq}`, 'QK^T (scores)', `seq=${ctx.seq} dim=${ctx.dim}`, qkt, gflops(2 * ctx.seq * ctx.seq * ctx.dim, qkt.medianMs)),
+    sample(`attention-softmax-${ctx.seq}`, 'Softmax on scores', `seq=${ctx.seq} rows=${ctx.seq} ${dispatchText(d.softInfo)}`, softmax),
+    sample(`attention-pv-${ctx.seq}`, 'Softmax × V', `seq=${ctx.seq} dim=${ctx.dim}`, pv, gflops(2 * ctx.seq * ctx.seq * ctx.dim, pv.medianMs)),
+  ];
 }
 
 function skipSample(id: string, name: string, size: string, note: string): PerfSample {
   return { id, name, size, timingMode: 'END_TO_END', iterations: 0, warmup: 0, medianMs: 0, averageMs: 0, minMs: 0, maxMs: 0, stdDevMs: 0, note };
 }
 
-function statsOfTimes(times: number[], mode: 'GPU_TIMESTAMP' | 'END_TO_END') {
-  const sorted = [...times].sort((a, b) => a - b);
-  const avg = times.reduce((a, b) => a + b, 0) / Math.max(times.length, 1);
-  const median = sorted[Math.floor(sorted.length / 2)] ?? 0;
-  const variance = times.reduce((a, b) => a + (b - avg) ** 2, 0) / Math.max(times.length, 1);
-  return {
-    mode,
-    iterations: times.length,
-    warmup: 3,
-    medianMs: median,
-    avgMs: avg,
-    minMs: sorted[0] ?? 0,
-    maxMs: sorted[sorted.length - 1] ?? 0,
-    stdDevMs: Math.sqrt(variance),
-  };
-}
+async function setupAttention(seq: number, dim: number, batch: number, kind: 'main' | 'correctness' | 'benchmark' = 'main', withRefs = true): Promise<AttentionCtx> {
+  const ctxId = ++attentionContextSeq;
+  attentionContextLog.push({ id: ctxId, kind, destroyed: false });
+  const data = attentionInputs(seq, dim, batch);
+  const ref = withRefs ? attentionRefs(seq, dim, batch) : null;
+  const scale = data.scale;
 
-function medianOf(times: number[]): number {
-  const sorted = [...times].sort((a, b) => a - b);
-  return sorted[Math.floor(sorted.length / 2)] ?? 0;
-}
-
-async function setupAttention(seq: number, dim: number, batch: number): Promise<AttentionCtx> {
-  const ref = attentionRefs(seq, dim, batch);
-  const scale = 1 / Math.sqrt(dim);
-
-  const bufQ = createStorageBuffer(seq * dim * 4, ref.Q);
-  const bufK = createStorageBuffer(seq * dim * 4, ref.K);
-  const bufV = createStorageBuffer(seq * dim * 4, ref.V);
+  const bufQ = createStorageBuffer(seq * dim * 4, data.Q);
+  const bufK = createStorageBuffer(seq * dim * 4, data.K);
+  const bufV = createStorageBuffer(seq * dim * 4, data.V);
   // TASK 8/17 — pre-fill output with sentinel; leftover proves unwritten rows
   // (buffer reuse guard: never rely on freshly allocated buffers being zero).
   const bufOut = createStorageBuffer(seq * dim * 4, new Float32Array(seq * dim).fill(ATTENTION_OUTPUT_SENTINEL));
   const bufScores = createStorageBuffer(seq * seq * 4);
   const bufProbs = createStorageBuffer(seq * seq * 4);
   const uniform = createUniformBuffer(createAttentionUniform(batch, seq, dim, scale));
+  // HARNESS FIX: the SOFTMAX pipeline reads { rows, cols } from its uniform —
+  // it must NOT receive the attention struct { batch, seq, dim, scale }, which
+  // decodes as rows=batch=1 (only row 0 computed). Give it a dedicated softmax
+  // uniform. Correctness through this context must stay strict.
+  const softUniform = createUniformBuffer(createSoftmaxUniform(seq, seq));
 
   const total = createPipeline(ATTENTION, ['uniform', 'read-only-storage', 'read-only-storage', 'read-only-storage', 'storage', 'storage']);
   const qkt = createPipeline(ATTN_QKT, [...QKT_BINDINGS]);
@@ -767,7 +860,7 @@ async function setupAttention(seq: number, dim: number, batch: number): Promise<
     { binding: 3, resource: { buffer: bufScores } },
   ]);
   const gSoft = createBindGroupForPipeline(soft, ['uniform', 'read-only-storage', 'storage'], [
-    { binding: 0, resource: { buffer: uniform } },
+    { binding: 0, resource: { buffer: softUniform } },
     { binding: 1, resource: { buffer: bufScores } },
     { binding: 2, resource: { buffer: bufProbs } },
   ]);
@@ -779,14 +872,37 @@ async function setupAttention(seq: number, dim: number, batch: number): Promise<
   ]);
 
   return {
+    kind,
+    ctxId,
+    destroyed: false,
     seq,
     dim,
     batch,
     pipelines: { total, qkt, soft, pv },
     groups: { total: gTotal, qkt: gQkt, soft: gSoft, pv: gPv },
     bufs: { q: bufQ, k: bufK, v: bufV, out: bufOut, scores: bufScores, probs: bufProbs },
-    ref: { scores: ref.scores, probs: ref.probs, out: ref.out },
+    softUniform,
+    ref: ref ? { scores: ref.scores, probs: ref.probs, out: ref.out } : null,
   };
+}
+
+/** Destroy all GPU buffers owned by an attention context and flag it destroyed. */
+export function destroyAttentionContext(ctx: AttentionCtx): void {
+  if (ctx.destroyed) return;
+  try {
+    ctx.bufs.q.destroy();
+    ctx.bufs.k.destroy();
+    ctx.bufs.v.destroy();
+    ctx.bufs.out.destroy();
+    ctx.bufs.scores.destroy();
+    ctx.bufs.probs.destroy();
+    ctx.softUniform.destroy();
+  } catch {
+    // best-effort cleanup
+  }
+  ctx.destroyed = true;
+  const entry = attentionContextLog.find((e) => e.id === ctx.ctxId);
+  if (entry) entry.destroyed = true;
 }
 
 // ─── Phase-Softmax Correctness (TASK 10/11/15) ───
@@ -824,18 +940,19 @@ export async function runPhaseSoftmaxCorrectness(seqs: number[] = [4, 16, 64, 12
   for (const seq of seqs) {
     const seqsRows = batch * seq;
     const info = assertSoftmaxDispatch(seqsRows);
-    const ctx = await setupAttention(seq, dim, batch);
+    const ctx = await setupAttention(seq, dim, batch, 'correctness', true);
     try {
       let stage = 'qkt';
       let errorType: string | null = null;
       let errorMessage: string | null = null;
+      const ref = ctx.ref!;
 
       // Phase 1: QK^T → scores, validate against CPU reference.
       const wgQ: [number, number, number] = [Math.ceil(seqsRows / 64), batch, 1];
       const scoresGot = await dispatchToAndRead(ctx.pipelines.qkt, ctx.groups.qkt, wgQ, ctx.bufs.scores, seq * seq * 4, `phase-softmax-qkt-${seq}`);
-      if (maxAbsDiff(scoresGot, ctx.ref.scores) > 1e-2) {
+      if (maxAbsDiff(scoresGot, ref.scores) > 1e-2) {
         errorType = 'phase-qkt-mismatch';
-        errorMessage = `QK^T scores maxErr=${maxAbsDiff(scoresGot, ctx.ref.scores).toExponential(2)}`;
+        errorMessage = `QK^T scores maxErr=${maxAbsDiff(scoresGot, ref.scores).toExponential(2)}`;
       }
 
       // Sentinel-fill probs so unwritten rows are visible after the softmax pass.
@@ -846,7 +963,7 @@ export async function runPhaseSoftmaxCorrectness(seqs: number[] = [4, 16, 64, 12
       const probsGot = await dispatchToAndRead(ctx.pipelines.soft, ctx.groups.soft, wgSoft, ctx.bufs.probs, seq * seq * 4, `phase-softmax-soft-${seq}`);
 
       stage = errorType === null ? 'softmax-validation' : 'qkt';
-      let num = analyzeNumeric(probsGot, ctx.ref.probs, 1e-2);
+      let num = analyzeNumeric(probsGot, ref.probs, 1e-2);
       if (errorType === null && !num.pass) {
         errorType = 'softmax-mismatch';
         errorMessage = `maxErr=${num.maxError.toExponential(2)} @ idx ${num.errorIndex} (cpu ${num.cpuValue?.toExponential(4)} gpu ${num.gpuValue?.toExponential(4)})`;
@@ -891,14 +1008,7 @@ export async function runPhaseSoftmaxCorrectness(seqs: number[] = [4, 16, 64, 12
         sentinelCount,
       });
     } finally {
-      try {
-        ctx.bufs.q.destroy();
-        ctx.bufs.k.destroy();
-        ctx.bufs.v.destroy();
-        ctx.bufs.out.destroy();
-        ctx.bufs.scores.destroy();
-        ctx.bufs.probs.destroy();
-      } catch {}
+      destroyAttentionContext(ctx);
     }
   }
   return results;

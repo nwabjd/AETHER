@@ -8,6 +8,8 @@
 // A single report never mixes the two modes; each sample carries its mode.
 
 import { ReadbackManager } from './readback.ts';
+import { CompletionToken, awaitCompletion } from './completion.ts';
+import { harnessCounters } from './harness-counters.ts';
 
 export const AETHER_DISABLE_TIMESTAMPS = true;
 
@@ -74,11 +76,13 @@ export class TimingManager {
   private _resolve: GPUBuffer | null = null;
   private _periodNs = 1;
   private _fallbackLogged: string | null = null;
+  private readonly _completion: CompletionToken;
 
   constructor(device: GPUDevice) {
     this.device = device;
     const ok = this.tryEnableTimestamps(device);
     this._mode = ok ? 'GPU_TIMESTAMP' : 'END_TO_END';
+    this._completion = new CompletionToken(device);
   }
 
   private tryEnableTimestamps(device: GPUDevice): boolean {
@@ -131,11 +135,17 @@ export class TimingManager {
   async measure(fn: (pass: GPUComputePassEncoder) => void, opts: MeasureOptions): Promise<TimingStats> {
     const warmup = opts.warmup ?? 3;
 
-    // Warmup: run through the full dispatch path (including the end-to-end
-    // sync so shader JIT / first-submit latency settles) without recording.
+    // Warmup (TASK 1/8): the dispatch encoder is finished AND submitted, then
+    // GPU completion is awaited via the tiny CompletionToken. Never leaves an
+    // unsubmitted encoder behind; never pretends a warmup ran.
     for (let i = 0; i < warmup; i++) {
-      this.dispatchPass(fn);
-      await this.sync();
+      const encoder = this.dispatchPass(fn);
+      harnessCounters.onCommandBufferCreated();
+      this._completion.encode(encoder);
+      const cmd = encoder.finish();
+      this.device.queue.submit([cmd]);
+      harnessCounters.onCommandBufferSubmitted('warmup');
+      await awaitCompletion(this.device, this._completion, `measure-warmup-${i}`);
     }
 
     const times: number[] = [];
@@ -188,7 +198,9 @@ export class TimingManager {
         endOfPassWriteIndex: 1,
       });
       encoder.resolveQuerySet(this._querySet, 0, 2, this._resolve, 0);
+      harnessCounters.onCommandBufferCreated();
       this.device.queue.submit([encoder.finish()]);
+      harnessCounters.onCommandBufferSubmitted('measurement');
 
       const res = await ReadbackManager.getInstance().copyAndRead(this.device, this._resolve, 16, 'measureTimestampPass');
       const ts = new BigUint64Array(res.buffer);
@@ -203,11 +215,18 @@ export class TimingManager {
   private async measureEndToEnd(fn: (pass: GPUComputePassEncoder) => void, wait?: () => Promise<void>): Promise<number> {
     const start = performance.now();
     const encoder = this.dispatchPass(fn);
-    this.device.queue.submit([encoder.finish()]);
+    // TASK 10/11/13: the completion signal is the tiny CompletionToken copy in
+    // the SAME command buffer — never a full-output GPU→CPU readback. This
+    // command buffer is one submission per iteration.
+    this._completion.encode(encoder);
+    harnessCounters.onCommandBufferCreated();
+    const cmd = encoder.finish();
+    this.device.queue.submit([cmd]);
+    harnessCounters.onCommandBufferSubmitted('measurement');
     if (wait) {
       await wait();
     } else {
-      await this.sync();
+      await awaitCompletion(this.device, this._completion, 'measure-end-to-end');
     }
     return performance.now() - start;
   }
@@ -215,11 +234,16 @@ export class TimingManager {
   /** Wait for all previously submitted work to finish (completion sync). */
   private async sync(): Promise<void> {
     try {
-      const dummy = this.device.createBuffer({ size: 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
-      await ReadbackManager.getInstance().copyAndRead(this.device, dummy, 4, 'sync');
-      dummy.destroy();
+      // TASK 18: sync uses the CompletionToken, not a dummy uninitialized
+      // storage buffer round-tripped through the ReadbackManager.
+      const enc = this.device.createCommandEncoder();
+      harnessCounters.onCommandBufferCreated();
+      this._completion.encode(enc);
+      this.device.queue.submit([enc.finish()]);
+      harnessCounters.onCommandBufferSubmitted('sync');
+      await awaitCompletion(this.device, this._completion, 'sync');
     } catch {
-      // Bounded wait if sync readback fails
+      // Bounded wait if completion fails
       await new Promise((r) => setTimeout(r, 16));
     }
   }
@@ -241,6 +265,7 @@ export class TimingManager {
     try {
       this._querySet?.destroy();
       this._resolve?.destroy();
+      this._completion.destroy();
     } catch {
       // best-effort cleanup
     }

@@ -43,6 +43,15 @@ import {
   type CommandBatchingResult,
   type SustainedResult,
 } from './perf-report';
+import {
+  runPhaseBenchmarkSeries,
+  runCriticalIsolation,
+  harnessDebugReport,
+} from './attention-harness';
+import {
+  runHarnessRegression,
+  formatHarnessRegression,
+} from './benchmark-harness-regression';
 
 let _container: HTMLElement | null = null;
 let _running = false;
@@ -891,6 +900,121 @@ async function runFullIsolatedPhaseHandler() {
   }
 }
 
+async function runHarnessDebugHandler() {
+  if (_running) return;
+  _running = true;
+  try {
+    await initBenchmark();
+    installListeners();
+    drainUncaptured();
+    installUncapturedCollector();
+    const mount = _container?.querySelector('#res-harness-debug') as HTMLElement | null;
+    if (mount) {
+      mount.innerHTML = `<div class="card"><div class="card-header"><span class="card-title">Harness debug panel</span></div><div style="padding:8px;font-size:12px;font-family:var(--mono);white-space:pre-wrap">${esc(harnessDebugReport())}</div></div>`;
+    }
+    log('HARNESS DEBUG: panel refreshed', 'info');
+  } catch (e) {
+    log(`ERROR: ${(e as Error).message}`, 'err');
+    if (hasDeviceLost()) stopDeviceLost();
+  } finally {
+    _running = false;
+  }
+}
+
+async function runHarnessRegressionHandler() {
+  if (_running) return;
+  _running = true;
+  try {
+    await initBenchmark();
+    installListeners();
+    drainUncaptured();
+    installUncapturedCollector();
+    log('═══ HARNESS REGRESSION (TASK 20) seq=4 iters=3 ═══', 'info');
+    const result = await runHarnessRegression(4, 3);
+    const mount = _container?.querySelector('#res-harness-regression') as HTMLElement | null;
+    if (mount) {
+      mount.innerHTML = `<div class="card" style="border-color:${result.passed ? 'var(--green)' : 'var(--red)'}">
+        <div class="card-header"><span class="card-title">Harness regression</span><span class="badge ${result.passed ? 'badge-pass' : 'badge-fail'}">${result.passed ? 'PASS' : 'FAIL'}</span></div>
+        <div style="padding:8px;font-size:12px;font-family:var(--mono);white-space:pre-wrap">${esc(formatHarnessRegression(result))}</div></div>`;
+    }
+    const dbg = _container?.querySelector('#res-harness-debug') as HTMLElement | null;
+    if (dbg) {
+      dbg.innerHTML = `<div class="card"><div class="card-header"><span class="card-title">Harness debug panel (after regression)</span></div><div style="padding:8px;font-size:12px;font-family:var(--mono);white-space:pre-wrap">${esc(harnessDebugReport())}</div></div>`;
+    }
+    log(`HARNESS REGRESSION: ${result.passed ? 'PASS' : 'FAIL'}`, result.passed ? 'ok' : 'err');
+  } catch (e) {
+    log(`ERROR: ${(e as Error).message}`, 'err');
+    if (hasDeviceLost()) stopDeviceLost();
+  } finally {
+    _running = false;
+  }
+}
+
+async function runCriticalIsolationHandler() {
+  if (_running) return;
+  _running = true;
+  try {
+    await initBenchmark();
+    installListeners();
+    drainUncaptured();
+    installUncapturedCollector();
+    log('═══ CRITICAL ISOLATION seq=256 (A isolated → B fresh-correctness → C warmup-only → D benchmark) ═══', 'info');
+    const steps = await runCriticalIsolation(256);
+    const rows = steps
+      .map((st) => `<tr style="color:${st.ok ? 'var(--green)' : 'var(--red)'}"><td class="td-l">${st.step}</td><td>${esc(st.label)}</td><td>${st.ok ? 'PASS' : 'FAIL'}</td><td style="color:var(--text-dim)">${esc(st.details)}</td></tr>`)
+      .join('');
+    const mount = _container?.querySelector('#res-harness-crit') as HTMLElement | null;
+    if (mount) {
+      mount.innerHTML = `<div class="card" style="border-color:${steps.every((s) => s.ok) ? 'var(--green)' : 'var(--red)'}">
+        <div class="card-header"><span class="card-title">Critical isolation seq=256</span><span class="badge ${steps.every((s) => s.ok) ? 'badge-pass' : 'badge-fail'}">${steps.every((s) => s.ok) ? 'ALL PASS' : `STOP @ ${steps.find((s) => !s.ok)?.step ?? '?'}`}</span></div>
+        <table class="perf-table"><thead><tr><th class="th-l">step</th><th>check</th><th>result</th><th>detail</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+    }
+    log(`CRITICAL ISOLATION: ${steps.every((s) => s.ok) ? 'ALL PASS' : `FAILED at step ${steps.find((s) => !s.ok)?.step ?? '?'}`}`, steps.every((s) => s.ok) ? 'ok' : 'err');
+  } catch (e) {
+    log(`ERROR: ${(e as Error).message}`, 'err');
+    if (hasDeviceLost()) stopDeviceLost();
+  } finally {
+    _running = false;
+  }
+}
+
+async function runHarnessBenchHandler() {
+  if (_running) return;
+  _running = true;
+  try {
+    await initBenchmark();
+    installListeners();
+    drainUncaptured();
+    installUncapturedCollector();
+    log('═══ PHASE BENCHMARK SERIES (seq=4,16,64,128,256 · 5 iterations/phase) ═══', 'info');
+    const results = await runPhaseBenchmarkSeries(_isoSeq, 5);
+    const html = results
+      .map((r) => {
+        const good = r.correctness.maxErrs.qkt < 1e-2 && r.correctness.maxErrs.soft < 1e-2 && r.correctness.maxErrs.pv < 1e-2;
+        return `<div class="card" style="border-color:${good ? 'var(--green)' : 'var(--red)'};margin-top:12px">
+          <div class="card-header"><span class="card-title">Phase benchmark seq=${r.seq} (correctness gated)</span>
+          <span class="badge ${good ? 'badge-pass' : 'badge-fail'}">${good ? 'PASS' : 'FAIL'}</span></div>
+          <div style="padding:4px 8px;font-size:12px;font-family:var(--mono);color:var(--text-dim)">correctness: qkt=${r.correctness.maxErrs.qkt.toExponential(2)} soft=${r.correctness.maxErrs.soft.toExponential(2)} pv=${r.correctness.maxErrs.pv.toExponential(2)} rowSumDev=${r.correctness.rowSumMaxDev.toExponential(3)}</div>
+          ${perfBlock(`${r.seq}`, r.samples)}
+        </div>`;
+      })
+      .join('');
+    const mount = _container?.querySelector('#res-harness-bench') as HTMLElement | null;
+    if (mount) mount.innerHTML = html;
+    const dbg = _container?.querySelector('#res-harness-debug') as HTMLElement | null;
+    if (dbg) {
+      dbg.innerHTML = `<div class="card"><div class="card-header"><span class="card-title">Harness debug panel (after phase benchmark)</span></div><div style="padding:8px;font-size:12px;font-family:var(--mono);white-space:pre-wrap">${esc(harnessDebugReport())}</div></div>`;
+    }
+    const allPass = results.every((r) => r.correctness.maxErrs.qkt < 1e-2 && r.correctness.maxErrs.soft < 1e-2 && r.correctness.maxErrs.pv < 1e-2);
+    log(`PHASE BENCHMARK SERIES: ${allPass ? 'ALL CORRECT' : 'CORRECTNESS FAILURE'} (${results.map((r) => `s${r.seq}:${r.samples.length}/3`).join(' ')})`, allPass ? 'ok' : 'err');
+  } catch (e) {
+    log(`ERROR: ${(e as Error).message}`, 'err');
+    if (hasDeviceLost()) stopDeviceLost();
+  } finally {
+    _running = false;
+  }
+}
+
 async function runCorrectnessTests() {
   if (_running) return;
   if (!gatesPassed()) {
@@ -1343,6 +1467,10 @@ export function render(el: HTMLElement) {
       <button class="btn btn-outline" id="btn-iso-qkt">RUN ISOLATED QKT</button>
       <button class="btn btn-outline" id="btn-iso-phase">RUN ISOLATED PHASE SOFTMAX</button>
       <button class="btn btn-outline" id="btn-iso-full">RUN FULL ISOLATED PHASE</button>
+      <button class="btn btn-outline" id="btn-harness-debug">HARNESS DEBUG PANEL</button>
+      <button class="btn btn-outline" id="btn-harness-crit">CRITICAL ISOLATION SEQ=256</button>
+      <button class="btn btn-outline" id="btn-harness-regression">RUN HARNESS REGRESSION</button>
+      <button class="btn btn-outline" id="btn-harness-bench">PHASE BENCHMARK SEQ=4..256</button>
     </div>
 
     <div id="res-minimal-64"></div>
@@ -1354,6 +1482,10 @@ export function render(el: HTMLElement) {
     <div id="res-iso-qkt"></div>
     <div id="res-iso-phase"></div>
     <div id="res-iso-full"></div>
+    <div id="res-harness-debug"></div>
+    <div id="res-harness-crit"></div>
+    <div id="res-harness-regression"></div>
+    <div id="res-harness-bench"></div>
     <div id="res-readback-engine"></div>
 
     <div id="validation-panel"></div>
@@ -1384,6 +1516,10 @@ export function render(el: HTMLElement) {
   el.querySelector('#btn-iso-qkt')?.addEventListener('click', runIsolatedQktHandler);
   el.querySelector('#btn-iso-phase')?.addEventListener('click', runIsolatedPhaseSoftmaxHandler);
   el.querySelector('#btn-iso-full')?.addEventListener('click', runFullIsolatedPhaseHandler);
+  el.querySelector('#btn-harness-debug')?.addEventListener('click', runHarnessDebugHandler);
+  el.querySelector('#btn-harness-crit')?.addEventListener('click', runCriticalIsolationHandler);
+  el.querySelector('#btn-harness-regression')?.addEventListener('click', runHarnessRegressionHandler);
+  el.querySelector('#btn-harness-bench')?.addEventListener('click', runHarnessBenchHandler);
   el.querySelector('#btn-harness')?.addEventListener('click', runHarnessMatmulHandler);
 
   const correctBtn = el.querySelector('#btn-correctness') as HTMLButtonElement | null;

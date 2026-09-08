@@ -6,6 +6,12 @@
 // 3. Guaranteed unmap() before buffer release/reuse
 // 4. Exact mapAsync error reporting (surfacing real exceptions instead of generic aborts)
 // 5. Explicit pre-map device-loss and size validation checks
+//
+// TASK 17: this manager is used ONLY for correctness full-output reads and the
+// tiny completion token — never as the per-iteration timing wait. It reports to
+// the harness counters so overlapping mapAsync is detectable.
+
+import { harnessCounters } from './harness-counters.ts';
 
 export interface ReadbackDiagnostics {
   stagingSize: number;
@@ -92,11 +98,15 @@ export class ReadbackManager {
 
       // 2. Submit copy command in single encoder
       const encoder = device.createCommandEncoder({ label: `Encoder_${contextInfo}` });
+      harnessCounters.onCommandBufferCreated();
       encoder.copyBufferToBuffer(srcBuffer, 0, staging, 0, size);
       device.queue.submit([encoder.finish()]);
+      harnessCounters.onCommandBufferSubmitted('readback');
 
       // 3. Map staging buffer & extract data with explicit error handling
       this.isPending = true;
+      harnessCounters.onReadbackOperation();
+      harnessCounters.onMapBegin();
       try {
         await staging.mapAsync(GPUMapMode.READ, 0, size);
         this.isMapped = true;
@@ -122,6 +132,8 @@ export class ReadbackManager {
         this.lastError = detailedError;
         console.error(detailedError);
         throw new Error(detailedError);
+      } finally {
+        harnessCounters.onMapEnd();
       }
     });
   }
@@ -138,6 +150,8 @@ export class ReadbackManager {
   ): Promise<Float32Array> {
     return this.enqueueReadback(device, async () => {
       this.isPending = true;
+      harnessCounters.onReadbackOperation();
+      harnessCounters.onMapBegin();
       try {
         await staging.mapAsync(GPUMapMode.READ, 0, size);
         this.isMapped = true;
@@ -163,6 +177,8 @@ export class ReadbackManager {
         this.lastError = detailedError;
         console.error(detailedError);
         throw new Error(detailedError);
+      } finally {
+        harnessCounters.onMapEnd();
       }
     });
   }
