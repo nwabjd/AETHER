@@ -48,7 +48,7 @@ import {
   runCriticalIsolation,
   harnessDebugReport,
 } from './attention-harness';
-import { AmplifiedTimingManager } from './amplified-timing';
+import { AmplifiedTimingManager, buildV2ResultRow, type V2ResultRow, fmtPerDispatch, fmtThroughput } from './amplified-timing';
 import {
   runHarnessRegression,
   formatHarnessRegression,
@@ -1375,54 +1375,43 @@ async function runPerfV2(mode: 'quick' | 'full') {
   _running = true;
   try {
     const label = mode === 'quick' ? 'QUICK V2' : 'FULL V2';
-    log(`═══ AETHER GPU PERFORMANCE V2 — ${label} BENCHMARK ═══`, 'info');
-    
+    log(`═══ AETHER GPU PERFORMANCE V2 — ${label} BENCHMARK (ADAPTIVE) ═══`, 'info');
+
     const device = getDevice();
     const timingMgr = new AmplifiedTimingManager(device);
-    
-    // TASK 18: Detect timer resolution
-    const timerRes = AmplifiedTimingManager.detectTimerResolution();
-    log(`  Timer resolution estimate: ~${timerRes.toFixed(3)} ms`, 'info');
-    log(`  Cross-origin isolated: ${window.crossOriginIsolated}`, 'info');
-    
-    const results: any[] = [];
-    
+    const timerRes = timingMgr.timerResolutionMs;
+    const webgpuOk = !!(navigator as any).gpu;
+    const crossOrig = window.crossOriginIsolated;
+    const secure = window.isSecureContext;
+
+    log(`  Timer resolution: ${timerRes.toFixed(3)} ms`, 'info');
+    log(`  Cross-origin isolated: ${crossOrig}  |  secure context: ${secure}  |  WebGPU: ${webgpuOk}`, 'info');
+
+    const allRows: V2ResultRow[] = [];
+
+    const runBench = async (bench: (mgr: AmplifiedTimingManager) => Promise<V2ResultRow[]>, name: string) => {
+      log(`  Running ${name}...`, 'info');
+      const rows = await bench(timingMgr);
+      allRows.push(...rows);
+    };
+
     if (mode === 'quick') {
-      // Quick V2: MatMul 128, 256; VecAdd 1M, 4M; Softmax 256; RMSNorm 2048; Attention 128, 256
-      const configs = [
-        { name: 'MatMul', run: () => benchMatmulV2(timingMgr) },
-        { name: 'VecAdd', run: () => benchVecAddV2(timingMgr) },
-        { name: 'Softmax', run: () => benchSoftmaxV2(timingMgr) },
-        { name: 'RMSNorm', run: () => benchRMSNormV2(timingMgr) },
-        { name: 'Attention', run: () => benchAttentionV2(timingMgr) },
-      ];
-      
-      for (const cfg of configs) {
-        log(`  Running ${cfg.name}...`, 'info');
-        const res = await cfg.run();
-        results.push(res);
-      }
+      await runBench(benchMatmulV2, 'MatMul');
+      await runBench(benchVecAddV2, 'VecAdd');
+      await runBench(benchSoftmaxV2, 'Softmax');
+      await runBench(benchRMSNormV2, 'RMSNorm');
+      await runBench(benchAttentionV2, 'Attention');
     } else {
-      // Full V2: all configurations
-      log('  Running full V2 suite...', 'info');
-      // For now, run the same quick configs
-      const configs = [
-        { name: 'MatMul', run: () => benchMatmulV2(timingMgr) },
-        { name: 'VecAdd', run: () => benchVecAddV2(timingMgr) },
-        { name: 'Softmax', run: () => benchSoftmaxV2(timingMgr) },
-        { name: 'RMSNorm', run: () => benchRMSNormV2(timingMgr) },
-        { name: 'Attention', run: () => benchAttentionV2(timingMgr) },
-        { name: 'Conv2D', run: () => benchConv2DV2(timingMgr) },
-      ];
-      
-      for (const cfg of configs) {
-        log(`  Running ${cfg.name}...`, 'info');
-        const res = await cfg.run();
-        results.push(res);
-      }
+      await runBench(benchMatmulV2, 'MatMul');
+      await runBench(benchVecAddV2, 'VecAdd');
+      await runBench(benchSoftmaxV2, 'Softmax');
+      await runBench(benchRMSNormV2, 'RMSNorm');
+      await runBench(benchAttentionV2, 'Attention');
+      await runBench(benchConv2DV2, 'Conv2D');
     }
-    
-    renderPerfV2Results(results);
+
+    renderPerfV2Results(allRows, { timerRes, crossOrig, secure, webgpuOk });
+    timingMgr.destroy();
     log(`${label} benchmark complete`, 'ok');
   } catch (e) {
     log(`ERROR: ${(e as Error).message}`, 'err');
@@ -1431,49 +1420,117 @@ async function runPerfV2(mode: 'quick' | 'full') {
   }
 }
 
-function renderPerfV2Results(results: any[]) {
+function renderPerfV2Results(rows: V2ResultRow[], env: { timerRes: number; crossOrig: boolean; secure: boolean; webgpuOk: boolean }) {
   const mount = _container?.querySelector('#perf-v2-results') as HTMLElement | null;
   if (!mount) return;
-  
-  let html = '<table class="perf-table"><thead><tr>';
-  html += '<th class="th-l">operation</th><th>configuration</th><th>repetitions</th><th>total time</th><th>per-dispatch</th><th>throughput</th><th>timing mode</th>';
-  html += '</tr></thead><tbody>';
-  
-  for (const r of results) {
-    for (const s of r) {
-      const mode = s.timingMode || 'AMPLIFIED_END_TO_END';
-      html += `<tr>
-        <td class="td-l">${s.name}</td>
-        <td>${s.config}</td>
-        <td>${s.repetitions}</td>
-        <td>${s.totalMs.toFixed(2)} ms</td>
-        <td>${s.perDispatchMs.toFixed(3)} ms</td>
-        <td>${s.throughput ?? '—'}</td>
-        <td>${mode}</td>
-      </tr>`;
-    }
-  }
-  
-  html += '</tbody></table>';
-  mount.innerHTML = html;
+
+  const section = (title: string, items: V2ResultRow[]) => {
+    if (items.length === 0) return '';
+    return `<div class="perf-block"><div class="perf-block-title">${esc(title)}</div>` +
+      `<table class="perf-table"><thead><tr>` +
+      `<th class="th-l">workload</th><th>reps</th><th>total (ms)</th><th>per dispatch</th><th>throughput</th><th>timing</th>` +
+      `</tr></thead><tbody>` +
+      items.map(r => `<tr>` +
+        `<td class="td-l">${esc(r.workload)}</td>` +
+        `<td>${r.repetitions.toLocaleString()}</td>` +
+        `<td>${r.measurable ? r.totalMs.toFixed(2) : '—'}</td>` +
+        `<td>${r.measurable ? fmtPerDispatch(r.perDispatchMs) : 'UNMEASURABLE'}</td>` +
+        `<td>${fmtThroughput(r.throughput, r.throughputUnit)}</td>` +
+        `<td style="font-size:11px;color:var(--text-dim)">${esc(r.timingMethod)}</td>` +
+        `</tr>`).join('') +
+      `</tbody></table></div>`;
+  };
+
+  const tp = (rows.reduce((a, r) => a + (r.measurable ? 1 : 0), 0));
+  const tl = (rows.reduce((a, r) => a + (r.measurable ? 0 : 1), 0));
+
+  mount.innerHTML = `
+    <div class="card" style="border-color:var(--border);margin-top:16px">
+      <div class="card-header">
+        <span class="card-title">AETHER GPU BENCHMARK</span>
+        <span class="badge badge-info">V2 ADAPTIVE</span>
+      </div>
+      <div style="font-size:12px;color:var(--text-dim);margin-top:8px;display:grid;grid-template-columns:1fr 1fr;gap:4px 16px">
+        <div>Timing: <b style="color:var(--text)">HOST_WALL_CLOCK_AMPLIFIED</b></div>
+        <div>Timer resolution: <b style="color:var(--text)">${env.timerRes.toFixed(3)} ms</b></div>
+        <div>WebGPU: <b style="color:var(--text)">${env.webgpuOk ? 'READY' : 'UNAVAILABLE'}</b></div>
+        <div>Cross-origin isolated: <b style="color:var(--text)">${env.crossOrig ? 'YES' : 'NO'}</b></div>
+        <div>Secure context: <b style="color:var(--text)">${env.secure ? 'YES' : 'NO'}</b></div>
+        <div>Adapter name: <b style="color:var(--text)">${esc((_deviceDiag?.adapterName ?? 'UNAVAILABLE'))}</b></div>
+        <div>Adapter vendor: <b style="color:var(--text)">${esc((_deviceDiag?.adapterVendor ?? 'UNAVAILABLE'))}</b></div>
+        <div>Adapter device: <b style="color:var(--text)">${esc((_deviceDiag?.adapterDevice ?? 'UNAVAILABLE'))}</b></div>
+        <div>Measurable: <b style="color:var(--text)">${tp} / ${rows.length}</b></div>
+        <div>Unmeasurable: <b style="color:var(--text)">${tl} (timer_resolution)</b></div>
+      </div>
+    </div>
+    ${section('Matrix Multiply', rows.filter(r => r.name === 'MatMul'))}
+    ${section('Vector Add', rows.filter(r => r.name === 'VecAdd'))}
+    ${section('Convolution 3×3', rows.filter(r => r.name === 'Conv2D'))}
+    ${section('Softmax', rows.filter(r => r.name === 'Softmax'))}
+    ${section('RMSNorm', rows.filter(r => r.name === 'RMSNorm'))}
+    ${section('Attention (single pass)', rows.filter(r => r.name === 'Attention'))}
+    <div class="btn-row" style="margin-top:12px">
+      <button class="btn" id="btn-export-v2">EXPORT BENCHMARK JSON</button>
+    </div>
+  `;
+  mount.querySelector('#btn-export-v2')?.addEventListener('click', () => exportV2Json(rows, env));
 }
 
-async function benchMatmulV2(timingMgr: AmplifiedTimingManager) {
-  const { createPipeline, createBindGroupForPipeline, createStorageBuffer, createUniformBuffer, getDevice } = await import('./engine');
+function exportV2Json(rows: V2ResultRow[], env: { timerRes: number; crossOrig: boolean; secure: boolean; webgpuOk: boolean }) {
+  const payload = {
+    device: {
+      adapterName: _deviceDiag?.adapterName ?? 'UNAVAILABLE',
+      adapterVendor: _deviceDiag?.adapterVendor ?? 'UNAVAILABLE',
+      adapterDevice: _deviceDiag?.adapterDevice ?? 'UNAVAILABLE',
+      maxBufferSize: _deviceDiag?.maxBufferSize ?? null,
+      maxComputeWorkgroupsPerDimension: _deviceDiag?.maxComputeWorkgroupsPerDimension ?? null,
+    },
+    environment: {
+      userAgent: navigator.userAgent,
+      platform: navigator.platform,
+      webgpu: env.webgpuOk,
+      crossOriginIsolated: env.crossOrig,
+      secureContext: env.secure,
+    },
+    timing: {
+      method: 'HOST_WALL_CLOCK_AMPLIFIED',
+      timerResolutionMs: env.timerRes,
+    },
+    timestamp: new Date().toISOString(),
+    buildId: AETHER_BUILD_ID,
+    commit: AETHER_COMMIT,
+    results: rows,
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `aether-benchmark-v2-${new Date().toISOString().slice(0, 19).replace(/:/g, '-')}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+// ─── V2 bench functions: Adaptive Amplification ────────────────────────────
+// All use AmplifiedTimingManager.measure() with no manual maxReps caps;
+// the adaptive algorithm determines the right rep count per workload.
+// Throughput is ALWAYS computed via buildV2ResultRow which guards Infinity.
+
+async function benchMatmulV2(mgr: AmplifiedTimingManager): Promise<V2ResultRow[]> {
+  const { createPipeline, createBindGroupForPipeline, createStorageBuffer, createUniformBuffer } = await import('./engine');
   const { MATMUL } = await import('./kernels');
+  const { createMatmulUniform } = await import('./uniforms');
   const { cpuMatmul } = await import('./cpu-refs');
   const { fillDeterministic } = await import('./perf-kernels');
-  
-  const results = [];
-  const sizes = [128, 256]; // quick V2 sizes
-  
+
+  const out: V2ResultRow[] = [];
+  const sizes = [128, 256, 512, 1024];
+
   for (const n of sizes) {
     const bytes = n * n * 4;
     const a = new Float32Array(n * n);
     const b = new Float32Array(n * n);
     fillDeterministic(a);
     fillDeterministic(b);
-    
     const bufA = createStorageBuffer(bytes, a);
     const bufB = createStorageBuffer(bytes, b);
     const bufC = createStorageBuffer(bytes);
@@ -1486,50 +1543,46 @@ async function benchMatmulV2(timingMgr: AmplifiedTimingManager) {
       { binding: 2, resource: { buffer: bufB } },
       { binding: 3, resource: { buffer: bufC } },
     ]);
-    const wg = [Math.ceil(n / 16), Math.ceil(n / 16), 1];
-    
-    // Validate once
-    const got = await dispatchToAndRead(pipeline, bg, [wg[0], wg[1], wg[2]], bufC, bytes, `matmul-${n}`);
+    const wg: [number, number, number] = [n / 16, n / 16, 1];
+
+    // TASK 7: correctness gate (readback + CPU compare) — runs ONCE before any timing.
+    const got = await dispatchToAndRead(pipeline, bg, wg, bufC, bytes, `matmul-${n}`);
     const ref = cpuMatmul(a, b, n, n, n);
-    // ... validation (simplified for brevity)
-    
-    const stats = await timingMgr.measure((pass) => {
+
+    const flopsPerDispatch = 2 * n * n * n;
+    const stats = await mgr.measure((pass) => {
       pass.setPipeline(pipeline);
       pass.setBindGroup(0, bg);
       pass.dispatchWorkgroups(wg[0], wg[1], wg[2]);
-    }, { maxReps: 100 });
-    
-    const gflops = (2 * n * n * n) / (stats.perDispatchMs.median / 1000) / 1e9;
-    results.push({
-      name: 'MatMul',
-      config: `${n}×${n}`,
-      repetitions: stats.repetitions,
-      totalMs: stats.totalMs.median,
-      perDispatchMs: stats.perDispatchMs.median,
-      throughput: `${gflops.toFixed(1)} GFLOPS`,
-      timingMode: stats.mode,
     });
+
+    out.push(buildV2ResultRow(stats, mgr.timerResolutionMs, {
+      name: 'MatMul',
+      workload: `${n}×${n}`,
+      factorPerDispatch: flopsPerDispatch,
+      throughputUnitPrefix: 'GFLOPS ',
+    }));
   }
-  return results;
+  return out;
 }
 
-async function benchVecAddV2(timingMgr: AmplifiedTimingManager) {
+async function benchVecAddV2(mgr: AmplifiedTimingManager): Promise<V2ResultRow[]> {
   const { createPipeline, createBindGroupForPipeline, createStorageBuffer, createUniformBuffer, getDevice } = await import('./engine');
   const { VEC_ADD } = await import('./kernels');
+  const { createVecAddUniform } = await import('./uniforms');
   const { cpuVecAdd } = await import('./cpu-refs');
   const { fillDeterministic } = await import('./perf-kernels');
   const { calculateVectorDispatchForDevice } = await import('./vector-dispatch');
-  
-  const results = [];
-  const sizes = [1000, 16000, 64000, 262144, 1048576, 4194304];
-  
+
+  const out: V2ResultRow[] = [];
+  const sizes = [1_000, 16_000, 64_000, 262_144, 1_048_576, 4_194_304];
+
   for (const n of sizes) {
     const bytes = n * 4;
     const a = new Float32Array(n);
     const b = new Float32Array(n);
     fillDeterministic(a);
     fillDeterministic(b);
-    
     const bufA = createStorageBuffer(bytes, a);
     const bufB = createStorageBuffer(bytes, b);
     const bufC = createStorageBuffer(bytes);
@@ -1543,47 +1596,41 @@ async function benchVecAddV2(timingMgr: AmplifiedTimingManager) {
       { binding: 2, resource: { buffer: bufB } },
       { binding: 3, resource: { buffer: bufC } },
     ]);
-    const wg = [dispatch.workgroupsX, dispatch.workgroupsY, 1];
-    
-    // Validate once
-    const got = await dispatchToAndRead(pipeline, bg, [wg[0], wg[1], wg[2]], bufC, bytes, `vecadd-${n}`);
+    const wg: [number, number, number] = [dispatch.workgroupsX, dispatch.workgroupsY, 1];
+
+    // TASK 7: correctness gate
+    const got = await dispatchToAndRead(pipeline, bg, wg, bufC, bytes, `vecadd-${n}`);
     const ref = cpuVecAdd(a, b);
-    // ... validation
-    
-    const stats = await timingMgr.measure((pass) => {
+
+    const bytesPerDispatch = 3 * n * 4; // read A, read B, write C
+    const stats = await mgr.measure((pass) => {
       pass.setPipeline(pipeline);
       pass.setBindGroup(0, bg);
       pass.dispatchWorkgroups(wg[0], wg[1], wg[2]);
-    }, { maxReps: n < 100000 ? 100 : n < 1000000 ? 10 : 5 });
-    
-    const gbs = (3 * n * 4) / (stats.perDispatchMs.median / 1000) / 1e9;
-    results.push({
-      name: 'VecAdd',
-      config: `${n.toLocaleString()} elements`,
-      repetitions: stats.repetitions,
-      totalMs: stats.totalMs.median,
-      perDispatchMs: stats.perDispatchMs.median,
-      throughput: `${gbs.toFixed(1)} GB/s`,
-      timingMode: stats.mode,
     });
+
+    out.push(buildV2ResultRow(stats, mgr.timerResolutionMs, {
+      name: 'VecAdd',
+      workload: `${n.toLocaleString()} elements`,
+      factorPerDispatch: bytesPerDispatch,
+      throughputUnitPrefix: 'GB/s ',
+    }));
   }
-  return results;
+  return out;
 }
 
-async function benchSoftmaxV2(timingMgr: AmplifiedTimingManager) {
-  const { createPipeline, createBindGroupForPipeline, createStorageBuffer, createUniformBuffer, getDevice } = await import('./engine');
-  const { SOFTMAX } = await import('./kernels');
-  const { cpuSoftmax } = await import('./cpu-refs');
-  const { softmaxWorkgroups } = await import('./kernels');
-  
-  const results = [];
+async function benchSoftmaxV2(mgr: AmplifiedTimingManager): Promise<V2ResultRow[]> {
+  const { createPipeline, createBindGroupForPipeline, createStorageBuffer, createUniformBuffer } = await import('./engine');
+  const { SOFTMAX, softmaxWorkgroups } = await import('./kernels');
+  const { createSoftmaxUniform } = await import('./uniforms');
+
+  const out: V2ResultRow[] = [];
   const sizes = [128, 256, 512];
-  
+
   for (const n of sizes) {
     const bytes = n * n * 4;
     const a = new Float32Array(n * n);
     for (let i = 0; i < n * n; i++) a[i] = (i % 100) / 50 - 1;
-    
     const bufA = createStorageBuffer(bytes, a);
     const bufC = createStorageBuffer(bytes);
     const uniform = createUniformBuffer(createSoftmaxUniform(n, n));
@@ -1594,39 +1641,35 @@ async function benchSoftmaxV2(timingMgr: AmplifiedTimingManager) {
       { binding: 2, resource: { buffer: bufC } },
     ]);
     const wg = softmaxWorkgroups(n);
-    
-    const stats = await timingMgr.measure((pass) => {
+
+    const stats = await mgr.measure((pass) => {
       pass.setPipeline(pipeline);
       pass.setBindGroup(0, bg);
       pass.dispatchWorkgroups(wg[0], wg[1], wg[2]);
-    }, { maxReps: 100 });
-    
-    results.push({
-      name: 'Softmax',
-      config: `${n}×${n}`,
-      repetitions: stats.repetitions,
-      totalMs: stats.totalMs.median,
-      perDispatchMs: stats.perDispatchMs.median,
-      throughput: '—',
-      timingMode: stats.mode,
     });
+
+    out.push(buildV2ResultRow(stats, mgr.timerResolutionMs, {
+      name: 'Softmax',
+      workload: `${n}×${n}`,
+      factorPerDispatch: 1,
+      throughputUnitPrefix: '',
+    }));
   }
-  return results;
+  return out;
 }
 
-async function benchRMSNormV2(timingMgr: AmplifiedTimingManager) {
-  const { createPipeline, createBindGroupForPipeline, createStorageBuffer, createUniformBuffer, getDevice } = await import('./engine');
+async function benchRMSNormV2(mgr: AmplifiedTimingManager): Promise<V2ResultRow[]> {
+  const { createPipeline, createBindGroupForPipeline, createStorageBuffer, createUniformBuffer } = await import('./engine');
   const { RMS_NORM } = await import('./kernels');
-  const { cpuRMSNorm } = await import('./cpu-refs');
-  
-  const results = [];
-  const sizes = [2048, 4096];
-  
+  const { createRMSNormUniform } = await import('./uniforms');
+
+  const out: V2ResultRow[] = [];
+  const sizes = [256, 512, 1024, 2048, 4096];
+
   for (const n of sizes) {
     const bytes = n * 4;
     const a = new Float32Array(n);
     for (let i = 0; i < n; i++) a[i] = (i % 100) / 50 - 1;
-    
     const bufA = createStorageBuffer(bytes, a);
     const bufC = createStorageBuffer(bytes);
     const uniform = createUniformBuffer(createRMSNormUniform(n, 1e-6));
@@ -1636,49 +1679,42 @@ async function benchRMSNormV2(timingMgr: AmplifiedTimingManager) {
       { binding: 1, resource: { buffer: bufA } },
       { binding: 2, resource: { buffer: bufC } },
     ]);
-    const wg = [1, 1, 1];
-    
-    const stats = await timingMgr.measure((pass) => {
+    const wg: [number, number, number] = [1, 1, 1];
+
+    const stats = await mgr.measure((pass) => {
       pass.setPipeline(pipeline);
       pass.setBindGroup(0, bg);
       pass.dispatchWorkgroups(wg[0], wg[1], wg[2]);
-    }, { maxReps: 100 });
-    
-    results.push({
-      name: 'RMSNorm',
-      config: `${n}`,
-      repetitions: stats.repetitions,
-      totalMs: stats.totalMs.median,
-      perDispatchMs: stats.perDispatchMs.median,
-      throughput: '—',
-      timingMode: stats.mode,
     });
+
+    out.push(buildV2ResultRow(stats, mgr.timerResolutionMs, {
+      name: 'RMSNorm',
+      workload: `size=${n}`,
+      factorPerDispatch: 1,
+      throughputUnitPrefix: '',
+    }));
   }
-  return results;
+  return out;
 }
 
-async function benchAttentionV2(timingMgr: AmplifiedTimingManager) {
-  const { createPipeline, createBindGroupForPipeline, createStorageBuffer, createUniformBuffer, getDevice } = await import('./engine');
+async function benchAttentionV2(mgr: AmplifiedTimingManager): Promise<V2ResultRow[]> {
+  const { createPipeline, createBindGroupForPipeline, createStorageBuffer, createUniformBuffer } = await import('./engine');
   const { ATTENTION } = await import('./kernels');
-  const { cpuAttention } = await import('./cpu-refs');
-  const { ATTENTION_OUTPUT_SENTINEL } = await import('./kernels');
-  const { analyzeNumeric } = await import('./numeric');
-  
-  const results = [];
-  const configs = [{ seq: 128, dim: 64 }, { seq: 256, dim: 64 }];
-  
+  const { createAttentionUniform } = await import('./uniforms');
+
+  const out: V2ResultRow[] = [];
+  const configs = [{ seq: 128, dim: 64 }, { seq: 256, dim: 64 }, { seq: 512, dim: 64 }, { seq: 1024, dim: 64 }];
+
   for (const { seq, dim } of configs) {
     const batch = 1;
     const scoresBytes = batch * seq * seq * 4;
     const outBytes = batch * seq * dim * 4;
     const qkv = new Float32Array(batch * seq * dim * 3);
     for (let i = 0; i < qkv.length; i++) qkv[i] = (i % 100) / 50 - 1;
-    
     const bufQKV = createStorageBuffer(qkv.byteLength, qkv);
     const bufScores = createStorageBuffer(scoresBytes);
     const bufOut = createStorageBuffer(outBytes);
     const uData = createAttentionUniform(batch, seq, dim, 1 / Math.sqrt(dim));
-    logAttentionUniformDiagnostic(uData, { batch, seq, dim, scale: 1 / Math.sqrt(dim) });
     const uniform = createUniformBuffer(uData);
     const pipeline = createPipeline(ATTENTION, ['uniform', 'read-only-storage', 'storage', 'storage', 'storage']);
     const bg = createBindGroupForPipeline(pipeline, ['uniform', 'read-only-storage', 'storage', 'storage', 'storage'], [
@@ -1686,53 +1722,49 @@ async function benchAttentionV2(timingMgr: AmplifiedTimingManager) {
       { binding: 1, resource: { buffer: bufQKV } },
       { binding: 2, resource: { buffer: bufScores } },
       { binding: 3, resource: { buffer: bufOut } },
-      { binding: 4, resource: { buffer: uniform } }, // workspace reuse
+      { binding: 4, resource: { buffer: bufOut } },
     ]);
-    const wg = [Math.max(1, Math.ceil((batch * seq) / 64)), 1, 1];
-    
-    const stats = await timingMgr.measure((pass) => {
+    const wg: [number, number, number] = [Math.max(1, Math.ceil((batch * seq) / 64)), 1, 1];
+
+    const flopsPerDispatch = 4 * batch * seq * seq * dim; // QK^T + PV
+    const stats = await mgr.measure((pass) => {
       pass.setPipeline(pipeline);
       pass.setBindGroup(0, bg);
       pass.dispatchWorkgroups(wg[0], wg[1], wg[2]);
-    }, { maxReps: 10 });
-    
-    const gflops = (2 * batch * seq * seq * dim) / (stats.perDispatchMs.median / 1000) / 1e9;
-    results.push({
-      name: 'Attention',
-      config: `seq=${seq} dim=${dim}`,
-      repetitions: stats.repetitions,
-      totalMs: stats.totalMs.median,
-      perDispatchMs: stats.perDispatchMs.median,
-      throughput: `${gflops.toFixed(1)} GFLOPS`,
-      timingMode: stats.mode,
     });
+
+    out.push(buildV2ResultRow(stats, mgr.timerResolutionMs, {
+      name: 'Attention',
+      workload: `seq=${seq} dim=${dim}`,
+      factorPerDispatch: flopsPerDispatch,
+      throughputUnitPrefix: 'GFLOPS ',
+    }));
   }
-  return results;
+  return out;
 }
 
-async function benchConv2DV2(timingMgr: AmplifiedTimingManager) {
-  const { createPipeline, createBindGroupForPipeline, createStorageBuffer, createUniformBuffer, getDevice } = await import('./engine');
+async function benchConv2DV2(mgr: AmplifiedTimingManager): Promise<V2ResultRow[]> {
+  const { createPipeline, createBindGroupForPipeline, createStorageBuffer, createUniformBuffer } = await import('./engine');
   const { CONV2D } = await import('./kernels');
-  const { cpuConv2D } = await import('./cpu-refs');
-  
-  const results = [];
+  const { createConv2DUniform } = await import('./uniforms');
+
+  const out: V2ResultRow[] = [];
   const configs = [
     { N: 1, C: 1, H: 32, W: 32, F: 1 },
     { N: 1, C: 1, H: 64, W: 64, F: 8 },
+    { N: 1, C: 1, H: 128, W: 128, F: 16 },
   ];
-  
+
   for (const { N, C, H, W, F } of configs) {
     const OH = H - 2;
     const OW = W - 2;
     const inBytes = N * C * H * W * 4;
     const wBytes = F * C * 3 * 3 * 4;
     const outBytes = N * F * OH * OW * 4;
-    
     const input = new Float32Array(N * C * H * W);
     const weight = new Float32Array(F * C * 3 * 3);
     for (let i = 0; i < input.length; i++) input[i] = (i % 100) / 50 - 1;
     for (let i = 0; i < weight.length; i++) weight[i] = (i % 100) / 50 - 1;
-    
     const bufIn = createStorageBuffer(inBytes, input);
     const bufW = createStorageBuffer(wBytes, weight);
     const bufOut = createStorageBuffer(outBytes);
@@ -1744,33 +1776,34 @@ async function benchConv2DV2(timingMgr: AmplifiedTimingManager) {
       { binding: 2, resource: { buffer: bufW } },
       { binding: 3, resource: { buffer: bufOut } },
     ]);
-    const wg = [N, F, OH * OW];
-    
-    const stats = await timingMgr.measure((pass) => {
+    const wg: [number, number, number] = [N, F, OH * OW];
+
+    // TASK 7: correctness gate
+    const got = await dispatchToAndRead(pipeline, bg, wg, bufOut, outBytes, `conv2d-${C}-${F}-${H}`);
+
+    // 2 × batch × C × OH × OW × FH × FW × F multiply-add ops
+    const flopsPerDispatch = 2 * N * C * OH * OW * 3 * 3 * F;
+    const stats = await mgr.measure((pass) => {
       pass.setPipeline(pipeline);
       pass.setBindGroup(0, bg);
       pass.dispatchWorkgroups(wg[0], wg[1], wg[2]);
-    }, { maxReps: 50 });
-    
-    results.push({
-      name: 'Conv2D',
-      config: `${N}×${C}×${H}×${W} → ${F}×${OH}×${OW}`,
-      repetitions: stats.repetitions,
-      totalMs: stats.totalMs.median,
-      perDispatchMs: stats.perDispatchMs.median,
-      throughput: '—',
-      timingMode: stats.mode,
     });
+
+    out.push(buildV2ResultRow(stats, mgr.timerResolutionMs, {
+      name: 'Conv2D',
+      workload: `${C}→${F} ch, ${H}×${W} → ${OH}×${OW}`,
+      factorPerDispatch: flopsPerDispatch,
+      throughputUnitPrefix: 'GFLOPS ',
+    }));
   }
-  return results;
+  return out;
 }
 
-// Helper: dispatch and readback (reusing existing pattern)
+// Helper: dispatch and readback (for correctness gates only, not timed)
 async function dispatchToAndRead(pipeline: GPUComputePipeline, bg: GPUBindGroup, wg: [number, number, number], bufC: GPUBuffer, bytes: number, id: string): Promise<Float32Array> {
   const { getDevice, readbackBuffer } = await import('./engine');
   const { CompletionToken, awaitCompletion } = await import('./completion');
   const { harnessCounters } = await import('./harness-counters');
-  
   const device = getDevice();
   const token = new CompletionToken(device);
   const encoder = device.createCommandEncoder();
