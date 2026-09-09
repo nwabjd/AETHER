@@ -11,7 +11,7 @@ import { getDevice, readbackBuffer } from './engine';
 import { cpuMatmul } from './cpu-refs';
 import {
   type V3Result, type AETHERReadiness, type FeasibilityReport,
-  classifyConfidence, safeThroughput, median, percentile,
+  buildV3Result, classifyConfidence, median, percentile,
   computeReadiness, classifyFeasibility, getTimerResolution,
 } from './results-v3.ts';
 import {
@@ -21,7 +21,7 @@ import {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────
 
-function dev(): GPUDevice {
+export function dev(): GPUDevice {
   return getDevice();
 }
 
@@ -32,15 +32,15 @@ function createBuf(usage: GPUBufferUsageFlags, bytes: number, data?: ArrayBuffer
   return buf;
 }
 
-function storageBuf(bytes: number, data?: ArrayBufferView) {
+export function storageBuf(bytes: number, data?: ArrayBufferView) {
   return createBuf(GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST, bytes, data);
 }
 
-function uniformBuf(data: ArrayBuffer) {
+export function uniformBuf(data: ArrayBuffer) {
   return createBuf(GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, Math.max(data.byteLength, 16), new Uint8Array(data));
 }
 
-function makePipeline(code: string, bindings: GPUBufferBindingLayout['type'][]) {
+export function makePipeline(code: string, bindings: GPUBufferBindingLayout['type'][]) {
   const mod = dev().createShaderModule({ code });
   return dev().createComputePipeline({
     layout: 'auto',
@@ -48,7 +48,7 @@ function makePipeline(code: string, bindings: GPUBufferBindingLayout['type'][]) 
   });
 }
 
-function makeBg(pipeline: GPUComputePipeline, bindings: GPUBufferBindingLayout['type'][], bufs: GPUBuffer[]) {
+export function makeBg(pipeline: GPUComputePipeline, bindings: GPUBufferBindingLayout['type'][], bufs: GPUBuffer[]) {
   const layout = pipeline.getBindGroupLayout(0);
   return dev().createBindGroup({
     layout,
@@ -56,7 +56,7 @@ function makeBg(pipeline: GPUComputePipeline, bindings: GPUBufferBindingLayout['
   });
 }
 
-function fillRandom(data: Float32Array) {
+export function fillRandom(data: Float32Array) {
   let s = 0x9e3779b9;
   for (let i = 0; i < data.length; i++) {
     s = (s * 1664525 + 1013904223) >>> 0;
@@ -84,9 +84,9 @@ async function measureBlock(fn: (pass: GPUComputePassEncoder) => void, reps: num
   return Number.isFinite(elapsed) && elapsed >= 0 ? elapsed : 0;
 }
 
-async function adaptiveMeasure(fn: (pass: GPUComputePassEncoder) => void, maxReps = 1_000_000): Promise<{
+export async function adaptiveMeasure(fn: (pass: GPUComputePassEncoder) => void, maxReps = 1_000_000): Promise<{
   reps: number; totalMs: number; medianMs: number; meanMs: number;
-  p95: number; p99: number; confidence: ReturnType<typeof classifyConfidence>;
+  p95: number | null; p99: number | null; confidence: ReturnType<typeof classifyConfidence>;
   samples: number[];
 }> {
   const timerRes = getTimerResolution();
@@ -112,41 +112,59 @@ async function adaptiveMeasure(fn: (pass: GPUComputePassEncoder) => void, maxRep
   // Warmup 3
   for (let i = 0; i < 3; i++) await measureBlock(fn, reps);
 
-  // 7 measurements
+  // V3.1.3: at least 20 independent block samples are required before
+  // median/p95/p99 are statistically valid (Phase 3B). Never label a single
+  // amplified block as median/p95/p99.
   const samples: number[] = [];
-  for (let i = 0; i < 7; i++) samples.push(await measureBlock(fn, reps));
+  for (let i = 0; i < 20; i++) samples.push(await measureBlock(fn, reps));
 
   const finites = samples.filter(t => t > 0 && Number.isFinite(t));
   const sorted = [...finites].sort((a, b) => a - b);
   const med = median(sorted);
   const mean = finites.length > 0 ? finites.reduce((a, c) => a + c, 0) / finites.length : 0;
-  const p95 = percentile(sorted, 0.95);
-  const p99 = percentile(sorted, 0.99);
+  // p95/p99 are percentiles of the INDEPENDENT BLOCK distribution only.
+  // With fewer than 20 block samples the percentile is not statistically
+  // meaningful — report null (never fabricate).
+  const p95 = finites.length >= 20 ? percentile(sorted, 0.95) : null;
+  const p99 = finites.length >= 20 ? percentile(sorted, 0.99) : null;
   const conf = classifyConfidence(med);
 
   return { reps, totalMs: med, medianMs: med, meanMs: mean, p95, p99, confidence: conf, samples: finites };
 }
 
-function makeResult(
-  category: string, operation: string, workload: string, shape: string,
-  m: Awaited<ReturnType<typeof adaptiveMeasure>>, perOpMs: number,
-  correctnessPassed: boolean, throughput: number | null, throughputUnit: string, notes: string
-): V3Result {
-  return {
-    category, operation, workload, shape,
-    repetitions: m.reps, totalMs: m.totalMs, estimatedPerOperationMs: perOpMs,
-    medianMs: m.medianMs, p95Ms: m.p95, p99Ms: m.p99,
-    timingMethod: 'HOST_WALL_CLOCK_AMPLIFIED',
-    confidence: m.confidence,
-    correctnessPassed,
-    throughput, throughputUnit, notes,
-measurable: m.confidence !== 'UNMEASURABLE',
-  };
+export interface MakeResultOpts {
+  category: string; operation: string; workload: string; shape: string;
+  m: Awaited<ReturnType<typeof adaptiveMeasure>>;
+  correctnessPassed: boolean;
+  notes?: string;
+  flopsPerExecution?: number;
+  bytesPerExecution?: number;
+  opsPerExecution?: number;
+  throughputUnit?: 'GFLOPS' | 'GB/s' | 'M/s' | 'k/s' | '/s';
+}
+
+/**
+ * Delegates to the shared buildV3Result (results-v3.ts) so the
+ * normalization contract has a single, unit-testable source of truth.
+ */
+export function makeResult(o: MakeResultOpts): V3Result {
+  return buildV3Result({
+    category: o.category, operation: o.operation, workload: o.workload, shape: o.shape,
+    reps: o.m.reps, totalMs: o.m.totalMs, medianMs: o.m.medianMs,
+    p95: o.m.p95, p99: o.m.p99, samples: o.m.samples.length,
+    confidence: o.m.confidence,
+    correctnessPassed: o.correctnessPassed,
+    notes: o.notes,
+    flopsPerExecution: o.flopsPerExecution,
+    bytesPerExecution: o.bytesPerExecution,
+    opsPerExecution: o.opsPerExecution,
+    throughputUnit: o.throughputUnit,
+  });
 }
 
 // ─── TASK 19: one-shot correctness check (outside timing path) ───────────
 
-async function verifyOneShot(
+export async function verifyOneShot(
   pipeline: GPUComputePipeline, bg: GPUBindGroup,
   wgX: number, wgY: number, wgZ: number,
   outBuf: GPUBuffer, outBytes: number
@@ -167,7 +185,7 @@ async function verifyOneShot(
   return data;
 }
 
-function verifyTolerance(got: Float32Array, ref: Float32Array, absTol = 2e-2, relTol = 2e-2): boolean {
+export function verifyTolerance(got: Float32Array, ref: Float32Array, absTol = 2e-2, relTol = 2e-2): boolean {
   if (got.length !== ref.length) return false;
   let ok = true;
   for (let i = 0; i < got.length; i++) {
@@ -227,8 +245,6 @@ const m = await adaptiveMeasure(pass => {
       pass.setPipeline(pipeline); pass.setBindGroup(0, bg);
       pass.dispatchWorkgroups(wgX, wgY, 1);
     });
-    const perOpMs = m.totalMs;
-    const { value: gflops } = safeThroughput(2 * M * N * K, perOpMs, 'GFLOPS');
     // TASK 19: correctness gate — run once outside the timing measurement.
     let correctnessPassed = false;
     try {
@@ -238,7 +254,15 @@ const m = await adaptiveMeasure(pass => {
     } catch {
       correctnessPassed = false;
     }
-    out.push(makeResult('TRANSFORMER', 'MatMul', `${t}×${h} × ${h}×${h}`, `[${t},${h}]×[${h},${h}]`, m, perOpMs, correctnessPassed, gflops, 'GFLOPS', correctnessPassed ? '' : 'correctness FAILED'));
+    out.push(makeResult({
+      category: 'TRANSFORMER', operation: 'MatMul',
+      workload: `${t}×${h} × ${h}×${h}`, shape: `[${t},${h}]×[${h},${h}]`,
+      m, correctnessPassed,
+      flopsPerExecution: 2 * M * N * K,
+      bytesPerExecution: (M * K + K * N + M * N) * 4,
+      throughputUnit: 'GFLOPS',
+      notes: correctnessPassed ? '' : 'correctness FAILED',
+    }));
     bufA.destroy(); bufB.destroy(); bufC.destroy(); uBuf.destroy();
   }
   return out;
@@ -322,14 +346,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       const bg = makeBg(pipeline, ['uniform', 'read-only-storage', 'storage', 'storage'], [uBuf, bufQKV, bufScores, bufOut]);
       const wgTotal = Math.max(1, Math.ceil((batch * seq) / 64));
 
-      const m = await adaptiveMeasure(pass => {
+const m = await adaptiveMeasure(pass => {
         pass.setPipeline(pipeline); pass.setBindGroup(0, bg);
         pass.dispatchWorkgroups(wgTotal, 1, 1);
       });
-      const perOpMs = m.totalMs;
-      const flopsPerOp = 4 * batch * seq * seq * dim; // QK^T + PV
-      const { value: gflops } = safeThroughput(flopsPerOp, perOpMs, 'GFLOPS');
-      out.push(makeResult('ATTENTION', 'Fused Attention', `hidden=${hidden} seq=${seq}`, `[1,${seq},${dim}]`, m, perOpMs, true, gflops, 'GFLOPS', 'QK^T+softmax+PV fused'));
+      out.push(makeResult({
+        category: 'ATTENTION', operation: 'Fused Attention',
+        workload: `hidden=${hidden} seq=${seq}`, shape: `[1,${seq},${dim}]`,
+        m, correctnessPassed: true,
+        flopsPerExecution: 4 * batch * seq * seq * dim, // QK^T + PV
+        bytesPerExecution: (batch * seq * dim * 3 + seq * seq + seq * dim) * 4,
+        throughputUnit: 'GFLOPS',
+        notes: 'QK^T+softmax+PV fused',
+      }));
       bufQKV.destroy(); bufScores.destroy(); bufOut.destroy(); uBuf.destroy();
     }
   }
@@ -395,12 +424,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // Step 3: H × W2
         pass.setPipeline(matmulPipeline); pass.setBindGroup(0, bg2);
         pass.dispatchWorkgroups(Math.ceil(seq / 16), Math.ceil(hidden / 16), 1);
-      });
-      const perOpMs = m.totalMs;
+});
       // FLOPs: 2*seq*hidden*intermediate (W1) + seq*intermediate (GELU approx) + 2*seq*intermediate*hidden (W2)
-      const flopsPerOp = 2 * seq * hidden * intermediate + seq * intermediate + 2 * seq * intermediate * hidden;
-      const { value: gflops } = safeThroughput(flopsPerOp, perOpMs, 'GFLOPS');
-      out.push(makeResult('MLP', 'Transformer MLP', `h=${hidden} int=${intermediate} seq=${seq}`, `[${seq},${hidden}]`, m, perOpMs, true, gflops, 'GFLOPS', 'W1→GELU→W2'));
+      out.push(makeResult({
+        category: 'MLP', operation: 'Transformer MLP',
+        workload: `h=${hidden} int=${intermediate} seq=${seq}`, shape: `[${seq},${hidden}]`,
+        m, correctnessPassed: true,
+        flopsPerExecution: 2 * seq * hidden * intermediate + seq * intermediate + 2 * seq * intermediate * hidden,
+        bytesPerExecution: (seq * hidden + hidden * intermediate + seq * intermediate + intermediate * hidden + seq * hidden) * 4,
+        throughputUnit: 'GFLOPS',
+        notes: 'W1→GELU→W2',
+      }));
       bufX.destroy(); bufW1.destroy(); bufH.destroy(); bufGelu.destroy(); bufW2.destroy();
       u1Buf.destroy(); u2Buf.destroy();
     }
@@ -450,12 +484,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       const uBuf = uniformBuf(uData);
       const bg = makeBg(pipeline, ['uniform', 'read-only-storage', 'read-only-storage', 'storage'], [uBuf, bufIn, bufW, bufOut]);
 
-      const m = await adaptiveMeasure(pass => {
+const m = await adaptiveMeasure(pass => {
         pass.setPipeline(pipeline); pass.setBindGroup(0, bg);
         pass.dispatchWorkgroups(seq, 1, 1);
       });
-      const perOpMs = m.totalMs;
-      out.push(makeResult('TRANSFORMER', 'RMSNorm', `hidden=${hidden} seq=${seq}`, `[${seq},${hidden}]`, m, perOpMs, true, null, '', ''));
+      out.push(makeResult({
+        category: 'TRANSFORMER', operation: 'RMSNorm',
+        workload: `hidden=${hidden} seq=${seq}`, shape: `[${seq},${hidden}]`,
+        m, correctnessPassed: true,
+        flopsPerExecution: 3 * seq * hidden, // square + normalize + scale
+        bytesPerExecution: (seq * hidden + hidden + seq * hidden) * 4,
+        throughputUnit: 'GFLOPS',
+        notes: '',
+      }));
       bufIn.destroy(); bufW.destroy(); bufOut.destroy(); uBuf.destroy();
     }
   }
@@ -481,14 +522,20 @@ export async function benchV3Embedding(onProgress?: (msg: string) => void): Prom
     const uBuf = uniformBuf(createEmbeddingUniform(vocabSize, hidden, numTokens));
     const bg = makeBg(pipeline, ['uniform', 'read-only-storage', 'read-only-storage', 'storage'], [uBuf, bufIdx, bufVocab, bufOut]);
 
-    const m = await adaptiveMeasure(pass => {
+const m = await adaptiveMeasure(pass => {
       pass.setPipeline(pipeline); pass.setBindGroup(0, bg);
       pass.dispatchWorkgroups(Math.ceil((numTokens * hidden) / 256), 1, 1);
     });
-    const perOpMs = m.totalMs;
-    const bytesPerOp = numTokens * hidden * 4 + numTokens * 4; // read vocab + indices, write output
-    const { value: gbps } = safeThroughput(bytesPerOp, perOpMs, 'GB/s');
-    out.push(makeResult('TRANSFORMER', 'Embedding Lookup', `tokens=${numTokens} vocab=${vocabSize} hidden=${hidden}`, `[${numTokens}]→[${numTokens},${hidden}]`, m, perOpMs, true, gbps, 'GB/s', `${(bytesPerOp / 1048576).toFixed(1)} MiB touched`));
+    const bytesPerExecution = numTokens * hidden * 4 + numTokens * 4; // read vocab + indices, write output
+    out.push(makeResult({
+      category: 'TRANSFORMER', operation: 'Embedding Lookup',
+      workload: `tokens=${numTokens} vocab=${vocabSize} hidden=${hidden}`,
+      shape: `[${numTokens}]→[${numTokens},${hidden}]`,
+      m, correctnessPassed: true,
+      bytesPerExecution,
+      throughputUnit: 'GB/s',
+      notes: `${(bytesPerExecution / 1048576).toFixed(1)} MiB touched`,
+    }));
     bufIdx.destroy(); bufOut.destroy(); uBuf.destroy();
   }
   bufVocab.destroy();
@@ -498,7 +545,7 @@ export async function benchV3Embedding(onProgress?: (msg: string) => void): Prom
 // ─── CATEGORY: IMAGE OPS ────────────────────────────────────────────────
 
 async function benchV3ImageOp(
-  name: string, code: string, bindings: GPUBufferBindingLayout['type'][],
+name: string, code: string, bindings: GPUBufferBindingLayout['type'][],
   sizes: Array<{ hw: number; channels: number }>,
   factorPerOp: (hw: number, c: number) => number,
   unit: 'GFLOPS' | 'GB/s',
@@ -520,10 +567,15 @@ async function benchV3ImageOp(
       pass.setPipeline(pipeline); pass.setBindGroup(0, bg);
       pass.dispatchWorkgroups(Math.ceil(n / 256), 1, 1);
     });
-    const perOpMs = m.totalMs;
-    const fp = factorPerOp(hw, channels);
-    const { value: tp } = safeThroughput(fp, perOpMs, unit);
-    out.push(makeResult('IMAGE', name, `${hw}×${hw}×${channels}`, `[${hw},${hw},${channels}]`, m, perOpMs, true, tp, unit, ''));
+    out.push(makeResult({
+      category: 'IMAGE', operation: name,
+      workload: `${hw}×${hw}×${channels}`, shape: `[${hw},${hw},${channels}]`,
+      m, correctnessPassed: true,
+      flopsPerExecution: factorPerOp(hw, channels),
+      bytesPerExecution: n * (unit === 'GB/s' ? 4 : 12),
+      throughputUnit: unit,
+      notes: '',
+    }));
     bufA.destroy(); bufB.destroy(); bufC.destroy();
   }
   return out;
@@ -626,9 +678,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         pass.setPipeline(siluPipeline); pass.setBindGroup(0, bgs[stage * 2 + 1]);
         pass.dispatchWorkgroups(Math.ceil(count / 256), 1, 1);
       }
-    });
-    const perOpMs = m.totalMs;
-    out.push(makeResult('IMAGE', 'VAE Decoder', `${lc.hw}×${lc.hw}×${lc.channels}`, `[${lc.channels},${lc.hw},${lc.hw}]`, m, perOpMs, true, null, '', 'conv→SiLU→conv→SiLU→conv→SiLU'));
+});
+    out.push(makeResult({
+      category: 'IMAGE', operation: 'VAE Decoder',
+      workload: `${lc.hw}×${lc.hw}×${lc.channels}`, shape: `[${lc.channels},${lc.hw},${lc.hw}]`,
+      m, correctnessPassed: true,
+      bytesPerExecution: (lc.channels * lc.hw * lc.hw + 16 * 64 * 64 + 16 * 62 * 62) * 4,
+      throughputUnit: 'GB/s',
+      notes: 'conv→SiLU→conv→SiLU→conv→SiLU',
+    }));
     for (const r of results) r.destroy();
     for (const u of uBufs) u.destroy();
   }
@@ -661,9 +719,15 @@ export async function benchV3Video(onProgress?: (msg: string) => void): Promise<
     const m = await adaptiveMeasure(pass => {
       pass.setPipeline(p); pass.setBindGroup(0, bg2);
       pass.dispatchWorkgroups(Math.ceil(n / 256), 1, 1);
-    });
-    const perOpMs = m.totalMs;
-    out.push(makeResult('VIDEO', 'Temporal Mixing', `${frames}×${hw}×${hw}×${channels}`, `[${frames},${hw},${hw},${channels}]`, m, perOpMs, true, null, '', 'temporal conv kernel=3'));
+});
+    out.push(makeResult({
+      category: 'VIDEO', operation: 'Temporal Mixing',
+      workload: `${frames}×${hw}×${hw}×${channels}`, shape: `[${frames},${hw},${hw},${channels}]`,
+      m, correctnessPassed: true,
+      bytesPerExecution: (n + 3 * channels + n) * 4,
+      throughputUnit: 'GB/s',
+      notes: 'temporal conv kernel=3',
+    }));
     bufIn.destroy(); bufW.destroy(); bufOut.destroy(); uBuf.destroy();
   }
   return out;
@@ -857,4 +921,5 @@ export async function runV3Quick(onProgress?: (msg: string) => void): Promise<V3
   const feasibility = classifyFeasibility(readiness);
   return { matmul, attention, mlp, rmsnorm, embedding, imageOps, vae, video, memory, sustained, readiness, feasibility };
 }
+
 

@@ -77,6 +77,84 @@ export function cpuRMSNorm(input: Float32Array, weight: Float32Array, eps: numbe
   return out;
 }
 
+// ─── V3.1 CPU Reference: Quantized MatMul ───────────────────────────────
+
+export function cpuInt8Matmul(A: Float32Array, B_packed: Uint32Array, M: number, N: number, K: number): Float32Array {
+  const C = new Float32Array(M * N);
+  for (let m = 0; m < M; m++) {
+    for (let n = 0; n < N; n++) {
+      let sum = 0;
+      for (let k = 0; k < K; k++) {
+        const idx = k * N + n;
+        const packed_idx = idx >>> 2;
+        const byte_idx = idx & 3;
+        const shift = byte_idx * 8;
+        const raw = (B_packed[packed_idx] >>> shift) & 0xFF;
+        const val = raw >= 128 ? raw - 256 : raw; // two's complement sign extension
+        sum += A[m * K + k] * val;
+      }
+      C[m * N + n] = sum;
+    }
+  }
+  return C;
+}
+
+export function cpuInt4Matmul(A: Float32Array, B_packed: Uint32Array, M: number, N: number, K: number): Float32Array {
+  const C = new Float32Array(M * N);
+  for (let m = 0; m < M; m++) {
+    for (let n = 0; n < N; n++) {
+      let sum = 0;
+      for (let k = 0; k < K; k++) {
+        const idx = k * N + n;
+        const packed_idx = idx >>> 3;
+        const nibble_idx = idx & 7;
+        const shift = nibble_idx * 4;
+        const raw = (B_packed[packed_idx] >>> shift) & 0xF;
+        const val = raw >= 8 ? raw - 16 : raw; // two's complement sign extension (4-bit)
+        sum += A[m * K + k] * val;
+      }
+      C[m * N + n] = sum;
+    }
+  }
+  return C;
+}
+
+// ─── V3.1 CPU Reference: KV-Cache Decode Attention ─────────────────────
+
+export function cpuKVDecodeAttn(
+  Q: Float32Array, K: Float32Array, V: Float32Array,
+  heads: number, headDim: number, context: number
+): Float32Array {
+  const out = new Float32Array(heads * headDim);
+  const scale = 1 / Math.sqrt(headDim);
+  for (let h = 0; h < heads; h++) {
+    const scores = new Float32Array(context);
+    let maxScore = -1e30;
+    for (let t = 0; t < context; t++) {
+      let dot = 0;
+      for (let d = 0; d < headDim; d++) {
+        dot += Q[h * headDim + d] * K[t * heads * headDim + h * headDim + d];
+      }
+      scores[t] = dot * scale;
+      if (scores[t] > maxScore) maxScore = scores[t];
+    }
+    let sumExp = 0;
+    for (let t = 0; t < context; t++) {
+      scores[t] = Math.exp(scores[t] - maxScore);
+      sumExp += scores[t];
+    }
+    for (let t = 0; t < context; t++) scores[t] /= sumExp;
+    for (let d = 0; d < headDim; d++) {
+      let sum = 0;
+      for (let t = 0; t < context; t++) {
+        sum += scores[t] * V[t * heads * headDim + h * headDim + d];
+      }
+      out[h * headDim + d] = sum;
+    }
+  }
+  return out;
+}
+
 export function cpuAttention(
   Q: Float32Array, K: Float32Array, V: Float32Array,
   batch: number, seq: number, dim: number, scale: number

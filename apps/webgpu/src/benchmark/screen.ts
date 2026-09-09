@@ -1529,6 +1529,24 @@ function runPerfV3(mode: 'quick' | 'full') {
   });
 }
 
+// ─── V3.1: LLM Inference Gate ───────────────────────────────────────────
+
+function runPerfV31(mode: 'quick' | 'full') {
+  if (_running) {
+    log('A benchmark is already running — wait for it to finish.', 'warn');
+    return;
+  }
+  _running = true;
+  log(`═══ AETHER V3.1 LLM INFERENCE GATE — ${mode === 'quick' ? 'QUICK' : 'FULL'} ═══`, 'info');
+  import('./perf-v3-ui').then((mod) => {
+    mod.runLLMGateFromUI(mode, getDevice, (msg, kind) => log(msg, kind ?? 'info'));
+  }).catch((e) => {
+    log(`V3.1 load error: ${(e as Error).message}`, 'err');
+  }).finally(() => {
+    _running = false;
+  });
+}
+
 // ─── V2 bench functions: Adaptive Amplification ────────────────────────────
 // All use AmplifiedTimingManager.measure() with no manual maxReps caps;
 // the adaptive algorithm determines the right rep count per workload.
@@ -1870,6 +1888,8 @@ function renderPerfPanel(el: HTMLElement) {
   el.querySelector('#btn-perf-v2-full')?.addEventListener('click', () => runPerfV2('full'));
   el.querySelector('#btn-perf-v3')?.addEventListener('click', () => runPerfV3('quick'));
   el.querySelector('#btn-perf-v3-full')?.addEventListener('click', () => runPerfV3('full'));
+  el.querySelector('#btn-perf-v3-1')?.addEventListener('click', () => runPerfV31('quick'));
+  el.querySelector('#btn-perf-v3-1-full')?.addEventListener('click', () => runPerfV31('full'));
   el.querySelector('#btn-perf-quick')?.addEventListener('click', () => runPerf('quick'));
   el.querySelector('#btn-perf-full')?.addEventListener('click', () => runPerf('full'));
   el.querySelector('#btn-perf-sustained')?.addEventListener('click', () => runPerf('sustained'));
@@ -1944,6 +1964,18 @@ export function render(el: HTMLElement) {
         <button class="btn btn-outline" id="btn-perf-v3-full">FULL V3</button>
       </div>
       <div id="perf-v3-results" style="margin-top:12px"></div>
+    </div>
+
+    <div class="card" style="border-color:var(--border);margin-top:12px">
+      <div class="card-header">
+        <span class="card-title">AETHER V3.1 — LLM INFERENCE GATE</span>
+        <span class="badge badge-info" id="perf-v3-1-badge">HARDWARE GATE</span>
+      </div>
+      <div class="btn-row" style="margin-top:10px;flex-wrap:wrap">
+        <button class="btn" id="btn-perf-v3-1">QUICK V3.1</button>
+        <button class="btn btn-outline" id="btn-perf-v3-1-full">FULL V3.1</button>
+      </div>
+      <div id="perf-v3-llm-results" style="margin-top:12px"></div>
     </div>
 
     <div class="btn-row" style="margin-top:16px">
