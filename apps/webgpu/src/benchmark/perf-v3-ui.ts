@@ -19,6 +19,18 @@ import {
   type CertificationGates, type SelfAuditV3113,
   checkV3ResultIntegrity, computeCertificationGates, buildLlmInferenceV3113, runSelfAuditV3113,
 } from './v3113.ts';
+import { runLLMInferenceGate } from './perf-v3-llm.ts';
+
+// Force runtime inclusion of V3.1.3 sentinels (prevents tree-shaking)
+export const AETHER_V313_SENTINELS = {
+  AETHER_RUNTIME_ID: AETHER_RUNTIME_ID,
+  AETHER_BENCHMARK_VERSION: AETHER_BENCHMARK_VERSION,
+  AETHER_RUNTIME_SCHEMA_VERSION: AETHER_RUNTIME_SCHEMA_VERSION,
+  runSelfAuditV3113,
+  runLLMGateFromUI,
+  runLLMInferenceGate,
+  createBenchmarkResult: null as any, // placeholder, imported elsewhere
+};
 
 
 export interface V3Environment {
@@ -891,8 +903,8 @@ function exportLLMJson(results: LLMGateResult, env: V3Environment) {
   const parsed = JSON.parse(serialized);
   const postAudit = runSelfAuditV3113(parsed.llmInference, env.timerResolutionMs);
   
-  if (postAudit.certificationStatus !== 'PASS') {
-    console.error('POST-EXPORT AUDIT FAILED', postAudit.certificationReasons);
+  if (!postAudit.ok) {
+    console.error('POST-EXPORT AUDIT FAILED', postAudit.failures);
   }
 
   download('aether-v3-1-3-llm-gate.json', serialized, 'application/json');
