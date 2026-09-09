@@ -300,3 +300,72 @@ canvas {
   .screen { padding: 24px 32px; }
   nav { padding: 12px 24px; }
 }
+
+/* ── AETHER V3 Model-Shaped Benchmark dashboard ─────────────────────────── */
+
+.v3-dash { padding: 16px; border-radius: 10px; background: var(--surface); }
+
+.v3-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.v3-col {
+  background: var(--surface-hover);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--text-dim);
+}
+.v3-col b { color: var(--text); font-weight: 600; }
+
+.v3-head {
+  font-size: 11px;
+  letter-spacing: 1.2px;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+  font-family: var(--mono);
+}
+
+.v3-section { margin-top: 14px; }
+.v3-section-title {
+  font-family: var(--mono);
+  font-size: 12px;
+  letter-spacing: 1px;
+  color: var(--text-dim);
+  margin-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 4px;
+}
+
+.score-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 6px 0;
+  font-size: 12px;
+}
+.score-label { width: 160px; color: var(--text-dim); font-family: var(--mono); font-size: 11px; }
+.score-track { flex: 1; height: 8px; background: var(--surface-hover); border-radius: 4px; overflow: hidden; }
+.score-fill { height: 100%; background: linear-gradient(90deg, var(--accent-dim), var(--accent)); border-radius: 4px; }
+.score-val { width: 34px; text-align: right; color: var(--text); font-weight: 700; font-size: 13px; }
+
+.overall-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--blue);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--blue) 8%, var(--surface));
+  font-family: var(--mono);
+  font-weight: 700;
+  font-size: 14px;
+}
+
+.perf-table td small { font-size: 10px; }

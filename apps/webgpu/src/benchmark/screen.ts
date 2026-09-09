@@ -1510,6 +1510,25 @@ function exportV2Json(rows: V2ResultRow[], env: { timerRes: number; crossOrig: b
   URL.revokeObjectURL(url);
 }
 
+// ─── V3: Model-Shaped Benchmark ──────────────────────────────────────────
+
+function runPerfV3(mode: 'quick' | 'full') {
+  if (_running) {
+    log('A benchmark is already running — wait for it to finish.', 'warn');
+    return;
+  }
+  _running = true;
+  log(`═══ AETHER MODEL-SHAPED BENCHMARK V3 — ${mode === 'quick' ? 'QUICK' : 'FULL'} ═══`, 'info');
+  // Defer to the V3 UI runner; it lazy-loads the heavy V3 module.
+  import('./perf-v3-ui').then((mod) => {
+    mod.runV3FromUI(mode, getDevice, (msg, kind) => log(msg, kind ?? 'info'));
+  }).catch((e) => {
+    log(`V3 load error: ${(e as Error).message}`, 'err');
+  }).finally(() => {
+    _running = false;
+  });
+}
+
 // ─── V2 bench functions: Adaptive Amplification ────────────────────────────
 // All use AmplifiedTimingManager.measure() with no manual maxReps caps;
 // the adaptive algorithm determines the right rep count per workload.
@@ -1849,6 +1868,8 @@ function renderPerfPanel(el: HTMLElement) {
   `;
   el.querySelector('#btn-perf-v2-quick')?.addEventListener('click', () => runPerfV2('quick'));
   el.querySelector('#btn-perf-v2-full')?.addEventListener('click', () => runPerfV2('full'));
+  el.querySelector('#btn-perf-v3')?.addEventListener('click', () => runPerfV3('quick'));
+  el.querySelector('#btn-perf-v3-full')?.addEventListener('click', () => runPerfV3('full'));
   el.querySelector('#btn-perf-quick')?.addEventListener('click', () => runPerf('quick'));
   el.querySelector('#btn-perf-full')?.addEventListener('click', () => runPerf('full'));
   el.querySelector('#btn-perf-sustained')?.addEventListener('click', () => runPerf('sustained'));
@@ -1911,6 +1932,18 @@ export function render(el: HTMLElement) {
         <button class="btn btn-outline" id="btn-perf-v2-full">FULL V2 (AMPLIFIED)</button>
       </div>
       <div id="perf-v2-results" style="margin-top:12px"></div>
+    </div>
+
+    <div class="card" style="border-color:var(--border);margin-top:12px">
+      <div class="card-header">
+        <span class="card-title">AETHER MODEL-SHAPED BENCHMARK (V3)</span>
+        <span class="badge badge-info" id="perf-v3-badge">READY</span>
+      </div>
+      <div class="btn-row" style="margin-top:10px;flex-wrap:wrap">
+        <button class="btn" id="btn-perf-v3">QUICK V3</button>
+        <button class="btn btn-outline" id="btn-perf-v3-full">FULL V3</button>
+      </div>
+      <div id="perf-v3-results" style="margin-top:12px"></div>
     </div>
 
     <div class="btn-row" style="margin-top:16px">
