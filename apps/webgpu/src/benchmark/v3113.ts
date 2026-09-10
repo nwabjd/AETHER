@@ -20,6 +20,7 @@ import {
   type LLMGateResult,
   type Confidence,
 } from './results-v3.ts';
+import type { InterruptionInfo } from './crash-safety.ts';
 
 export type GateStatus = 'PASS' | 'FAIL';
 
@@ -213,7 +214,7 @@ export interface CertificationGates {
   llmSuiteComplete: GateStatus;
   memorySuiteComplete: GateStatus;
   overallCertified: boolean;
-  certificationStatus: 'CERTIFIED' | 'NOT_CERTIFIED';
+  certificationStatus: 'CERTIFIED' | 'NOT_CERTIFIED' | 'FAILED';
   reasons: string[];
 }
 
@@ -284,6 +285,30 @@ export function computeCertificationGates(
     overallCertified,
     certificationStatus: overallCertified ? 'CERTIFIED' : 'NOT_CERTIFIED',
     reasons,
+  };
+}
+
+/**
+ * Crash-safety: any interruption (page refresh, device lost, OOM, JS error …)
+ * makes certification FAIL closed — the baseline {@link CertificationGates}
+ * are invalidated regardless of how good the partial numbers looked.
+ */
+export function finalizeCertificationWithInterruption(
+  base: CertificationGates,
+  interruption: InterruptionInfo,
+): CertificationGates {
+  return {
+    timingIntegrity: 'FAIL',
+    throughputIntegrity: 'FAIL',
+    correctnessIntegrity: 'FAIL',
+    llmSuiteComplete: 'FAIL',
+    memorySuiteComplete: 'FAIL',
+    overallCertified: false,
+    certificationStatus: 'FAILED',
+    reasons: [
+      ...base.reasons,
+      `certification FAILED: benchmark interrupted (${interruption.kind}${interruption.error ? `: ${interruption.error}` : ''} at ${interruption.at})`,
+    ],
   };
 }
 

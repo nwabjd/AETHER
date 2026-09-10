@@ -1,4 +1,4 @@
-// AETHER GPU Benchmark V3.1 — LLM Inference Gate
+﻿// AETHER GPU Benchmark V3.1 â€” LLM Inference Gate
 //
 // Adds INT8/INT4 quantized matmul, KV-cache decode attention,
 // synthetic transformer block, token generation simulation,
@@ -26,8 +26,12 @@ import {
 import {
   cpuInt8Matmul, cpuInt4Matmul, cpuKVDecodeAttn, cpuMatmul,
 } from './cpu-refs.ts';
+import {
+  heartbeat, checkpointCategory, releaseTrackedBuffers, checkResourceFloor, trackBuffer,
+} from './crash-safety.ts';
+import type { ResumeContext } from './crash-safety.ts';
 
-// ─── WGSL Kernels ───────────────────────────────────────────────────────
+// â”€â”€â”€ WGSL Kernels â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 const INT8_MATMUL_WGSL = /* wgsl */ `
 struct Uniforms { M: u32, N: u32, K: u32 };
@@ -224,7 +228,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   }
 }`;
 
-// ─── Packing Helpers ────────────────────────────────────────────────────
+// â”€â”€â”€ Packing Helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 function packInt8(weights: Float32Array): Uint32Array {
   const n = weights.length;
@@ -250,16 +254,21 @@ function packInt4(weights: Float32Array): Uint32Array {
   return packed;
 }
 
-// ─── A) QUANTIZED MATMUL ────────────────────────────────────────────────
+// â”€â”€â”€ A) QUANTIZED MATMUL â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-export async function benchQuantizedMatmul(onProgress?: (msg: string) => void): Promise<V3Result[]> {
+export async function benchQuantizedMatmul(onProgress?: (msg: string) => void, subset: 'small' | 'full' = 'full'): Promise<V3Result[]> {
   const out: V3Result[] = [];
-  const hiddenSizes = [512, 768, 1024, 1536, 2048];
-  const shapes: Array<{ M: number; label: string }> = [
-    { M: 1, label: 'decode' },
-    { M: 128, label: 'prefill-128' },
-    { M: 256, label: 'prefill-256' },
-  ];
+  const hiddenSizes = subset === 'small' ? [512] : [512, 768, 1024, 1536, 2048];
+  const shapes: Array<{ M: number; label: string }> = subset === 'small'
+    ? [
+        { M: 1, label: 'decode' },
+        { M: 128, label: 'prefill-128' },
+      ]
+    : [
+        { M: 1, label: 'decode' },
+        { M: 128, label: 'prefill-128' },
+        { M: 256, label: 'prefill-256' },
+      ];
 
   for (const hidden of hiddenSizes) {
       for (const { M, label } of shapes) {
@@ -290,14 +299,14 @@ export async function benchQuantizedMatmul(onProgress?: (msg: string) => void): 
         out.push(createBenchmarkResult({
           category: 'LLM_INFERENCE', operation: 'FP32 MatMul (baseline)',
           workload: `${label} h=${hidden}`,
-          shape: `[${M},${hidden}] × [${hidden},${hidden}]`,
+          shape: `[${M},${hidden}] Ã— [${hidden},${hidden}]`,
           totalMs: m.totalMs, repetitions: m.reps, samples: m.samples.length,
           medianMs: m.medianMs, p95Ms: m.p95, p99Ms: m.p99,
           flopsPerExecution: 2 * M * K * N,
           bytesPerExecution: 0, opsPerExecution: 0,
           throughputUnit: 'GFLOPS',
           correctnessPassed,
-          notes: `FP32 baseline — NOT a quantized path`,
+          notes: `FP32 baseline â€” NOT a quantized path`,
         }));
         bufA.destroy(); bufB.destroy(); bufC.destroy(); uBuf.destroy();
       }
@@ -339,7 +348,7 @@ export async function benchQuantizedMatmul(onProgress?: (msg: string) => void): 
 
         out.push(createBenchmarkResult({
           category: 'LLM_INFERENCE', operation: opName,
-          workload: `${label} h=${hidden}`, shape: `[${M},${K}]×[${K},${N}]`,
+          workload: `${label} h=${hidden}`, shape: `[${M},${K}]Ã—[${K},${N}]`,
           totalMs: m.totalMs, repetitions: m.reps, samples: m.samples.length,
           medianMs: m.medianMs, p95Ms: m.p95, p99Ms: m.p99,
           flopsPerExecution: 2 * M * N * K,
@@ -356,13 +365,13 @@ export async function benchQuantizedMatmul(onProgress?: (msg: string) => void): 
   return out;
 }
 
-// ─── B) KV-CACHE DECODE ATTENTION ───────────────────────────────────────
+// â”€â”€â”€ B) KV-CACHE DECODE ATTENTION â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-export async function benchKVCacheDecodeAttention(onProgress?: (msg: string) => void): Promise<V3Result[]> {
+export async function benchKVCacheDecodeAttention(onProgress?: (msg: string) => void, subset: 'short' | 'mid' | 'full' = 'full'): Promise<V3Result[]> {
   const out: V3Result[] = [];
   const heads = 8, headDim = 64;
   const pipeline = makePipeline(KV_DECODE_ATTN_WGSL, ['uniform', 'read-only-storage', 'read-only-storage', 'read-only-storage', 'storage']);
-  const contexts = [128, 256, 512, 1024, 2048, 4096];
+  const contexts = subset === 'short' ? [128, 256] : subset === 'mid' ? [512, 1024] : [128, 256, 512, 1024, 2048, 4096];
   const checkCtx = new Set([128, 512, 1024]);
 
   for (const ctx of contexts) {
@@ -412,7 +421,7 @@ export async function benchKVCacheDecodeAttention(onProgress?: (msg: string) => 
   return out;
 }
 
-// ─── C) SYNTHETIC TRANSFORMER BLOCK ─────────────────────────────────────
+// â”€â”€â”€ C) SYNTHETIC TRANSFORMER BLOCK â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 const TRANSFORMER_CONFIGS: TransformerBlockConfig[] = [
   { name: '0.5B', hidden: 512, intermediate: 2048, layers: 12, heads: 8, kvHeads: 2, headDim: 64 },
@@ -437,11 +446,12 @@ function computeParamCount(cfg: TransformerBlockConfig): { fp16: number; int8: n
   return { fp16: total * 2, int8: total, int4: Math.ceil(total / 2) };
 }
 
-export async function benchSyntheticTransformerBlock(onProgress?: (msg: string) => void): Promise<TransformerBlockResult[]> {
+export async function benchSyntheticTransformerBlock(onProgress?: (msg: string) => void, subset: 'small' | 'full' = 'full'): Promise<TransformerBlockResult[]> {
   const out: TransformerBlockResult[] = [];
   const epsBits = new ArrayBuffer(4); new Float32Array(epsBits)[0] = 1e-6;
+  const configs = subset === 'small' ? TRANSFORMER_CONFIGS.slice(0, 2) : TRANSFORMER_CONFIGS;
 
-  for (const cfg of TRANSFORMER_CONFIGS) {
+  for (const cfg of configs) {
     onProgress?.(`transformer block ${cfg.name} hidden=${cfg.hidden}`);
     const H = cfg.hidden, I = cfg.intermediate;
     const seq = 1; // single token decode
@@ -549,7 +559,7 @@ export async function benchSyntheticTransformerBlock(onProgress?: (msg: string) 
   return out;
 }
 
-// ─── D) TOKEN GENERATION SIMULATION ─────────────────────────────────────
+// â”€â”€â”€ D) TOKEN GENERATION SIMULATION â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 export function estimateTokenGeneration(
   blockResults: TransformerBlockResult[],
@@ -598,13 +608,24 @@ export function estimateTokenGeneration(
   return out;
 }
 
-// ─── E) MEMORY BUDGET (chunked allocation) ──────────────────────────────
+// â”€â”€â”€ E) MEMORY BUDGET (chunked allocation) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-export async function benchMemoryBudget(onProgress?: (msg: string) => void): Promise<MemBudgetResult[]> {
+export async function benchMemoryBudget(onProgress?: (msg: string) => void, subset: 'small' | 'full' = 'full'): Promise<MemBudgetResult[]> {
   const out: MemBudgetResult[] = [];
-  const targets = [128, 256, 512, 768, 1024, 1536, 2048];
+  const targets = subset === 'small' ? [128, 256] : [128, 256, 512, 768, 1024, 1536, 2048];
   const chunkMB = 64;
   const d = dev();
+  // Crash-safety: refuse to even start on a device whose maxBufferSize is
+  // below the 4 MiB floor â€” classify as RESOURCE_LIMIT, not OOM.
+  const floor = checkResourceFloor(d);
+  if (!floor.ok) {
+    return [{
+      targetMB: targets[0], chunkMB, success: false,
+      totalAllocatedMB: 0, largestBufferMB: 0, numBuffers: 0,
+      allocMs: 0, writeMs: 0,
+      failureReason: floor.reason ?? 'device maxBufferSize below 4 MiB floor',
+    }];
+  }
   const maxPerBuf = Math.min(d.limits.maxBufferSize, 256 * 1024 * 1024); // respect 256 MiB per buffer
 
   for (const targetMB of targets) {
@@ -629,6 +650,7 @@ export async function benchMemoryBudget(onProgress?: (msg: string) => void): Pro
         failureReason = `buffer allocation failed at ${thisChunk / 1048576}MB chunk (allocated ${allocated / 1048576}MB of ${targetMB}MB target): ${(e as Error).message}`;
         break;
       }
+      trackBuffer(buf);
       allocMs += performance.now() - t0;
       const w0 = performance.now();
       let off = 0;
@@ -658,24 +680,54 @@ export async function benchMemoryBudget(onProgress?: (msg: string) => void): Pro
   return out;
 }
 
-// ─── FULL LLM INFERENCE GATE RUNNER ─────────────────────────────────────
+// â”€â”€â”€ FULL LLM INFERENCE GATE RUNNER â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-export async function runLLMInferenceGate(onProgress?: (msg: string) => void): Promise<LLMGateResult> {
+const LLM_GATE_KEYS = ['quantizedMatmul', 'decodeAttention', 'transformerBlocks', 'memoryBudget', 'attention'] as const;
+
+function llmGateResumed(resume: ResumeContext | undefined, key: string): boolean {
+  return !!resume && resume.completed.includes(key) && resume.partial[key] !== undefined;
+}
+
+function llmGateProgress(onProgress: ((msg: string) => void) | undefined, category: string) {
+  return (msg: string) => {
+    heartbeat({ phase: 'V3.1', category, test: msg });
+    onProgress?.(msg);
+  };
+}
+
+export async function runLLMInferenceGate(onProgress?: (msg: string) => void, resume?: ResumeContext): Promise<LLMGateResult> {
   onProgress?.('LLM Inference Gate: INT8/INT4 quantized matmul...');
-  const quantizedMatmul = await benchQuantizedMatmul(onProgress);
-  onProgress?.('LLM Inference Gate: KV-cache decode attention...');
-  const decodeAttention = await benchKVCacheDecodeAttention(onProgress);
-  onProgress?.('LLM Inference Gate: synthetic transformer block...');
-  const transformerBlocks = await benchSyntheticTransformerBlock(onProgress);
+  heartbeat({ phase: 'V3.1', category: 'quantizedMatmul', test: 'quantized matmul' });
+  const quantizedMatmul = llmGateResumed(resume, 'quantizedMatmul')
+    ? (resume!.partial.quantizedMatmul as V3Result[])
+    : await benchQuantizedMatmul(llmGateProgress(onProgress, 'quantizedMatmul'));
+  if (!llmGateResumed(resume, 'quantizedMatmul')) checkpointCategory('quantizedMatmul', quantizedMatmul);
+
+  const decodeAttention = llmGateResumed(resume, 'decodeAttention')
+    ? (resume!.partial.decodeAttention as V3Result[])
+    : await benchKVCacheDecodeAttention(llmGateProgress(onProgress, 'decodeAttention'));
+  if (!llmGateResumed(resume, 'decodeAttention')) checkpointCategory('decodeAttention', decodeAttention);
+
+  const transformerBlocks = llmGateResumed(resume, 'transformerBlocks')
+    ? (resume!.partial.transformerBlocks as TransformerBlockResult[])
+    : await benchSyntheticTransformerBlock(llmGateProgress(onProgress, 'transformerBlocks'));
+  if (!llmGateResumed(resume, 'transformerBlocks')) checkpointCategory('transformerBlocks', transformerBlocks);
+
   onProgress?.('LLM Inference Gate: token generation simulation...');
   const tokenGeneration = estimateTokenGeneration(transformerBlocks, decodeAttention);
-  onProgress?.('LLM Inference Gate: memory budget...');
-  const memoryBudget = await benchMemoryBudget(onProgress);
+
+  const memoryBudget = llmGateResumed(resume, 'memoryBudget')
+    ? (resume!.partial.memoryBudget as MemBudgetResult[])
+    : await benchMemoryBudget(llmGateProgress(onProgress, 'memoryBudget'));
+  if (!llmGateResumed(resume, 'memoryBudget')) checkpointCategory('memoryBudget', memoryBudget);
 
   // We need V3 attention results for the LLM readiness score.
   // Import dynamically to avoid circular dependency.
   const { benchV3Attention } = await import('./perf-v3.ts');
-  const attentionResults = await benchV3Attention(onProgress);
+  const attentionResults = llmGateResumed(resume, 'attention')
+    ? (resume!.partial.attention as V3Result[])
+    : await benchV3Attention(llmGateProgress(onProgress, 'attention'));
+  if (!llmGateResumed(resume, 'attention')) checkpointCategory('attention', attentionResults);
 
   const llmReadiness = computeLLMReadiness(
     quantizedMatmul, attentionResults, decodeAttention,
@@ -684,34 +736,155 @@ export async function runLLMInferenceGate(onProgress?: (msg: string) => void): P
   return { quantizedMatmul, decodeAttention, transformerBlocks, tokenGeneration, memoryBudget, llmReadiness };
 }
 
-export async function runLLMInferenceGateQuick(onProgress?: (msg: string) => void): Promise<LLMGateResult> {
+export async function runLLMInferenceGateQuick(onProgress?: (msg: string) => void, resume?: ResumeContext): Promise<LLMGateResult> {
   onProgress?.('LLM Inference Gate Quick: INT8/INT4 quantized matmul...');
-  const quantizedMatmulFull = await benchQuantizedMatmul(onProgress);
-  // Quick: take only decode shapes for 512 and 1024
-  const quantizedMatmul = quantizedMatmulFull.filter(r =>
-    r.workload.includes('decode') && (r.workload.includes('h=512') || r.workload.includes('h=1024'))
-  );
-  onProgress?.('LLM Inference Gate Quick: KV-cache decode attention...');
-  const decodeAttentionFull = await benchKVCacheDecodeAttention(onProgress);
-  // Quick: take ctx=128, 512, 1024 only
-  const decodeAttention = decodeAttentionFull.filter(r =>
-    r.workload.includes('ctx=128') || r.workload.includes('ctx=512') || r.workload.includes('ctx=1024')
-  );
-  onProgress?.('LLM Inference Gate Quick: synthetic transformer block...');
-  const transformerBlocksFull = await benchSyntheticTransformerBlock(onProgress);
-  // Quick: take 0.5B and 1B only
-  const transformerBlocks = transformerBlocksFull.filter(b => b.config.name === '0.5B' || b.config.name === '1B');
+  heartbeat({ phase: 'V3.1', category: 'quantizedMatmul', test: 'quantized matmul (quick)' });
+  const quantizedMatmul = llmGateResumed(resume, 'quantizedMatmul')
+    ? (resume!.partial.quantizedMatmul as V3Result[])
+    : (await benchQuantizedMatmul(llmGateProgress(onProgress, 'quantizedMatmul'))).filter(r =>
+        r.workload.includes('decode') && (r.workload.includes('h=512') || r.workload.includes('h=1024'))
+      );
+  if (!llmGateResumed(resume, 'quantizedMatmul')) checkpointCategory('quantizedMatmul', quantizedMatmul);
+
+  const decodeAttention = llmGateResumed(resume, 'decodeAttention')
+    ? (resume!.partial.decodeAttention as V3Result[])
+    : (await benchKVCacheDecodeAttention(llmGateProgress(onProgress, 'decodeAttention'))).filter(r =>
+        r.workload.includes('ctx=128') || r.workload.includes('ctx=512') || r.workload.includes('ctx=1024')
+      );
+  if (!llmGateResumed(resume, 'decodeAttention')) checkpointCategory('decodeAttention', decodeAttention);
+
+  const transformerBlocks = llmGateResumed(resume, 'transformerBlocks')
+    ? (resume!.partial.transformerBlocks as TransformerBlockResult[])
+    : (await benchSyntheticTransformerBlock(llmGateProgress(onProgress, 'transformerBlocks'))).filter(b => b.config.name === '0.5B' || b.config.name === '1B');
+  if (!llmGateResumed(resume, 'transformerBlocks')) checkpointCategory('transformerBlocks', transformerBlocks);
+
   onProgress?.('LLM Inference Gate Quick: token generation simulation...');
   const tokenGeneration = estimateTokenGeneration(transformerBlocks, decodeAttention);
-  onProgress?.('LLM Inference Gate Quick: memory budget...');
-  const memoryBudget = await benchMemoryBudget(onProgress);
+
+  const memoryBudget = llmGateResumed(resume, 'memoryBudget')
+    ? (resume!.partial.memoryBudget as MemBudgetResult[])
+    : await benchMemoryBudget(llmGateProgress(onProgress, 'memoryBudget'), 'small');
+  if (!llmGateResumed(resume, 'memoryBudget')) checkpointCategory('memoryBudget', memoryBudget);
 
   const { benchV3Attention } = await import('./perf-v3.ts');
-  const attentionResults = (await benchV3Attention(onProgress)).slice(0, 3);
+  const attentionResults = llmGateResumed(resume, 'attention')
+    ? (resume!.partial.attention as V3Result[])
+    : (await benchV3Attention(llmGateProgress(onProgress, 'attention'))).slice(0, 3);
+  if (!llmGateResumed(resume, 'attention')) checkpointCategory('attention', attentionResults);
 
   const llmReadiness = computeLLMReadiness(
     quantizedMatmul, attentionResults, decodeAttention,
     transformerBlocks, memoryBudget, 0,
   );
   return { quantizedMatmul, decodeAttention, transformerBlocks, tokenGeneration, memoryBudget, llmReadiness };
+}
+
+// â”€â”€â”€ STAGED DIAGNOSTIC MODE (crash-safety scout run) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+export interface LLMDiagnosticStage {
+  name: string;
+  label: string;
+  durationMs: number;
+  completed: boolean;
+  error: string | null;
+  items: unknown;
+}
+
+/**
+ * Runs the LLM inference gate in 7 short, breakable stages, releasing ALL GPU
+ * buffers between stages. Each stage completes its full work item, so this is a
+ * truthful (if small) benchmark â€” never fabricates results. Used to pinpoint at
+ * which category an iPhone refresh/termination occurs.
+ */
+export async function runLLMDiagnosticStaged(onProgress?: (msg: string) => void): Promise<LLMDiagnosticStage[]> {
+  const stages: LLMDiagnosticStage[] = [];
+  const mk = (name: string, label: string) => ({ name, label, durationMs: 0, completed: false, error: null, items: null });
+
+  // Stage 1: small quantized matmul + KV attention
+  let s1: LLMDiagnosticStage = mk('quantizedMatmul', 'Small quantized matmul (h=512, decode/prefill-128)');
+  try {
+    const items = await benchQuantizedMatmul(llmGateProgress(onProgress, 'quantizedMatmul'), 'small');
+    s1 = { ...s1, durationMs: items.reduce((a, r) => a + r.totalMs, 0), completed: true, items };
+  } catch (e) {
+    s1 = { ...s1, error: (e as Error).message };
+  }
+  stages.push(s1);
+  releaseTrackedBuffers();
+
+  let s2: LLMDiagnosticStage = mk('decodeAttention', 'KV decode attention (ctx=128, 256)');
+  try {
+    const items = await benchKVCacheDecodeAttention(llmGateProgress(onProgress, 'decodeAttention'), 'short');
+    s2 = { ...s2, durationMs: items.reduce((a, r) => a + r.totalMs, 0), completed: true, items };
+  } catch (e) {
+    s2 = { ...s2, error: (e as Error).message };
+  }
+  stages.push(s2);
+  releaseTrackedBuffers();
+
+  let s3: LLMDiagnosticStage = mk('decodeAttention512', 'KV decode attention (ctx=512, 1024)');
+  try {
+    const items = await benchKVCacheDecodeAttention(llmGateProgress(onProgress, 'decodeAttention'), 'mid');
+    s3 = { ...s3, durationMs: items.reduce((a, r) => a + r.totalMs, 0), completed: true, items };
+  } catch (e) {
+    s3 = { ...s3, error: (e as Error).message };
+  }
+  stages.push(s3);
+  releaseTrackedBuffers();
+
+  let s4: LLMDiagnosticStage = mk('memoryBudget', 'Memory budget ladder (128MB, 256MB)');
+  try {
+    const items = await benchMemoryBudget(llmGateProgress(onProgress, 'memoryBudget'), 'small');
+    s4 = { ...s4, durationMs: items.reduce((a, r) => a + r.allocMs + r.writeMs, 0), completed: true, items };
+  } catch (e) {
+    s4 = { ...s4, error: (e as Error).message };
+  }
+  stages.push(s4);
+  releaseTrackedBuffers();
+
+  let s5: LLMDiagnosticStage = mk('transformerBlocks', 'Transformer block (0.5B, 1B)');
+  try {
+    const items = await benchSyntheticTransformerBlock(llmGateProgress(onProgress, 'transformerBlocks'), 'small');
+    s5 = { ...s5, durationMs: items.reduce((a, r) => a + r.totalMs, 0), completed: true, items };
+  } catch (e) {
+    s5 = { ...s5, error: (e as Error).message };
+  }
+  stages.push(s5);
+  releaseTrackedBuffers();
+
+  // Stage 6: token generation derived from measured stages 1â€“5
+  let s6: LLMDiagnosticStage = mk('tokenGeneration', 'Token generation simulation (derived)');
+  try {
+    const items = estimateTokenGeneration(
+      (s5.items as TransformerBlockResult[]) ?? [],
+      (s2.items as V3Result[]) ?? [],
+    );
+    s6 = { ...s6, durationMs: items.reduce((a, r) => a + r.totalMs, 0), completed: true, items };
+  } catch (e) {
+    s6 = { ...s6, error: (e as Error).message };
+  }
+  stages.push(s6);
+
+  let s7: LLMDiagnosticStage = mk('certification', 'Full certification (readiness + self-audit)');
+  try {
+    const core = await import('./perf-v3.ts');
+    const { benchV3Attention } = core;
+    const attentionResults = await benchV3Attention(llmGateProgress(onProgress, 'attention'));
+    releaseTrackedBuffers();
+    const { computeLLMReadiness } = await import('./results-v3.ts');
+    const llmReadiness = computeLLMReadiness(
+      (s1.items as V3Result[]) ?? [],
+      attentionResults,
+      (s2.items as V3Result[]) ?? [],
+      (s5.items as TransformerBlockResult[]) ?? [],
+      (s4.items as MemBudgetResult[]) ?? [],
+      0,
+    );
+    s7 = { ...s7, durationMs: attentionResults.reduce((a, r) => a + r.totalMs, 0), completed: true, items: llmReadiness };
+  } catch (e) {
+    s7 = { ...s7, error: (e as Error).message };
+  }
+  stages.push(s7);
+  releaseTrackedBuffers();
+
+  return stages;
 }

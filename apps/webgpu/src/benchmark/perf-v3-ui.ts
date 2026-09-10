@@ -18,8 +18,16 @@ import {
 import {
   type CertificationGates, type SelfAuditV3113,
   checkV3ResultIntegrity, computeCertificationGates, buildLlmInferenceV3113, runSelfAuditV3113,
+  finalizeCertificationWithInterruption,
 } from './v3113.ts';
-import { runLLMInferenceGate } from './perf-v3-llm.ts';
+import { runLLMInferenceGate, runLLMInferenceGateQuick, runLLMDiagnosticStaged } from './perf-v3-llm.ts';
+import {
+  beginBenchmark, completeBenchmark, interrupt, monitorDeviceLost,
+  getRuntimeError, getDeviceHealth, getCheckpoint, clearRuntimeError,
+  startHeartbeatTicker, stopHeartbeatTicker,
+} from './crash-safety.ts';
+import type { ResumeContext, RuntimeErrorRecord, InterruptionKind } from './crash-safety.ts';
+import { createBenchmarkResult } from './results-v3.ts';
 
 // Force runtime inclusion of V3.1.3 sentinels (prevents tree-shaking)
 export const AETHER_V313_SENTINELS = {
@@ -29,7 +37,7 @@ export const AETHER_V313_SENTINELS = {
   runSelfAuditV3113,
   runLLMGateFromUI,
   runLLMInferenceGate,
-  createBenchmarkResult: null as any, // placeholder, imported elsewhere
+  createBenchmarkResult,
 };
 
 
@@ -156,7 +164,37 @@ export function buildSelfAudit(
     : [];
 
   // Run the V3.1.3 integrity + certification gates
-  const gateResult = computeCertificationGates(gate, batchResults);
+  const gateResult = (() => {
+    const base = computeCertificationGates(gate, batchResults);
+    // Crash-safety: fail closed if the benchmark was ever interrupted.
+    const checkpoint = getCheckpoint();
+    if (checkpoint?.interruption) {
+      return finalizeCertificationWithInterruption(base, checkpoint.interruption);
+    }
+    const runtimeError = getRuntimeError();
+    const health = getDeviceHealth();
+    const interruption = runtimeError
+      ? {
+          kind: (runtimeError as RuntimeErrorRecord & { category: InterruptionKind | null }).category as InterruptionKind,
+          reason: runtimeError.error,
+          error: runtimeError.error,
+          stack: runtimeError.stack,
+          at: runtimeError.timestamp,
+        }
+      : health.lost
+        ? {
+            kind: 'WEBGPU_DEVICE_LOST' as const,
+            reason: health.reason ?? 'device lost',
+            error: health.message ?? null,
+            stack: null,
+            at: new Date().toISOString(),
+          }
+        : null;
+    if (interruption) {
+      return finalizeCertificationWithInterruption(base, interruption);
+    }
+    return base;
+  })();
   const llmInference = gate ? buildLlmInferenceV3113(gate) : null;
   const selfAudit = runSelfAuditV3113(llmInference, timerResolutionMs);
 
@@ -203,6 +241,10 @@ export function buildSelfAudit(
     llmReadinessReason: llmReadinessStatus.reason,
     // V3.1.3 self-audit checks
     selfAuditChecks: selfAudit,
+    // Crash-safety forensics
+    deviceHealth: getDeviceHealth(),
+    runtimeError: getRuntimeError(),
+    interruption: getCheckpoint()?.interruption ?? null,
   };
 }
 
@@ -501,6 +543,10 @@ function exportV3Json(results: V3FullResult, env: V3Environment) {
     llmReadinessScore: selfAudit.llmReadinessScore,
     llmReadinessStatus: selfAudit.llmReadinessStatus,
     llmReadinessReason: selfAudit.llmReadinessReason,
+    // Crash-safety forensics (A–J interruption classification)
+    deviceHealth: getDeviceHealth(),
+    runtimeError: getRuntimeError(),
+    interruption: getCheckpoint()?.interruption ?? null,
   };
   download('aether-v3-1-3-complete.json', JSON.stringify(payload, null, 2), 'application/json');
 }
@@ -897,6 +943,10 @@ function exportLLMJson(results: LLMGateResult, env: V3Environment) {
     },
     selfAudit: selfAudit.selfAuditChecks ?? null,
     note: 'WebGPU allocation capability, NOT total system RAM.',
+    // Crash-safety forensics (A–J interruption classification)
+    deviceHealth: getDeviceHealth(),
+    runtimeError: getRuntimeError(),
+    interruption: getCheckpoint()?.interruption ?? null,
   };
   // Post-serialization audit as required by Phase 14
   const serialized = JSON.stringify(payload, null, 2);
@@ -971,7 +1021,15 @@ WebGPU allocation capability, NOT total system RAM.
 
 // ─── Runner hook used by screen.ts V3.1 button ──────────────────────────
 
-export async function runLLMGateFromUI(mode: 'quick' | 'full', getDevice: () => GPUDevice, log: (msg: string, kind?: string) => void) {
+function buildResumeContextFromCheckpoint(includeCompletedAll: boolean): ResumeContext {
+  const cp = getCheckpoint();
+  if (!cp) return { completed: [], partial: {} };
+  if (!includeCompletedAll || cp.status !== 'INTERRUPTED') return { completed: [], partial: {} };
+  return { completed: cp.completedCategories, partial: cp.partialResults };
+}
+
+export async function runLLMGateFromUI(mode: 'quick' | 'full', getDevice: () => GPUDevice, log: (msg: string, kind?: string) => void, opts?: { resume?: ResumeContext }) {
+  const resume = opts?.resume ?? null;
   try {
     const device = getDevice();
     setTimerResolution(detectTimerResolution());
@@ -982,21 +1040,79 @@ export async function runLLMGateFromUI(mode: 'quick' | 'full', getDevice: () => 
     log('memorySuite: ENABLED', 'info');
     log('normalizedResults: ENABLED', 'info');
     log('postExportAudit: ENABLED', 'info');
+    if (resume) log(`crash-safety: RESUMING interrupted run (${resume.completed.length} categories cached)`, 'info');
 
-    const results = await (mode === 'quick' ? runLLMInferenceGateQuick : runLLMInferenceGate)((msg) => log(`V3.1: ${msg}`, 'info'));
-    _llmGateResults = results;
-    const { validateLLMGateIntegrity } = await import('./results-v3.ts');
-    const gateAudit = validateLLMGateIntegrity(results);
-    if (!gateAudit.ok) {
-      log(`V3.1 AUDIT FAILURES: ${gateAudit.issues.length}`, 'err');
-      for (const i of gateAudit.issues) log(`  - ${i.operation} ${i.workload}: ${i.detail}`, 'err');
-    } else {
-      log('V3.1 audit OK: normalization + throughput verified for LLM gate results.', 'ok');
+    // Crash-safety lifecycle
+    beginBenchmark('V3.1', mode, {
+      resume: resume ? { completed: resume.completed, partial: resume.partial } : undefined,
+    }, (globalThis as any).AETHER_BUILD_ID ?? null);
+    const stopDeviceMonitor = monitorDeviceLost(device);
+    const stopTicker = startHeartbeatTicker();
+    const runner = mode === 'quick' ? runLLMInferenceGateQuick : runLLMInferenceGate;
+
+    try {
+      const results = await runner(
+        (msg) => log(`V3.1: ${msg}`, 'info'),
+        resume ?? undefined,
+      );
+      completeBenchmark();
+      stopTicker();
+      stopDeviceMonitor();
+      clearRuntimeError();
+      _llmGateResults = results;
+      const { validateLLMGateIntegrity } = await import('./results-v3.ts');
+      const gateAudit = validateLLMGateIntegrity(results);
+      if (!gateAudit.ok) {
+        log(`V3.1 AUDIT FAILURES: ${gateAudit.issues.length}`, 'err');
+        for (const i of gateAudit.issues) log(`  - ${i.operation} ${i.workload}: ${i.detail}`, 'err');
+      } else {
+        log('V3.1 audit OK: normalization + throughput verified for LLM gate results.', 'ok');
+      }
+      const env = await gatherEnv(device);
+      renderLLMGate(results, env, log);
+    } catch (e) {
+      stopTicker();
+      stopDeviceMonitor();
+      const err = e as Error;
+      const msg = `${err.message} ${err.stack ?? ''}`.toLowerCase();
+      if (msg.includes('validation')) {
+        interrupt('GPU_VALIDATION_ERROR', err.message, err);
+      } else if (msg.includes('limit') && (msg.includes('alloc') || msg.includes('buffer') || msg.includes('memory'))) {
+        interrupt('RESOURCE_LIMIT', err.message, err);
+      } else {
+        interrupt('JAVASCRIPT_EXCEPTION', err.message, err);
+      }
+      log(`V3.1 ERROR: ${err.message}`, 'err');
+      log('crash-safety: benchmark interrupted (A–J), certification FAILED, partial results preserved. RELOAD the page and press RESUME.', 'warn');
     }
-    const env = await gatherEnv(device);
-    renderLLMGate(results, env, log);
   } catch (e) {
     log(`V3.1 ERROR: ${(e as Error).message}`, 'err');
+  }
+}
+
+export async function runLLMDiagnosticFromUI(getDevice: () => GPUDevice, log: (msg: string, kind?: string) => void) {
+  try {
+    const device = getDevice();
+    setTimerResolution(detectTimerResolution());
+    const { runLLMDiagnosticStaged } = await import('./perf-v3-llm.ts');
+    log('AETHER V3.1.3 STAGED DIAGNOSTIC ACTIVE', 'info');
+    beginBenchmark('V3.1', 'quick', undefined, (globalThis as any).AETHER_BUILD_ID ?? null);
+    const stopDeviceMonitor = monitorDeviceLost(device);
+    const stopTicker = startHeartbeatTicker();
+    const env = await gatherEnv(device);
+    const stages = await runLLMDiagnosticStaged((msg) => log(`DIAG: ${msg}`, 'info'));
+    stopTicker();
+    stopDeviceMonitor();
+    completeBenchmark();
+    for (const s of stages) {
+      const state = s.completed ? (s.error ? 'ERROR' : 'DONE') : 'SKIPPED';
+      log(`DIAG ${state}: ${s.label}${s.error ? ` — ${s.error}` : ''} (${Math.round(s.durationMs)}ms)`, s.completed && !s.error ? 'ok' : 'err');
+    }
+    log(`DIAG done: ${stages.filter(s => s.completed).length}/${stages.length} stages completed`, 'ok');
+    log(`DIAG env: ${env.device} | maxBufferSize: ${env.maxBufferSize ? Math.round(env.maxBufferSize / 1048576) + ' MB' : 'UNAVAILABLE'} | timer: ${env.timerResolutionMs.toFixed(3)} ms`, 'info');
+    log('crash-safety: diagnostic complete. Export the LLM JSON to capture the full staged report.', 'info');
+  } catch (e) {
+    log(`DIAG ERROR: ${(e as Error).message}`, 'err');
   }
 }
 

@@ -56,6 +56,11 @@ import {
 import { createMatmulUniform, createVecAddUniform, createSoftmaxUniform, createRMSNormUniform, createAttentionUniform, createConv2DUniform, logAttentionUniformDiagnostic } from './uniforms';
 import { cpuMatmul, cpuVecAdd, cpuSoftmax, cpuRMSNorm, cpuAttention, cpuConv2D } from './cpu-refs';
 import { fillDeterministic } from './perf-kernels';
+import {
+  installGlobalErrorCapture, getPendingRun, clearInterruptedRun, getCheckpoint,
+  classifyInterruption, getRuntimeError, getDeviceHealth, releaseTrackedBuffers,
+} from './crash-safety';
+import type { Checkpoint } from './crash-safety';
 
 let _container: HTMLElement | null = null;
 let _running = false;
@@ -1531,17 +1536,111 @@ function runPerfV3(mode: 'quick' | 'full') {
 
 // ─── V3.1: LLM Inference Gate ───────────────────────────────────────────
 
-function runPerfV31(mode: 'quick' | 'full') {
+function crashBannerConfig(): { pending: boolean; cp: Checkpoint | null; kind: string } {
+  const cp = getPendingRun();
+  if (!cp) return { pending: false, cp: null, kind: 'none' };
+  const info = classifyInterruption(cp);
+  return { pending: true, cp, kind: info.kind };
+}
+
+function renderCrashSafetyBanner() {
+  const el = _container;
+  if (!el) return;
+  const box = el.querySelector('#crash-safety-banner') as HTMLElement | null;
+  if (!box) return;
+  const { pending, cp, kind } = crashBannerConfig();
+  if (!pending || !cp) {
+    box.style.display = 'none';
+    box.innerHTML = '';
+    return;
+  }
+  const health = getDeviceHealth();
+  const err = getRuntimeError();
+  const phase = cp.currentPhase ?? '—';
+  const category = cp.currentCategory ?? '—';
+  const at = cp.lastHeartbeat ? `last checkpoint ${cp.lastHeartbeat}` : '';
+  box.style.display = 'block';
+  box.innerHTML = `
+    <div style="padding:12px 14px;border:1px solid #b58900;border-radius:8px;background:rgba(181,137,0,.08);font-size:13px;line-height:1.6">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        <b style="color:#b58900">⚠ BENCHMARK INTERRUPTED</b>
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:11px">${kind}</span>
+      </div>
+      <div style="color:var(--text);margin-top:6px">
+        The previous V3.1 run did not finish. Certification is <b>FAILED</b> for that run.
+        Partial results are preserved so you can resume without re-running completed categories.
+        ${health.lost ? ` Device reported: <b>WEBGPU DEVICE LOST</b> (${health.reason ?? health.message ?? ''}).` : ''}
+        ${err ? ` Fatal error recorded: <b>${err.error}</b>.` : ''}
+      </div>
+      <div style="color:var(--text-dim);font-size:11px;font-family:var(--mono);margin-top:4px">
+        phase: ${phase} | category: ${category} | ${cp.completedCategories.length} category(ies) complete | ${at}
+      </div>
+      <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
+        <button class="btn" id="btn-resume-run">RESUME INTERRUPTED RUN</button>
+        <button class="btn btn-outline" id="btn-new-run">START NEW RUN</button>
+        <button class="btn btn-outline" id="btn-clear-run">CLEAR (DISCARD)</button>
+      </div>
+    </div>
+  `;
+  box.querySelector('#btn-resume-run')?.addEventListener('click', () => {
+    renderCrashSafetyBanner();
+    runPerfV31(cp.mode, 'resume');
+  });
+  box.querySelector('#btn-new-run')?.addEventListener('click', () => {
+    clearInterruptedRun();
+    renderCrashSafetyBanner();
+    log('crash-safety: cleared interrupted run, starting fresh benchmark.', 'info');
+    runPerfV31(cp.mode, 'fresh');
+  });
+  box.querySelector('#btn-clear-run')?.addEventListener('click', () => {
+    clearInterruptedRun();
+    renderCrashSafetyBanner();
+    log('crash-safety: cleared interrupted run checkpoint. No benchmark started.', 'info');
+  });
+}
+
+function runPerfV31(mode: 'quick' | 'full', resumeAction?: 'resume' | 'fresh') {
+  if (_running) {
+    log('A benchmark is already running — wait for it to finish.', 'warn');
+    return;
+  }
+  const cp = getPendingRun();
+  if (!resumeAction && cp && cp.status === 'INTERRUPTED') {
+    renderCrashSafetyBanner();
+    log('crash-safety: an interrupted benchmark was found. Use RESUME, START NEW, or CLEAR.', 'warn');
+    return;
+  }
+  _running = true;
+  log(`═══ AETHER V3.1 LLM INFERENCE GATE — ${mode === 'quick' ? 'QUICK' : 'FULL'} ${resumeAction === 'resume' ? '(RESUMED)' : ''} ═══`, 'info');
+  import('./perf-v3-ui').then(async (mod) => {
+    renderCrashSafetyBanner();
+    let resumeOpts: { resume: { completed: string[]; partial: Record<string, unknown> } } | undefined;
+    if (resumeAction === 'resume' && cp) {
+      resumeOpts = { resume: { completed: cp.completedCategories, partial: cp.partialResults } };
+    }
+    await mod.runLLMGateFromUI(mode, getDevice, (msg, kind) => log(msg, kind ?? 'info'), resumeOpts);
+    if (!cp || resumeAction === 'fresh') {
+      renderCrashSafetyBanner();
+    }
+  }).catch((e) => {
+    log(`V3.1 load error: ${(e as Error).message}`, 'err');
+  }).finally(() => {
+    _running = false;
+  });
+}
+
+function runLLMDiagnostic() {
   if (_running) {
     log('A benchmark is already running — wait for it to finish.', 'warn');
     return;
   }
   _running = true;
-  log(`═══ AETHER V3.1 LLM INFERENCE GATE — ${mode === 'quick' ? 'QUICK' : 'FULL'} ═══`, 'info');
+  log('═══ AETHER V3.1.3 STAGED LLM DIAGNOSTIC ═══', 'info');
   import('./perf-v3-ui').then((mod) => {
-    mod.runLLMGateFromUI(mode, getDevice, (msg, kind) => log(msg, kind ?? 'info'));
+    mod.runLLMDiagnosticFromUI(getDevice, (msg, kind) => log(msg, kind ?? 'info'));
   }).catch((e) => {
-    log(`V3.1 load error: ${(e as Error).message}`, 'err');
+    log(`Diagnostic load error: ${(e as Error).message}`, 'err');
+    releaseTrackedBuffers();
   }).finally(() => {
     _running = false;
   });
@@ -1890,6 +1989,17 @@ function renderPerfPanel(el: HTMLElement) {
   el.querySelector('#btn-perf-v3-full')?.addEventListener('click', () => runPerfV3('full'));
   el.querySelector('#btn-perf-v3-1')?.addEventListener('click', () => runPerfV31('quick'));
   el.querySelector('#btn-perf-v3-1-full')?.addEventListener('click', () => runPerfV31('full'));
+  el.querySelector('#btn-perf-v3-1-diag')?.addEventListener('click', () => runLLMDiagnostic());
+  el.querySelector('#btn-perf-v3-1-resume')?.addEventListener('click', () => {
+    const cp = getPendingRun();
+    if (cp) runPerfV31(cp.mode, 'resume');
+    else log('crash-safety: no interrupted run to resume.', 'warn');
+  });
+  el.querySelector('#btn-perf-v3-1-clear')?.addEventListener('click', () => {
+    clearInterruptedRun();
+    renderCrashSafetyBanner();
+    log('crash-safety: cleared interrupted run checkpoint.', 'info');
+  });
   el.querySelector('#btn-perf-quick')?.addEventListener('click', () => runPerf('quick'));
   el.querySelector('#btn-perf-full')?.addEventListener('click', () => runPerf('full'));
   el.querySelector('#btn-perf-sustained')?.addEventListener('click', () => runPerf('sustained'));
@@ -1976,7 +2086,9 @@ export function render(el: HTMLElement) {
       <div class="btn-row" style="margin-top:10px;flex-wrap:wrap">
         <button class="btn" id="btn-perf-v3-1">QUICK V3.1</button>
         <button class="btn btn-outline" id="btn-perf-v3-1-full">FULL V3.1</button>
+        <button class="btn btn-outline" id="btn-perf-v3-1-diag">STAGED DIAGNOSTIC</button>
       </div>
+      <div id="crash-safety-banner" style="display:none;margin-top:12px"></div>
       <div id="perf-v3-llm-results" style="margin-top:12px"></div>
     </div>
 
@@ -2066,10 +2178,11 @@ export function render(el: HTMLElement) {
   }
   renderPerfPanel(el);
 
-  // Suppress unhandled errors so failures render in the log instead of a crash dialog.
-  const errorHandler = (e: Event) => { e.preventDefault(); };
-  window.addEventListener('error', errorHandler);
-  window.addEventListener('unhandledrejection', errorHandler);
+  // Crash-safety: capture global errors + unhandled rejections, record them
+// with the active checkpoint, and let the interrupted-run banner offer
+// RESUME / START NEW / CLEAR. No page crash loop, no suppressed evidence.
+  installGlobalErrorCapture();
+  renderCrashSafetyBanner();
 
   // Auto-initialize on load to show device info + diagnostics.
   initBenchmark().then(diag => {

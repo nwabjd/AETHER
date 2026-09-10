@@ -656,3 +656,244 @@ test('V3.1.3 TEST 13: throughputIntegrity catches wrong throughput', () => {
   assert.ok(issues.some(i => i.kind === 'throughput_integrity'),
     `expected throughput_integrity issue, got: ${JSON.stringify(issues)}`);
 });
+
+// ─── CRASH-SAFETY REGRESSION TESTS (V3.1.3) ───────────────────────────────
+// After the iPhone FULL V3.1 benchmark refreshed mid-run, crash-safety was
+// added: global error capture, device.lost monitoring, per-category checkpoints,
+// resume, fail-closed certification, and resource cleanup. These tests pin each
+// contract so the memory-safety hardening cannot silently regress.
+
+import {
+  beginBenchmark, checkpointCategory, completeBenchmark, interrupt, finalizeInterrupted,
+  monitorDeviceLost, getDeviceHealth, getRuntimeError,
+  getCheckpoint, getPendingRun, classifyInterruption,
+  trackBuffer, releaseTrackedBuffers, trackedBufferCount,
+  deviceMaxBufferBytes, effectiveMaxBufferBytes, checkResourceFloor,
+  installGlobalErrorCapture, setStorageForTests, resetForTests,
+} from '../src/benchmark/crash-safety.ts';
+import { finalizeCertificationWithInterruption } from '../src/benchmark/v3113.ts';
+import type { V3Result, LLMGateResult, LLMReadiness } from '../src/benchmark/results-v3.ts';
+
+function memStorage(): { getItem(k: string): string | null; setItem(k: string, v: string): void; removeItem(k: string): void } {
+  const m = new Map<string, string>();
+  return {
+    getItem: (k: string) => m.get(k) ?? null,
+    setItem: (k: string, v: string) => { m.set(k, v); },
+    removeItem: (k: string) => { m.delete(k); },
+  };
+}
+
+const readiness: LLMReadiness = {
+  computeScore: 0, memoryScore: 0, attentionScore: 0, decodeScore: 0,
+  transformerBlockScore: 0, sustainedScore: 0, overall: 0,
+  llmCompute: 0, llmMemory: 0, kvCache: 0, prefill: 0, decode: 0,
+  transformerBlock: 0, longContext: 0, sustained: 0,
+};
+
+const emptyGate: LLMGateResult = {
+  quantizedMatmul: [], decodeAttention: [], transformerBlocks: [],
+  tokenGeneration: [], memoryBudget: [], llmReadiness: readiness,
+};
+
+test('CS T1 (V3.1.3): device.lost → health lost + checkpoint INTERRUPTED (WEBGPU_DEVICE_LOST)', () => {
+  resetForTests();
+  setStorageForTests(memStorage());
+  beginBenchmark('V3.1', 'full', undefined, 'testbuild');
+  let cb: ((e: unknown) => void) | null = null;
+  const fake = {
+    addEventListener(ev: string, handler: (e: unknown) => void) { if (ev === 'lost') cb = handler; },
+    removeEventListener() { cb = null; },
+  };
+  monitorDeviceLost(fake);
+  cb!({ reason: 'destroyed', message: 'lost mid-run' });
+  assert.equal(getDeviceHealth().lost, true);
+  const cp = getCheckpoint();
+  assert.equal(cp?.status, 'INTERRUPTED');
+  assert.equal(cp?.interruption?.kind, 'WEBGPU_DEVICE_LOST');
+  assert.equal(cp?.certificationStatus, 'FAILED');
+  assert.equal(getPendingRun()?.status, 'INTERRUPTED');
+});
+
+function withFakeWindow(fn: (errorHandler: (e: unknown) => void, rejectionHandler: (e: unknown) => void) => void) {
+  let errorHandler: ((e: unknown) => void) | undefined;
+  let rejectionHandler: ((e: unknown) => void) | undefined;
+  const fakeWindow = {
+    addEventListener(ev: string, h: (e: unknown) => void) {
+      if (ev === 'error') errorHandler = h;
+      if (ev === 'unhandledrejection') rejectionHandler = h;
+    },
+    removeEventListener() {},
+  };
+  (globalThis as Record<string, unknown>).window = fakeWindow;
+  const cleanup = installGlobalErrorCapture();
+  try {
+    fn(errorHandler!, rejectionHandler!);
+  } finally {
+    cleanup();
+    delete (globalThis as Record<string, unknown>).window;
+  }
+}
+
+test('CS T2 (V3.1.3): window error capture records JS exception + prevents crash dialog', () => {
+  resetForTests();
+  setStorageForTests(memStorage());
+  beginBenchmark('V3.1', 'full', undefined, 'testbuild');
+  let prevented = false;
+  withFakeWindow((errorHandler) => {
+    errorHandler({
+      message: 'boom', filename: 'bench.ts', lineno: 42, error: new Error('boom'),
+      preventDefault() { prevented = true; },
+    });
+  });
+  assert.equal(prevented, true, 'crash dialog must be suppressed');
+  const rec = getRuntimeError();
+  assert.ok(rec);
+  assert.ok(rec!.error.includes('boom'));
+  const cp = getCheckpoint();
+  assert.equal(cp?.status, 'INTERRUPTED');
+  assert.equal(cp?.interruption?.kind, 'JAVASCRIPT_EXCEPTION');
+});
+
+test('CS T3 (V3.1.3): unhandledrejection capture → UNHANDLED_REJECTION', () => {
+  resetForTests();
+  setStorageForTests(memStorage());
+  beginBenchmark('V3.1', 'full', undefined, 'testbuild');
+  let prevented = false;
+  withFakeWindow((_errorHandler, rejectionHandler) => {
+    rejectionHandler({
+      reason: new Error('rejected!'),
+      preventDefault() { prevented = true; },
+    });
+  });
+  assert.equal(prevented, true, 'crash dialog must be suppressed');
+  assert.equal(getCheckpoint()?.interruption?.kind, 'UNHANDLED_REJECTION');
+});
+
+test('CS T4 (V3.1.3): classifyInterruption → PAGE_TERMINATED_OR_BROWSER_RELOADED (no fabricated JS error)', () => {
+  resetForTests();
+  setStorageForTests(memStorage());
+  beginBenchmark('V3.1', 'full', undefined, 'testbuild');
+  checkpointCategory('quantizedMatmul', [{ x: 1 }]);
+  // Page death mid-run: a RUNNING checkpoint survives, no error was captured.
+  const info = classifyInterruption();
+  assert.equal(info.kind, 'PAGE_TERMINATED_OR_BROWSER_RELOADED');
+  assert.equal(getRuntimeError(), null, 'must never fabricate a JS exception');
+  assert.equal(getPendingRun()?.status, 'RUNNING', 'banner sees the never-finished run');
+});
+
+test('CS T5 (V3.1.3): checkpoint persists each completed category to storage', () => {
+  resetForTests();
+  setStorageForTests(memStorage());
+  beginBenchmark('V3.1', 'full', undefined, 'testbuild');
+  checkpointCategory('quantizedMatmul', [{ n: 1 }]);
+  checkpointCategory('decodeAttention', [{ n: 2 }]);
+  const pending = getPendingRun();
+  assert.ok(pending);
+  assert.deepEqual(pending!.completedCategories, ['quantizedMatmul', 'decodeAttention']);
+  assert.deepEqual(pending!.partialResults.quantizedMatmul, [{ n: 1 }]);
+  assert.deepEqual(pending!.partialResults.decodeAttention, [{ n: 2 }]);
+});
+
+test('CS T6 (V3.1.3): resume context seeds a new beginBenchmark (recovery banner)', () => {
+  const storage = memStorage();
+  resetForTests();
+  setStorageForTests(storage);
+  beginBenchmark('V3.1', 'full', undefined, 'testbuild');
+  checkpointCategory('quantizedMatmul', [{ n: 1 }]);
+  const pending = getPendingRun()!;
+  resetForTests(); // mimic page reload: in-memory state cleared, storage kept
+  setStorageForTests(storage);
+  beginBenchmark('V3.1', 'full', {
+    resume: { completed: pending.completedCategories, partial: pending.partialResults },
+  }, 'build2');
+  const cp = getCheckpoint()!;
+  assert.equal(cp.status, 'RUNNING');
+  assert.deepEqual(cp.completedCategories, ['quantizedMatmul']);
+  assert.deepEqual(cp.partialResults.quantizedMatmul, [{ n: 1 }]);
+  assert.equal(cp.buildId, 'build2');
+});
+
+test('CS T7 (V3.1.3): partial results round-trip through storage with order intact', () => {
+  const storage = memStorage();
+  resetForTests();
+  setStorageForTests(storage);
+  beginBenchmark('V3.1', 'full', undefined, 'testbuild');
+  checkpointCategory('decodeAttention', [{ ctx: 128 }]);
+  checkpointCategory('transformerBlocks', [{ name: '0.5B' }]);
+  resetForTests(true); // page reload: keep storage (the checkpoint must survive)
+  setStorageForTests(storage);
+  const pending = getPendingRun();
+  assert.ok(pending);
+  assert.deepEqual(pending!.completedCategories, ['decodeAttention', 'transformerBlocks']);
+  assert.deepEqual(pending!.partialResults.decodeAttention, [{ ctx: 128 }]);
+  assert.deepEqual(pending!.partialResults.transformerBlocks, [{ name: '0.5B' }]);
+});
+
+test('CS T8 (V3.1.3): memory guards cap buffers + reject sub-floor devices (RESOURCE_LIMIT)', () => {
+  const low = checkResourceFloor({ limits: { maxBufferSize: 1024 * 1024 } });
+  assert.equal(low.ok, false);
+  assert.ok(low.reason!.includes('RESOURCE_LIMIT'));
+  const healthy = { limits: { maxBufferSize: 512 * 1024 * 1024 } };
+  assert.equal(checkResourceFloor(healthy).ok, true);
+  assert.equal(deviceMaxBufferBytes(healthy), 512 * 1024 * 1024);
+  assert.equal(effectiveMaxBufferBytes(healthy), 256 * 1024 * 1024, 'effective cap = MAX_SAFE_BUFFER_BYTES');
+  assert.equal(deviceMaxBufferBytes(undefined), 256 * 1024 * 1024, 'unknown device → DEFAULT_ASSUMED_MAX_BUFFER');
+});
+
+test('CS T9 (V3.1.3): tracked buffers are destroyed on interruption (cleanup-after-failure)', () => {
+  resetForTests();
+  setStorageForTests(memStorage());
+  beginBenchmark('V3.1', 'full', undefined, 'testbuild');
+  let destroyed = 0;
+  const fakeBuf = { destroy() { destroyed++; } } as unknown as GPUBuffer;
+  trackBuffer(fakeBuf);
+  trackBuffer(fakeBuf); // dedupe via Set
+  assert.equal(trackedBufferCount(), 1);
+  assert.equal(destroyed, 0);
+  interrupt('RESOURCE_LIMIT', 'out of memory');
+  assert.equal(destroyed, 1, 'interrupt must destroy every tracked buffer');
+  assert.equal(trackedBufferCount(), 0);
+  assert.equal(getCheckpoint()?.certificationStatus, 'FAILED');
+  completeBenchmark(); // post-interrupt complete must not throw
+  releaseTrackedBuffers(); // idempotent
+});
+
+test('CS T10 (V3.1.3): incomplete LLM gate → NOT_CERTIFIED with explicit reasons', () => {
+  const gates = computeCertificationGates(emptyGate);
+  assert.equal(gates.overallCertified, false);
+  assert.equal(gates.certificationStatus, 'NOT_CERTIFIED');
+  assert.ok(gates.reasons.some(r => r.includes('kvCacheDecode missing contexts')));
+  assert.ok(gates.reasons.some(r => r.includes('tokenGeneration')));
+  assert.ok(gates.reasons.some(r => r.includes('memoryBudget missing rungs')));
+});
+
+test('CS T11 (V3.1.3): device.lost → certification FAILED (fail closed)', () => {
+  const base = computeCertificationGates(emptyGate);
+  const failed = finalizeCertificationWithInterruption(base, {
+    kind: 'WEBGPU_DEVICE_LOST', reason: 'destroyed', error: 'device lost during benchmark', stack: null,
+    at: new Date().toISOString(),
+  });
+  assert.equal(failed.certificationStatus, 'FAILED');
+  assert.equal(failed.overallCertified, false);
+  assert.ok(failed.reasons.some(r => r.includes('certification FAILED')));
+});
+
+test('CS T12 (V3.1.3): interrupted LLM run survives reload and FAILs certification', () => {
+  const storage = memStorage();
+  resetForTests();
+  setStorageForTests(storage);
+  beginBenchmark('V3.1', 'full', undefined, 'testbuild');
+  checkpointCategory('quantizedMatmul', [{ n: 1 }]);
+  finalizeInterrupted('PAGE_TERMINATED_OR_BROWSER_RELOADED', 'page terminated');
+  const cp = getCheckpoint()!;
+  assert.equal(cp.status, 'INTERRUPTED');
+  resetForTests(true); // page reload; storage kept
+  setStorageForTests(storage);
+  const pending = getPendingRun()!;
+  assert.equal(pending.status, 'INTERRUPTED');
+  assert.deepEqual(pending.completedCategories, ['quantizedMatmul']);
+  const base = computeCertificationGates(emptyGate);
+  const failed = finalizeCertificationWithInterruption(base, pending.interruption!);
+  assert.equal(failed.certificationStatus, 'FAILED');
+  assert.ok(failed.reasons.some(r => r.includes('PAGE_TERMINATED_OR_BROWSER_RELOADED')));
+});

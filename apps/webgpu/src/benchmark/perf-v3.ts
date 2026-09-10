@@ -15,6 +15,10 @@ import {
   computeReadiness, classifyFeasibility, getTimerResolution,
 } from './results-v3.ts';
 import {
+  trackBuffer, effectiveMaxBufferBytes, heartbeat, checkpointCategory,
+} from './crash-safety.ts';
+import type { ResumeContext } from './crash-safety.ts';
+import {
   GELU, SILU, EMBEDDING_LOOKUP, TEMPORAL_MIX,
   createEmbeddingUniform, createTemporalMixUniform,
 } from './kernels-v3.ts';
@@ -29,7 +33,9 @@ function createBuf(usage: GPUBufferUsageFlags, bytes: number, data?: ArrayBuffer
   const buf = dev().createBuffer({ size: bytes, usage, mappedAtCreation: !!data });
   if (data) new Uint8Array(buf.getMappedRange()).set(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
   buf.unmap();
-  return buf;
+  // Crash-safety: every buffer created through the shared helpers is tracked so
+  // an interrupted benchmark can release GPU resources (GPUBuffer.destroy()).
+  return trackBuffer(buf) as GPUBuffer;
 }
 
 export function storageBuf(bytes: number, data?: ArrayBufferView) {
@@ -741,33 +747,59 @@ export async function benchV3Memory(onProgress?: (msg: string) => void): Promise
   const out: MemResult[] = [];
   const sizesMB = [64, 128, 256, 384, 512];
   const d = dev();
+  // Crash-safety: this category must NEVER allocate a single GPUBuffer above
+  // the device limit (~256 MiB on iPhone). Allocate the target total in chunks
+  // so a memory-limited device fails gracefully instead of being killed.
+  const maxPerBuf = effectiveMaxBufferBytes(d);
+  const chunkMB = Math.max(1, Math.min(64, Math.floor(maxPerBuf / (1024 * 1024))));
+  const chunkBytes = Math.min(chunkMB * 1024 * 1024, maxPerBuf);
+
   for (const mb of sizesMB) {
     onProgress?.(`memory ${mb}MB`);
-    const bytes = mb * 1024 * 1024;
+    const targetBytes = mb * 1024 * 1024;
     const start = performance.now();
-    let buf: GPUBuffer | null = null;
+    const bufs: GPUBuffer[] = [];
+    let allocated = 0;
+    let allocError: unknown = null;
     try {
-      buf = d.createBuffer({ size: bytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
-    } catch {
-      out.push({ allocated: false, sizeMB: mb, allocMs: 0, writeMs: 0 });
+      while (allocated < targetBytes) {
+        const thisChunk = Math.min(chunkBytes, targetBytes - allocated);
+        const buf = d.createBuffer({ size: thisChunk, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
+        trackBuffer(buf);
+        bufs.push(buf);
+        allocated += thisChunk;
+      }
+    } catch (e) {
+      allocError = e;
+    }
+    for (const b of bufs) b.destroy();
+    const allocMs = performance.now() - start;
+
+    if (allocError !== null || allocated < targetBytes) {
+      out.push({ allocated: false, sizeMB: mb, allocMs, writeMs: 0 });
       continue;
     }
-    const allocMs = performance.now() - start;
-    // Write test
+
+    // Write test (keeps the same semantics as the original single-buffer path)
     const wStart = performance.now();
-    const fill = new Float32Array(Math.min(bytes / 4, 256)).fill(42.0);
+    const fill = new Float32Array(Math.min(targetBytes / 4, 256)).fill(42.0);
+    let writeFailed = false;
     try {
-      for (let offset = 0; offset < bytes; offset += fill.byteLength) {
-        d.queue.writeBuffer(buf, offset, fill, 0, Math.min(fill.length, (bytes - offset) / 4));
+      for (const b of bufs) {
+        const len = b.size;
+        for (let offset = 0; offset < len; offset += fill.byteLength) {
+          d.queue.writeBuffer(b, offset, fill, 0, Math.min(fill.length, (len - offset) / 4));
+        }
       }
     } catch {
-      buf.destroy();
-      out.push({ allocated: true, sizeMB: mb, allocMs, writeMs: -1 });
-      continue;
+      writeFailed = true;
     }
     const writeMs = performance.now() - wStart;
-    buf.destroy();
-    out.push({ allocated: true, sizeMB: mb, allocMs, writeMs });
+    if (writeFailed) {
+      out.push({ allocated: true, sizeMB: mb, allocMs, writeMs: -1 });
+    } else {
+      out.push({ allocated: true, sizeMB: mb, allocMs, writeMs });
+    }
   }
   return out;
 }
@@ -888,35 +920,134 @@ export interface V3FullResult {
   feasibility: FeasibilityReport;
 }
 
-export async function runV3Full(onProgress?: (msg: string) => void): Promise<V3FullResult> {
+/**
+ * Per-category progress wrapper: surfaces progress to the UI AND keeps the
+ * crash-safety heartbeat (phase/category/test) fresh between checkpoints.
+ */
+function v3Progress(onProgress: ((msg: string) => void) | undefined, phase: string, category: string) {
+  return (msg: string) => {
+    heartbeat({ phase, category, test: msg });
+    onProgress?.(msg);
+  };
+}
+
+function v3Resumed(resume: ResumeContext | undefined, key: string): boolean {
+  return !!resume && resume.completed.includes(key) && resume.partial[key] !== undefined;
+}
+
+export async function runV3Full(onProgress?: (msg: string) => void, resume?: ResumeContext): Promise<V3FullResult> {
   onProgress?.('Starting V3 Model-Shaped Benchmark...');
-  const matmul = await benchV3Matmul(onProgress);
-  const attention = await benchV3Attention(onProgress);
-  const mlp = await benchV3MLP(onProgress);
-  const rmsnorm = await benchV3RMSNorm(onProgress);
-  const embedding = await benchV3Embedding(onProgress);
-  const imageOps = await benchV3ImageOps(onProgress);
-  const vae = await benchV3VAE(onProgress);
-  const video = await benchV3Video(onProgress);
-  const memory = await benchV3Memory(onProgress);
-  const sustained = await benchV3Sustained(onProgress);
+  heartbeat({ phase: 'V3:MODEL-SHAPED', category: null, test: 'starting' });
+
+  const matmul = v3Resumed(resume, 'matmul')
+    ? (resume!.partial.matmul as V3Result[])
+    : await benchV3Matmul(v3Progress(onProgress, 'V3-FULL', 'matmul'));
+  if (!v3Resumed(resume, 'matmul')) checkpointCategory('matmul', matmul);
+
+  const attention = v3Resumed(resume, 'attention')
+    ? (resume!.partial.attention as V3Result[])
+    : await benchV3Attention(v3Progress(onProgress, 'V3-FULL', 'attention'));
+  if (!v3Resumed(resume, 'attention')) checkpointCategory('attention', attention);
+
+  const mlp = v3Resumed(resume, 'mlp')
+    ? (resume!.partial.mlp as V3Result[])
+    : await benchV3MLP(v3Progress(onProgress, 'V3-FULL', 'mlp'));
+  if (!v3Resumed(resume, 'mlp')) checkpointCategory('mlp', mlp);
+
+  const rmsnorm = v3Resumed(resume, 'rmsnorm')
+    ? (resume!.partial.rmsnorm as V3Result[])
+    : await benchV3RMSNorm(v3Progress(onProgress, 'V3-FULL', 'rmsnorm'));
+  if (!v3Resumed(resume, 'rmsnorm')) checkpointCategory('rmsnorm', rmsnorm);
+
+  const embedding = v3Resumed(resume, 'embedding')
+    ? (resume!.partial.embedding as V3Result[])
+    : await benchV3Embedding(v3Progress(onProgress, 'V3-FULL', 'embedding'));
+  if (!v3Resumed(resume, 'embedding')) checkpointCategory('embedding', embedding);
+
+  const imageOps = v3Resumed(resume, 'imageOps')
+    ? (resume!.partial.imageOps as V3Result[])
+    : await benchV3ImageOps(v3Progress(onProgress, 'V3-FULL', 'imageOps'));
+  if (!v3Resumed(resume, 'imageOps')) checkpointCategory('imageOps', imageOps);
+
+  const vae = v3Resumed(resume, 'vae')
+    ? (resume!.partial.vae as V3Result[])
+    : await benchV3VAE(v3Progress(onProgress, 'V3-FULL', 'vae'));
+  if (!v3Resumed(resume, 'vae')) checkpointCategory('vae', vae);
+
+  const video = v3Resumed(resume, 'video')
+    ? (resume!.partial.video as V3Result[])
+    : await benchV3Video(v3Progress(onProgress, 'V3-FULL', 'video'));
+  if (!v3Resumed(resume, 'video')) checkpointCategory('video', video);
+
+  const memory = v3Resumed(resume, 'memory')
+    ? (resume!.partial.memory as MemResult[])
+    : await benchV3Memory(v3Progress(onProgress, 'V3-FULL', 'memory'));
+  if (!v3Resumed(resume, 'memory')) checkpointCategory('memory', memory);
+
+  const sustained = v3Resumed(resume, 'sustained')
+    ? (resume!.partial.sustained as SustainedResult)
+    : await benchV3Sustained(v3Progress(onProgress, 'V3-FULL', 'sustained'));
+  if (!v3Resumed(resume, 'sustained')) checkpointCategory('sustained', sustained);
+
   const readiness = computeReadiness(matmul, attention, mlp, imageOps, video, memory.map(m => ({ allocated: m.allocated, sizeMB: m.sizeMB })), sustained.dropPct);
   const feasibility = classifyFeasibility(readiness);
   return { matmul, attention, mlp, rmsnorm, embedding, imageOps, vae, video, memory, sustained, readiness, feasibility };
 }
 
-export async function runV3Quick(onProgress?: (msg: string) => void): Promise<V3FullResult> {
+export async function runV3Quick(onProgress?: (msg: string) => void, resume?: ResumeContext): Promise<V3FullResult> {
   onProgress?.('Starting V3 Quick (reduced subset)...');
-  const matmul = (await benchV3Matmul(onProgress)).slice(0, 3);
-  const attention = (await benchV3Attention(onProgress)).slice(0, 3);
-  const mlp = (await benchV3MLP(onProgress)).slice(0, 2);
-  const rmsnorm = (await benchV3RMSNorm(onProgress)).slice(0, 2);
-  const embedding = (await benchV3Embedding(onProgress)).slice(0, 2);
-  const imageOps = (await benchV3ImageOps(onProgress)).slice(0, 3);
-  const vae = (await benchV3VAE(onProgress)).slice(0, 1);
-  const video = (await benchV3Video(onProgress)).slice(0, 2);
-  const memory = await benchV3Memory(onProgress);
-  const sustained = await benchV3Sustained(onProgress);
+  heartbeat({ phase: 'V3:QUICK', category: null, test: 'starting' });
+
+  const matmul = v3Resumed(resume, 'matmul')
+    ? (resume!.partial.matmul as V3Result[])
+    : (await benchV3Matmul(v3Progress(onProgress, 'V3-QUICK', 'matmul'))).slice(0, 3);
+  if (!v3Resumed(resume, 'matmul')) checkpointCategory('matmul', matmul);
+
+  const attention = v3Resumed(resume, 'attention')
+    ? (resume!.partial.attention as V3Result[])
+    : (await benchV3Attention(v3Progress(onProgress, 'V3-QUICK', 'attention'))).slice(0, 3);
+  if (!v3Resumed(resume, 'attention')) checkpointCategory('attention', attention);
+
+  const mlp = v3Resumed(resume, 'mlp')
+    ? (resume!.partial.mlp as V3Result[])
+    : (await benchV3MLP(v3Progress(onProgress, 'V3-QUICK', 'mlp'))).slice(0, 2);
+  if (!v3Resumed(resume, 'mlp')) checkpointCategory('mlp', mlp);
+
+  const rmsnorm = v3Resumed(resume, 'rmsnorm')
+    ? (resume!.partial.rmsnorm as V3Result[])
+    : (await benchV3RMSNorm(v3Progress(onProgress, 'V3-QUICK', 'rmsnorm'))).slice(0, 2);
+  if (!v3Resumed(resume, 'rmsnorm')) checkpointCategory('rmsnorm', rmsnorm);
+
+  const embedding = v3Resumed(resume, 'embedding')
+    ? (resume!.partial.embedding as V3Result[])
+    : (await benchV3Embedding(v3Progress(onProgress, 'V3-QUICK', 'embedding'))).slice(0, 2);
+  if (!v3Resumed(resume, 'embedding')) checkpointCategory('embedding', embedding);
+
+  const imageOps = v3Resumed(resume, 'imageOps')
+    ? (resume!.partial.imageOps as V3Result[])
+    : (await benchV3ImageOps(v3Progress(onProgress, 'V3-QUICK', 'imageOps'))).slice(0, 3);
+  if (!v3Resumed(resume, 'imageOps')) checkpointCategory('imageOps', imageOps);
+
+  const vae = v3Resumed(resume, 'vae')
+    ? (resume!.partial.vae as V3Result[])
+    : (await benchV3VAE(v3Progress(onProgress, 'V3-QUICK', 'vae'))).slice(0, 1);
+  if (!v3Resumed(resume, 'vae')) checkpointCategory('vae', vae);
+
+  const video = v3Resumed(resume, 'video')
+    ? (resume!.partial.video as V3Result[])
+    : (await benchV3Video(v3Progress(onProgress, 'V3-QUICK', 'video'))).slice(0, 2);
+  if (!v3Resumed(resume, 'video')) checkpointCategory('video', video);
+
+  const memory = v3Resumed(resume, 'memory')
+    ? (resume!.partial.memory as MemResult[])
+    : await benchV3Memory(v3Progress(onProgress, 'V3-QUICK', 'memory'));
+  if (!v3Resumed(resume, 'memory')) checkpointCategory('memory', memory);
+
+  const sustained = v3Resumed(resume, 'sustained')
+    ? (resume!.partial.sustained as SustainedResult)
+    : await benchV3Sustained(v3Progress(onProgress, 'V3-QUICK', 'sustained'));
+  if (!v3Resumed(resume, 'sustained')) checkpointCategory('sustained', sustained);
+
   const readiness = computeReadiness(matmul, attention, mlp, imageOps, video, memory.map(m => ({ allocated: m.allocated, sizeMB: m.sizeMB })), sustained.dropPct);
   const feasibility = classifyFeasibility(readiness);
   return { matmul, attention, mlp, rmsnorm, embedding, imageOps, vae, video, memory, sustained, readiness, feasibility };
