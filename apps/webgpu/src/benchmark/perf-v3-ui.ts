@@ -776,11 +776,16 @@ function renderBlockTable(blocks: TransformerBlockResult[]): string {
         <td>${fmtBytesShort(b.fp16Bytes / (1024 * 1024))}</td>
         <td>${fmtBytesShort(b.int8Bytes / (1024 * 1024))}</td>
         <td>${fmtBytesShort(b.int4Bytes / (1024 * 1024))}</td>
-        <td>${b.confidence !== 'UNMEASURABLE' ? b.blockLatencyMs.toFixed(3) + ' ms' : 'UNMEASURABLE'}</td>
+        <td>${b.resourceLimit
+          ? `<span style="color:var(--red)">RESOURCE_LIMIT</span>`
+          : b.confidence !== 'UNMEASURABLE' ? b.blockLatencyMs.toFixed(3) + ' ms' : 'UNMEASURABLE'}</td>
         <td>${confBadge(b.confidence)}</td>
       </tr>`).join('')}
       </tbody>
     </table>
+    ${blocks.some(b => b.resourceLimit)
+      ? `<div style="font-size:11px;color:var(--red);margin-top:4px">${blocks.filter(b => b.resourceLimit).map(b => `${esc(b.config.name)} aborted BEFORE allocation by the safe memory guard: ${esc(b.resourceLimit!.reason)}`).join('<br/>')}</div>`
+      : ''}
     <div style="font-size:11px;color:var(--text-dim);margin-top:6px">Architectural workload simulations — NOT claims that corresponding real models fit.</div>
   </div>`;
 }
@@ -991,7 +996,7 @@ ${mkRows(results.decodeAttention)}
 ## Synthetic Transformer Block (NOT real model benchmarks)
 | class | hidden | intermediate | layers | heads | kvHeads | params | FP16 | INT8 | INT4 | block ms | conf |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-${results.transformerBlocks.map(b => `| ${b.config.name} | ${b.config.hidden} | ${b.config.intermediate} | ${b.config.layers} | ${b.config.heads} | ${b.config.kvHeads} | ${(b.paramCount / 1e6).toFixed(1)}M | ${fmtBytesShort(b.fp16Bytes / (1024 * 1024))} | ${fmtBytesShort(b.int8Bytes / (1024 * 1024))} | ${fmtBytesShort(b.int4Bytes / (1024 * 1024))} | ${b.blockLatencyMs.toFixed(3)} | ${b.confidence} |`).join('\n')}
+${results.transformerBlocks.map(b => `| ${b.config.name} | ${b.config.hidden} | ${b.config.intermediate} | ${b.config.layers} | ${b.config.heads} | ${b.config.kvHeads} | ${(b.paramCount / 1e6).toFixed(1)}M | ${fmtBytesShort(b.fp16Bytes / (1024 * 1024))} | ${fmtBytesShort(b.int8Bytes / (1024 * 1024))} | ${fmtBytesShort(b.int4Bytes / (1024 * 1024))} | ${b.resourceLimit ? 'RESOURCE_LIMIT (aborted before allocation)' : b.blockLatencyMs.toFixed(3)} | ${b.confidence} |`).join('\n')}
 
 ## Token Generation Simulation (SYNTHETIC INFERENCE ESTIMATES)
 | prompt | generate | prefill ms | first token ms | avg decode ms | tokens/sec | total ms |

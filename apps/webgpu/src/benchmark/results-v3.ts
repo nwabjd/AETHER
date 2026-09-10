@@ -82,6 +82,16 @@ export interface TransformerBlockConfig {
   headDim: number;
 }
 
+// Present when a transformer block was aborted BEFORE allocation by the safe
+// 7B memory guard (transformer-guard.ts). NEVER fabricated as a measured
+// result — certification must treat a required block in this state as a
+// failed workload (attempted but not completed).
+export interface TransformerResourceLimit {
+  attempted: boolean;
+  status: 'RESOURCE_LIMIT' | 'UNSUPPORTED';
+  reason: string;
+}
+
 export interface TransformerBlockResult {
   config: TransformerBlockConfig;
   paramCount: number;
@@ -98,6 +108,7 @@ export interface TransformerBlockResult {
   throughput: number | null;
   throughputUnit: string;
   confidence: Confidence;
+  resourceLimit?: TransformerResourceLimit;
 }
 
 export interface TokenGenEstimate {

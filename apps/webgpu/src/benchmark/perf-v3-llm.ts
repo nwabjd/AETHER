@@ -30,6 +30,11 @@ import {
   heartbeat, checkpointCategory, releaseTrackedBuffers, checkResourceFloor, trackBuffer,
 } from './crash-safety.ts';
 import type { ResumeContext } from './crash-safety.ts';
+import {
+  computeParamCount, createDisposableTracker, guardTransformerBlock,
+  buildBlockedTransformerBlock,
+} from './transformer-guard.ts';
+import type { TransformerBlockLimits } from './transformer-guard.ts';
 
 // â”€â”€â”€ WGSL Kernels â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
@@ -431,28 +436,35 @@ const TRANSFORMER_CONFIGS: TransformerBlockConfig[] = [
   { name: '7B', hidden: 2048, intermediate: 8192, layers: 32, heads: 32, kvHeads: 8, headDim: 64 },
 ];
 
-function computeParamCount(cfg: TransformerBlockConfig): { fp16: number; int8: number; int4: number } {
-  const vocab = 32000;
-  const embed = vocab * cfg.hidden;
-  const perLayer =
-    cfg.hidden * cfg.hidden +              // Q projection
-    cfg.hidden * cfg.kvHeads * cfg.headDim + // K projection
-    cfg.hidden * cfg.kvHeads * cfg.headDim + // V projection
-    cfg.hidden * cfg.hidden +              // O projection
-    cfg.hidden * cfg.intermediate +        // MLP up
-    cfg.intermediate * cfg.hidden +        // MLP down
-    cfg.hidden * 2;                         // 2x RMSNorm
-  const total = embed + cfg.layers * perLayer;
-  return { fp16: total * 2, int8: total, int4: Math.ceil(total / 2) };
-}
-
 export async function benchSyntheticTransformerBlock(onProgress?: (msg: string) => void, subset: 'small' | 'full' = 'full'): Promise<TransformerBlockResult[]> {
   const out: TransformerBlockResult[] = [];
   const epsBits = new ArrayBuffer(4); new Float32Array(epsBits)[0] = 1e-6;
   const configs = subset === 'small' ? TRANSFORMER_CONFIGS.slice(0, 2) : TRANSFORMER_CONFIGS;
 
+  // Safe 7B memory guard, evaluated BEFORE any allocation for every config.
+  // The only authoritative per-buffer caps are the device's real limits; total
+  // memory is NOT exposed by WebGPU, so safety is decided by comparing the
+  // workload's actual simultaneously-live device commit against the
+  // conservative per-run suite budget (transformer-guard.ts). A config the
+  // guard rejects is reported as RESOURCE_LIMIT and NEVER measured.
+  const limits: TransformerBlockLimits = {
+    maxBufferSize: dev().limits.maxBufferSize,
+    maxStorageBufferBindingSize: dev().limits.maxStorageBufferBindingSize,
+  };
+
   for (const cfg of configs) {
     onProgress?.(`transformer block ${cfg.name} hidden=${cfg.hidden}`);
+
+    const guard = guardTransformerBlock(cfg, limits);
+    if (!guard.ok) {
+      // Fail closed BEFORE anything dangerous is allocated. The run continues
+      // to token generation / memory ladder / attention / self-audit; the
+      // certification gates see a required block that did NOT run.
+      onProgress?.(`transformer block ${cfg.name} BLOCKED: ${guard.reason}`);
+      out.push(buildBlockedTransformerBlock(cfg, guard.reason!));
+      continue;
+    }
+
     const H = cfg.hidden, I = cfg.intermediate;
     const seq = 1; // single token decode
 
@@ -463,98 +475,103 @@ export async function benchSyntheticTransformerBlock(onProgress?: (msg: string) 
     const geluPipeline = makePipeline(GELU, ['read-only-storage', 'storage']);
     const addPipeline = makePipeline(RESIDUAL_ADD_WGSL, ['read-only-storage', 'read-only-storage', 'storage']);
 
-    // Weight buffers
-    const wNorm1 = new Float32Array(H); wNorm1.fill(1);
-    const wQKV = new Float32Array(H * H * 3); fillRandom(wQKV);
-    const wO = new Float32Array(H * H); fillRandom(wO);
-    const wNorm2 = new Float32Array(H); wNorm2.fill(1);
-    const wUp = new Float32Array(H * I); fillRandom(wUp);
-    const wDown = new Float32Array(I * H); fillRandom(wDown);
+    // Every GPU resource for this block is registered in the tracker and
+    // destroyed in the finally below — even if a later allocation or the
+    // measurement throws mid-block. Previous blocks are always fully released
+    // before the next one starts.
+    const tracked = createDisposableTracker<GPUBuffer>();
+    try {
+      // Weight buffers
+      const wNorm1 = new Float32Array(H); wNorm1.fill(1);
+      const wQKV = new Float32Array(H * H * 3); fillRandom(wQKV);
+      const wO = new Float32Array(H * H); fillRandom(wO);
+      const wNorm2 = new Float32Array(H); wNorm2.fill(1);
+      const wUp = new Float32Array(H * I); fillRandom(wUp);
+      const wDown = new Float32Array(I * H); fillRandom(wDown);
 
-    const bufNorm1W = storageBuf(wNorm1.byteLength, wNorm1);
-    const bufQKVW = storageBuf(wQKV.byteLength, wQKV);
-    const bufOW = storageBuf(wO.byteLength, wO);
-    const bufNorm2W = storageBuf(wNorm2.byteLength, wNorm2);
-    const bufUpW = storageBuf(wUp.byteLength, wUp);
-    const bufDownW = storageBuf(wDown.byteLength, wDown);
+      const bufNorm1W = tracked.create(() => storageBuf(wNorm1.byteLength, wNorm1));
+      const bufQKVW = tracked.create(() => storageBuf(wQKV.byteLength, wQKV));
+      const bufOW = tracked.create(() => storageBuf(wO.byteLength, wO));
+      const bufNorm2W = tracked.create(() => storageBuf(wNorm2.byteLength, wNorm2));
+      const bufUpW = tracked.create(() => storageBuf(wUp.byteLength, wUp));
+      const bufDownW = tracked.create(() => storageBuf(wDown.byteLength, wDown));
 
-    // Activation buffers
-    const input = new Float32Array(seq * H); fillRandom(input);
-    const bufInput = storageBuf(input.byteLength, input);
-    const bufNorm1Out = storageBuf(seq * H * 4);
-    const bufQKVOut = storageBuf(seq * H * 3 * 4);
-    const bufScores = storageBuf(seq * seq * 4);
-    const bufAttnOut = storageBuf(seq * H * 4);
-    const bufProjOut = storageBuf(seq * H * 4);
-    const bufRes1 = storageBuf(seq * H * 4);
-    const bufNorm2Out = storageBuf(seq * H * 4);
-    const bufHidden = storageBuf(seq * I * 4);
-    const bufGeluOut = storageBuf(seq * I * 4);
-    const bufMlpOut = storageBuf(seq * H * 4);
-    const bufOutput = storageBuf(seq * H * 4);
+      // Activation buffers
+      const input = new Float32Array(seq * H); fillRandom(input);
+      const bufInput = tracked.create(() => storageBuf(input.byteLength, input));
+      const bufNorm1Out = tracked.create(() => storageBuf(seq * H * 4));
+      const bufQKVOut = tracked.create(() => storageBuf(seq * H * 3 * 4));
+      const bufScores = tracked.create(() => storageBuf(seq * seq * 4));
+      const bufAttnOut = tracked.create(() => storageBuf(seq * H * 4));
+      const bufProjOut = tracked.create(() => storageBuf(seq * H * 4));
+      const bufRes1 = tracked.create(() => storageBuf(seq * H * 4));
+      const bufNorm2Out = tracked.create(() => storageBuf(seq * H * 4));
+      const bufHidden = tracked.create(() => storageBuf(seq * I * 4));
+      const bufGeluOut = tracked.create(() => storageBuf(seq * I * 4));
+      const bufMlpOut = tracked.create(() => storageBuf(seq * H * 4));
+      const bufOutput = tracked.create(() => storageBuf(seq * H * 4));
 
-    // Uniforms
-    const uRms1 = uniformBuf(new Uint32Array([seq, new Uint32Array(epsBits)[0]]).buffer);
-    const uQKV = uniformBuf(new Uint32Array([seq, H * 3, H]).buffer);
-    const uAttn = uniformBuf(new Float32Array([1, seq, H, 1 / Math.sqrt(H)]).buffer);
-    const uO = uniformBuf(new Uint32Array([seq, H, H]).buffer);
-    const uRms2 = uniformBuf(new Uint32Array([seq, new Uint32Array(epsBits)[0]]).buffer);
-    const uUp = uniformBuf(new Uint32Array([seq, I, H]).buffer);
-    const uDown = uniformBuf(new Uint32Array([seq, H, I]).buffer);
+      // Uniforms
+      const uRms1 = tracked.create(() => uniformBuf(new Uint32Array([seq, new Uint32Array(epsBits)[0]]).buffer));
+      const uQKV = tracked.create(() => uniformBuf(new Uint32Array([seq, H * 3, H]).buffer));
+      const uAttn = tracked.create(() => uniformBuf(new Float32Array([1, seq, H, 1 / Math.sqrt(H)]).buffer));
+      const uO = tracked.create(() => uniformBuf(new Uint32Array([seq, H, H]).buffer));
+      const uRms2 = tracked.create(() => uniformBuf(new Uint32Array([seq, new Uint32Array(epsBits)[0]]).buffer));
+      const uUp = tracked.create(() => uniformBuf(new Uint32Array([seq, I, H]).buffer));
+      const uDown = tracked.create(() => uniformBuf(new Uint32Array([seq, H, I]).buffer));
 
-    // Bind groups
-    const bgRms1 = makeBg(rmsPipeline, ['uniform', 'read-only-storage', 'read-only-storage', 'storage'], [uRms1, bufInput, bufNorm1W, bufNorm1Out]);
-    const bgQKV = makeBg(matPipeline, ['uniform', 'read-only-storage', 'read-only-storage', 'storage'], [uQKV, bufNorm1Out, bufQKVW, bufQKVOut]);
-    const bgAttn = makeBg(attnPipeline, ['uniform', 'read-only-storage', 'storage', 'storage'], [uAttn, bufQKVOut, bufScores, bufAttnOut]);
-    const bgO = makeBg(matPipeline, ['uniform', 'read-only-storage', 'read-only-storage', 'storage'], [uO, bufAttnOut, bufOW, bufProjOut]);
-    const bgAdd1 = makeBg(addPipeline, ['read-only-storage', 'read-only-storage', 'storage'], [bufInput, bufProjOut, bufRes1]);
-    const bgRms2 = makeBg(rmsPipeline, ['uniform', 'read-only-storage', 'read-only-storage', 'storage'], [uRms2, bufRes1, bufNorm2W, bufNorm2Out]);
-    const bgUp = makeBg(matPipeline, ['uniform', 'read-only-storage', 'read-only-storage', 'storage'], [uUp, bufNorm2Out, bufUpW, bufHidden]);
-    const bgGelu = makeBg(geluPipeline, ['read-only-storage', 'storage'], [bufHidden, bufGeluOut]);
-    const bgDown = makeBg(matPipeline, ['uniform', 'read-only-storage', 'read-only-storage', 'storage'], [uDown, bufGeluOut, bufDownW, bufMlpOut]);
-    const bgAdd2 = makeBg(addPipeline, ['read-only-storage', 'read-only-storage', 'storage'], [bufRes1, bufMlpOut, bufOutput]);
+      // Bind groups
+      const bgRms1 = makeBg(rmsPipeline, ['uniform', 'read-only-storage', 'read-only-storage', 'storage'], [uRms1, bufInput, bufNorm1W, bufNorm1Out]);
+      const bgQKV = makeBg(matPipeline, ['uniform', 'read-only-storage', 'read-only-storage', 'storage'], [uQKV, bufNorm1Out, bufQKVW, bufQKVOut]);
+      const bgAttn = makeBg(attnPipeline, ['uniform', 'read-only-storage', 'storage', 'storage'], [uAttn, bufQKVOut, bufScores, bufAttnOut]);
+      const bgO = makeBg(matPipeline, ['uniform', 'read-only-storage', 'read-only-storage', 'storage'], [uO, bufAttnOut, bufOW, bufProjOut]);
+      const bgAdd1 = makeBg(addPipeline, ['read-only-storage', 'read-only-storage', 'storage'], [bufInput, bufProjOut, bufRes1]);
+      const bgRms2 = makeBg(rmsPipeline, ['uniform', 'read-only-storage', 'read-only-storage', 'storage'], [uRms2, bufRes1, bufNorm2W, bufNorm2Out]);
+      const bgUp = makeBg(matPipeline, ['uniform', 'read-only-storage', 'read-only-storage', 'storage'], [uUp, bufNorm2Out, bufUpW, bufHidden]);
+      const bgGelu = makeBg(geluPipeline, ['read-only-storage', 'storage'], [bufHidden, bufGeluOut]);
+      const bgDown = makeBg(matPipeline, ['uniform', 'read-only-storage', 'read-only-storage', 'storage'], [uDown, bufGeluOut, bufDownW, bufMlpOut]);
+      const bgAdd2 = makeBg(addPipeline, ['read-only-storage', 'read-only-storage', 'storage'], [bufRes1, bufMlpOut, bufOutput]);
 
-    const m = await adaptiveMeasure(pass => {
-      pass.setPipeline(rmsPipeline); pass.setBindGroup(0, bgRms1); pass.dispatchWorkgroups(seq, 1, 1);
-      pass.setPipeline(matPipeline); pass.setBindGroup(0, bgQKV); pass.dispatchWorkgroups(seq, Math.ceil(H * 3 / 16), 1);
-      pass.setPipeline(attnPipeline); pass.setBindGroup(0, bgAttn); pass.dispatchWorkgroups(Math.ceil((seq * H) / 64), 1, 1);
-      pass.setPipeline(matPipeline); pass.setBindGroup(0, bgO); pass.dispatchWorkgroups(seq, Math.ceil(H / 16), 1);
-      pass.setPipeline(addPipeline); pass.setBindGroup(0, bgAdd1); pass.dispatchWorkgroups(Math.ceil((seq * H) / 256), 1, 1);
-      pass.setPipeline(rmsPipeline); pass.setBindGroup(0, bgRms2); pass.dispatchWorkgroups(seq, 1, 1);
-      pass.setPipeline(matPipeline); pass.setBindGroup(0, bgUp); pass.dispatchWorkgroups(seq, Math.ceil(I / 16), 1);
-      pass.setPipeline(geluPipeline); pass.setBindGroup(0, bgGelu); pass.dispatchWorkgroups(Math.ceil((seq * I) / 256), 1, 1);
-      pass.setPipeline(matPipeline); pass.setBindGroup(0, bgDown); pass.dispatchWorkgroups(seq, Math.ceil(H / 16), 1);
-      pass.setPipeline(addPipeline); pass.setBindGroup(0, bgAdd2); pass.dispatchWorkgroups(Math.ceil((seq * H) / 256), 1, 1);
-    });
+      const m = await adaptiveMeasure(pass => {
+        pass.setPipeline(rmsPipeline); pass.setBindGroup(0, bgRms1); pass.dispatchWorkgroups(seq, 1, 1);
+        pass.setPipeline(matPipeline); pass.setBindGroup(0, bgQKV); pass.dispatchWorkgroups(seq, Math.ceil(H * 3 / 16), 1);
+        pass.setPipeline(attnPipeline); pass.setBindGroup(0, bgAttn); pass.dispatchWorkgroups(Math.ceil((seq * H) / 64), 1, 1);
+        pass.setPipeline(matPipeline); pass.setBindGroup(0, bgO); pass.dispatchWorkgroups(seq, Math.ceil(H / 16), 1);
+        pass.setPipeline(addPipeline); pass.setBindGroup(0, bgAdd1); pass.dispatchWorkgroups(Math.ceil((seq * H) / 256), 1, 1);
+        pass.setPipeline(rmsPipeline); pass.setBindGroup(0, bgRms2); pass.dispatchWorkgroups(seq, 1, 1);
+        pass.setPipeline(matPipeline); pass.setBindGroup(0, bgUp); pass.dispatchWorkgroups(seq, Math.ceil(I / 16), 1);
+        pass.setPipeline(geluPipeline); pass.setBindGroup(0, bgGelu); pass.dispatchWorkgroups(Math.ceil((seq * I) / 256), 1, 1);
+        pass.setPipeline(matPipeline); pass.setBindGroup(0, bgDown); pass.dispatchWorkgroups(seq, Math.ceil(H / 16), 1);
+        pass.setPipeline(addPipeline); pass.setBindGroup(0, bgAdd2); pass.dispatchWorkgroups(Math.ceil((seq * H) / 256), 1, 1);
+      });
 
-    const params = computeParamCount(cfg);
-    const totalFlops = (2 * H * H * 3 + 6 * H * H + 2 * H * I + 2 * I * H) * m.reps; // Simplified estimation
-    const res = createBenchmarkResult({
-      category: 'LLM_INFERENCE', operation: 'TransformerBlock',
-      workload: cfg.name, shape: `h=${H} i=${I}`,
-      totalMs: m.totalMs, repetitions: m.reps, samples: m.samples.length,
-      medianMs: m.medianMs, p95Ms: m.p95, p99Ms: m.p99,
-      flopsPerExecution: totalFlops / m.reps,
-      bytesPerExecution: 0, opsPerExecution: 0,
-      throughputUnit: 'GFLOPS',
-      correctnessPassed: true,
-    });
+      const params = computeParamCount(cfg);
+      const totalFlops = (2 * H * H * 3 + 6 * H * H + 2 * H * I + 2 * I * H) * m.reps; // Simplified estimation
+      const res = createBenchmarkResult({
+        category: 'LLM_INFERENCE', operation: 'TransformerBlock',
+        workload: cfg.name, shape: `h=${H} i=${I}`,
+        totalMs: m.totalMs, repetitions: m.reps, samples: m.samples.length,
+        medianMs: m.medianMs, p95Ms: m.p95, p99Ms: m.p99,
+        flopsPerExecution: totalFlops / m.reps,
+        bytesPerExecution: 0, opsPerExecution: 0,
+        throughputUnit: 'GFLOPS',
+        correctnessPassed: true,
+      });
 
-    out.push({
-      config: cfg,
-      paramCount: params.fp16 / 2,
-      fp16Bytes: params.fp16,
-      int8Bytes: params.int8,
-      int4Bytes: params.int4,
-      blockLatencyMs: res.totalMs,
-      ...res,
-    });
-
-    bufNorm1W.destroy(); bufQKVW.destroy(); bufOW.destroy(); bufNorm2W.destroy(); bufUpW.destroy(); bufDownW.destroy();
-    bufInput.destroy(); bufNorm1Out.destroy(); bufQKVOut.destroy(); bufScores.destroy(); bufAttnOut.destroy();
-    bufProjOut.destroy(); bufRes1.destroy(); bufNorm2Out.destroy(); bufHidden.destroy(); bufGeluOut.destroy();
-    bufMlpOut.destroy(); bufOutput.destroy();
-    uRms1.destroy(); uQKV.destroy(); uAttn.destroy(); uO.destroy(); uRms2.destroy(); uUp.destroy(); uDown.destroy();
+      out.push({
+        config: cfg,
+        paramCount: params.fp16 / 2,
+        fp16Bytes: params.fp16,
+        int8Bytes: params.int8,
+        int4Bytes: params.int4,
+        blockLatencyMs: res.totalMs,
+        ...res,
+      });
+    } finally {
+      // try/finally — EVERY GPU resource created for THIS block is destroyed
+      // even if the block throws mid-way, and before the next config starts.
+      tracked.release();
+    }
   }
   return out;
 }

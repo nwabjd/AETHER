@@ -37,6 +37,7 @@ export type InterruptionKind =
   | 'APPLICATION_NAVIGATION'           // G
   | 'SERVICE_WORKER_RELOAD'            // H
   | 'PAGE_TERMINATED_OR_BROWSER_RELOADED' // I
+  | 'TRANSFORMER_SUITE_RESOURCE_LIMIT' // K — controlled 7B guard abort, NOT a crash
   | 'UNKNOWN';                         // J
 
 export const INTERRUPTION_KINDS: InterruptionKind[] = [
@@ -49,6 +50,7 @@ export const INTERRUPTION_KINDS: InterruptionKind[] = [
   'APPLICATION_NAVIGATION',
   'SERVICE_WORKER_RELOAD',
   'PAGE_TERMINATED_OR_BROWSER_RELOADED',
+  'TRANSFORMER_SUITE_RESOURCE_LIMIT',
   'UNKNOWN',
 ];
 
@@ -493,6 +495,28 @@ function clearCheckpointStorage(): void {
 
 // ─── Interruption classifier ─────────────────────────────────────────────
 
+interface GuardAbortedBlockInfo {
+  names: string[];
+}
+
+/**
+ * Detect transformer blocks that were aborted BEFORE allocation by the safe
+ * 7B memory guard (transformer-guard.ts). A controlled abort is a distinct,
+ * first-class state — it must NEVER be misreported as a JavaScript exception,
+ * a WebGPU device loss, or a generic page reload.
+ */
+function checkpointGuardAborted(checkpoint: Checkpoint | null): GuardAbortedBlockInfo | null {
+  const blocks = checkpoint?.partialResults?.transformerBlocks;
+  if (!Array.isArray(blocks)) return null;
+  const names = blocks
+    .filter((b: unknown) => {
+      const bd = b as { config?: { name?: unknown }; resourceLimit?: unknown };
+      return !!bd && typeof bd === 'object' && bd.config && typeof bd.config.name === 'string' && !!bd.resourceLimit;
+    })
+    .map((b) => (b as { config: { name: string } }).config.name);
+  return names.length > 0 ? { names } : null;
+}
+
 /**
  * Given a checkpoint (default: the pending one), classify how the previous
  * run ended using the strongest evidence available. If only a RUNNING
@@ -511,6 +535,20 @@ export function classifyInterruption(cp: Checkpoint | null = null): Interruption
       reason: _deviceHealth.reason ?? 'device lost',
       error: _deviceHealth.message ?? null,
       stack: null,
+      at: new Date().toISOString(),
+    };
+  }
+  // DISTINCT controlled-abort classification: the run reached the 7B block,
+  // the guard rejected it before allocation (resourceLimit recorded in the
+  // checkpointed transformerBlocks), and the page later died or was reloaded
+  // before a JavaScript handler could finalize. This is NOT a JS/driver crash.
+  const guardAborted = checkpointGuardAborted(checkpoint);
+  if (guardAborted) {
+    return {
+      kind: 'TRANSFORMER_SUITE_RESOURCE_LIMIT',
+      reason: `Safe 7B memory guard aborted required block(s) ${guardAborted.names.join(', ')} BEFORE allocation (resourceLimit) — a controlled resource-limit abort, NOT a JavaScript exception, device loss, or random page reload. The page then terminated/reloaded before the run could finalize.`,
+      error: err ? err.error : null,
+      stack: err?.stack ?? null,
       at: new Date().toISOString(),
     };
   }

@@ -19,6 +19,7 @@ import {
   type V3Result,
   type LLMGateResult,
   type Confidence,
+  type TransformerResourceLimit,
 } from './results-v3.ts';
 import type { InterruptionInfo } from './crash-safety.ts';
 
@@ -257,13 +258,24 @@ export function computeCertificationGates(
   const blockNames = new Set(gate.transformerBlocks.map(b => b.config.name));
   const missingBlocks = REQUIRED_BLOCKS.filter(n => !blockNames.has(n));
 
+  // Safe 7B memory guard (transformer-guard.ts): a REQUIRED block that was
+  // aborted before allocation (resourceLimit) is NOT a completed workload —
+  // the suite must never certify "complete" when 7B never actually ran. This
+  // is not a benchmark-threshold change; it keeps REQUIRED_BLOCKS untouched.
+  const resourceLimitedRequired = gate.transformerBlocks.filter(
+    b => b.resourceLimit !== undefined && REQUIRED_BLOCKS.includes(b.config.name)
+  );
+
   const genOk = gate.tokenGeneration.length === 3;
-  const llmSuiteComplete: GateStatus = missingCtx.length === 0 && missingPrecision.length === 0 && missingBlocks.length === 0 && genOk ? 'PASS' : 'FAIL';
+  const llmSuiteComplete: GateStatus = missingCtx.length === 0 && missingPrecision.length === 0 && missingBlocks.length === 0 && genOk && resourceLimitedRequired.length === 0 ? 'PASS' : 'FAIL';
   if (llmSuiteComplete === 'FAIL') {
     if (missingCtx.length) reasons.push(`kvCacheDecode missing contexts: ${missingCtx.join(', ')}`);
     if (missingPrecision.length) reasons.push(`precisionMatmul missing: ${missingPrecision.join(', ')}`);
     if (missingBlocks.length) reasons.push(`transformerBlocks missing: ${missingBlocks.join(', ')}`);
     if (!genOk) reasons.push(`tokenGeneration must contain exactly 3 cases`);
+    if (resourceLimitedRequired.length) reasons.push(
+      `transformerBlocks aborted by safe memory guard (attempted:true, status:RESOURCE_LIMIT, certified:false): ${resourceLimitedRequired.map(b => `${b.config.name} — ${b.resourceLimit!.reason}`).join('; ')}`
+    );
   }
 
   const ladder = gate.memoryBudget;
@@ -361,8 +373,10 @@ export interface TransformerBlockExport {
   blockLatencyMs: number;
   estimatedTokensPerSecond: number | null;
   memoryEstimateBytes: number;
-  status: 'MEASURED' | 'UNSUPPORTED';
+  status: 'MEASURED' | 'UNSUPPORTED' | 'RESOURCE_LIMIT';
   notes: string;
+  /** Present when the safe 7B memory guard aborted this block BEFORE allocation. */
+  resourceLimit: TransformerResourceLimit | null;
 }
 
 export interface TokenGenerationExport {
@@ -467,6 +481,11 @@ export function buildLlmInferenceV3113(gate: LLMGateResult): LlmInferenceV3113 {
     const contextLength = 2048;
     const kvCacheBytes = 2 * b.config.layers * b.config.kvHeads * b.config.headDim * contextLength * 4;
     const estTokPerSec = b.blockLatencyMs > 0 ? 1000 / Math.max(b.blockLatencyMs * b.config.layers, 1e-9) : null;
+    const status: TransformerBlockExport['status'] = b.resourceLimit
+      ? 'RESOURCE_LIMIT'
+      : b.blockLatencyMs > 0
+        ? 'MEASURED'
+        : 'UNSUPPORTED';
     return {
       name: b.config.name,
       parameterCount: b.paramCount,
@@ -483,8 +502,11 @@ export function buildLlmInferenceV3113(gate: LLMGateResult): LlmInferenceV3113 {
       blockLatencyMs: b.blockLatencyMs,
       estimatedTokensPerSecond: estTokPerSec !== null ? +estTokPerSec.toFixed(2) : null,
       memoryEstimateBytes: b.int4Bytes + kvCacheBytes,
-      status: b.blockLatencyMs > 0 ? 'MEASURED' : 'UNSUPPORTED',
-      notes: 'SYNTHETIC ARCHITECTURAL MODEL — NOT evidence that the actual named model loads or runs. Representative block workload only.',
+      status,
+      notes: status === 'RESOURCE_LIMIT'
+        ? `ABORTED BEFORE ALLOCATION — ${b.resourceLimit!.reason}`
+        : 'SYNTHETIC ARCHITECTURAL MODEL — NOT evidence that the actual named model loads or runs. Representative block workload only.',
+      resourceLimit: b.resourceLimit ?? null,
     };
   });
 
@@ -588,6 +610,11 @@ export function runSelfAuditV3113(llm: LlmInferenceV3113 | null, timerResolution
   add(12, 'timer resolution recorded', Number.isFinite(timerResolutionMs) && timerResolutionMs > 0, `timerResolutionMs=${timerResolutionMs}`);
   add(13, 'certification gates present', true, 'timingIntegrity/throughputIntegrity/correctnessIntegrity/llmSuiteComplete/memorySuiteComplete computed in computeCertificationGates');
   add(14, 'overallCertified false if any mandatory test missing', true, 'computed in computeCertificationGates');
+
+  const rlRequired = llm.transformerBlocks.filter(b => b.resourceLimit && REQUIRED_BLOCKS.includes(b.name));
+  add(15, 'required transformer blocks not aborted by safe memory guard', rlRequired.length === 0, rlRequired.length === 0
+    ? 'none (all required blocks actually executed)'
+    : `RESOURCE_LIMIT (attempted:true, certified:false): ${rlRequired.map(b => `${b.name} — ${b.resourceLimit!.reason}`).join('; ')}`);
 
   return { ok: failures.length === 0, checks, failures };
 }

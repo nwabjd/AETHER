@@ -670,6 +670,7 @@ import {
   trackBuffer, releaseTrackedBuffers, trackedBufferCount,
   deviceMaxBufferBytes, effectiveMaxBufferBytes, checkResourceFloor,
   installGlobalErrorCapture, setStorageForTests, resetForTests,
+  INTERRUPTION_KINDS,
 } from '../src/benchmark/crash-safety.ts';
 import { finalizeCertificationWithInterruption } from '../src/benchmark/v3113.ts';
 import type { V3Result, LLMGateResult, LLMReadiness } from '../src/benchmark/results-v3.ts';
@@ -1254,4 +1255,198 @@ test('ST16 (V3.1.3): check #7 rejects malformed model names and fails certificat
   assert.equal(r.checkPass, false, r.detail);
   assert.equal(r.auditOk, false);
   assert.equal(r.certificationStatus, 'FAILED');
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// V3.1.3 TEST SET SG — SAFE 7B MEMORY GUARD
+// Pins the fail-closed guard: real estimates, no fake 7B numbers, no
+// exceptions, finally-based GPU cleanup, 7B kept in the required suite, and
+// certification held false when the guard rejects the mandatory 7B block.
+// ═══════════════════════════════════════════════════════════════════════════
+
+import {
+  guardTransformerBlock, estimateTransformerBlockMemory, buildBlockedTransformerBlock,
+  createDisposableTracker, computeParamCount, TRANSFORMER_SUITE_SAFE_COMMIT_BYTES,
+} from '../src/benchmark/transformer-guard.ts';
+import { buildLlmInferenceV3113, runSelfAuditV3113 } from '../src/benchmark/v3113.ts';
+import type { TransformerBlockConfig } from '../src/benchmark/results-v3.ts';
+
+const BLOCK_7B: TransformerBlockConfig = { name: '7B', hidden: 2048, intermediate: 8192, layers: 32, heads: 32, kvHeads: 8, headDim: 64 };
+const GUARD_7B_REASON = '7B transformer workload exceeds safe browser memory budget on this device';
+
+const IPHONE_LIMITS = { maxBufferSize: 256 * 1024 * 1024, maxStorageBufferBindingSize: 128 * 1024 * 1024 };
+
+function fullGateWith7BRejected(): { stages: LLMDiagnosticStage[]; gate: LLMGateResult } {
+  resetForTests();
+  const stages = fullStages();
+  const tb = stages.find(s => s.name === 'transformerBlocks')!;
+  tb.items = ['0.5B', '1B', '1.5B', '3B'].map(stagedBlock).concat([buildBlockedTransformerBlock(BLOCK_7B, GUARD_7B_REASON)]);
+  const gate = assembleLLMGateFromStages(stages)!;
+  return { stages, gate };
+}
+
+function fullGateWith7BMeasured(): { stages: LLMDiagnosticStage[]; gate: LLMGateResult } {
+  resetForTests();
+  const stages = fullStages();
+  const gate = assembleLLMGateFromStages(stages)!;
+  return { stages, gate };
+}
+
+test('ST17 (V3.1.3): safe allocation path — 0.5B–3B pass the guard, 7B is rejected before allocation', () => {
+  const sizes: TransformerBlockConfig[] = [
+    { name: '0.5B', hidden: 512, intermediate: 2048, layers: 12, heads: 8, kvHeads: 2, headDim: 64 },
+    { name: '1B', hidden: 768, intermediate: 3072, layers: 12, heads: 12, kvHeads: 4, headDim: 64 },
+    { name: '1.5B', hidden: 768, intermediate: 3072, layers: 24, heads: 12, kvHeads: 4, headDim: 64 },
+    { name: '3B', hidden: 1024, intermediate: 4096, layers: 24, heads: 16, kvHeads: 8, headDim: 64 },
+  ];
+  for (const cfg of sizes) {
+    const g = guardTransformerBlock(cfg, IPHONE_LIMITS);
+    assert.equal(g.ok, true, `${cfg.name} should run: ${g.reason}`);
+    assert.equal(g.reason, null);
+    assert.ok(g.estimate.deviceCommitBytes <= TRANSFORMER_SUITE_SAFE_COMMIT_BYTES);
+    assert.ok(g.estimate.deviceCommitBytes > 0 && g.estimate.hostCommitBytes > 0 && g.estimate.largestBufferBytes > 0);
+  }
+  const g7 = guardTransformerBlock(BLOCK_7B, IPHONE_LIMITS);
+  assert.equal(g7.ok, false, '7B must be rejected on iPhone-class limits');
+  assert.ok(g7.reason!.includes('exceeds safe browser memory budget'));
+});
+
+test('ST18 (V3.1.3): 7B rejected — estimate ≈192 MiB live, NEVER claimed safe from maxBufferSize', () => {
+  const est = estimateTransformerBlockMemory(BLOCK_7B);
+  assert.ok(est.deviceCommitBytes > 128 * 1024 * 1024 && est.deviceCommitBytes < 256 * 1024 * 1024,
+    `7B live GPU commit must be ~192 MiB, got ${est.deviceCommitBytes}`);
+  assert.equal(est.largestBufferBytes, 64 * 1024 * 1024, 'largest single 7B weight buffer is exactly 64 MiB');
+  // Even a desktop-class buffer cap does NOT make 7B "safe": maxBufferSize is
+  // per-buffer, not total memory. The budget is workload-specific.
+  const giant = guardTransformerBlock(BLOCK_7B, { maxBufferSize: 2 * 1024 * 1024 * 1024, maxStorageBufferBindingSize: 2 * 1024 * 1024 * 1024 });
+  assert.equal(giant.ok, false, '7B stays rejected even when maxBufferSize is huge');
+  // Per-buffer caps still matter independently: a small-buffer device must be
+  // stopped by the maxBufferSize check regardless of the budget.
+  const tiny = guardTransformerBlock(BLOCK_7B, { maxBufferSize: 32 * 1024 * 1024 });
+  assert.equal(tiny.ok, false);
+  assert.ok(tiny.reason!.includes('maxBufferSize'));
+});
+
+test('ST19 (V3.1.3): resource-limit result is NOT PASS and flows as RESOURCE_LIMIT through the export', () => {
+  const b = buildBlockedTransformerBlock(BLOCK_7B, GUARD_7B_REASON);
+  assert.ok(b.resourceLimit);
+  assert.equal(b.resourceLimit!.status, 'RESOURCE_LIMIT');
+  assert.equal(b.resourceLimit!.attempted, true);
+  assert.notEqual(b.resourceLimit!.status, 'UNSUPPORTED', 'a guard abort is RESOURCE_LIMIT, not a generic UNSUPPORTED');
+  assert.equal(b.blockLatencyMs, 0, 'blocked blocks never carry a fabricated latency');
+  const { gate } = fullGateWith7BRejected();
+  const tb = buildLlmInferenceV3113(gate).transformerBlocks.find(x => x.name === '7B')!;
+  assert.equal(tb.status, 'RESOURCE_LIMIT', 'export must say RESOURCE_LIMIT, never MEASURED');
+  assert.ok(tb.resourceLimit && tb.resourceLimit.attempted === true && tb.resourceLimit.reason.length > 0);
+});
+
+test('ST20 (V3.1.3): 7B resource-limit path does not throw (guide, gate, audit, export)', () => {
+  assert.doesNotThrow(() => buildBlockedTransformerBlock(BLOCK_7B, GUARD_7B_REASON));
+  const { stages, gate } = fullGateWith7BRejected();
+  assert.doesNotThrow(() => computeCertificationGates(gate));
+  assert.doesNotThrow(() => buildLlmInferenceV3113(gate));
+  const llmV = buildLlmInferenceV3113(gate);
+  assert.doesNotThrow(() => runSelfAuditV3113(llmV, 1));
+  assert.doesNotThrow(() => buildStagedDiagnosticExport(stages, gate, stagedEnv, { buildId: 'rl-no-throw' }));
+});
+
+test('ST21 (V3.1.3): every GPU resource is destroyed in finally even when a later allocation throws', () => {
+  const destroyed: string[] = [];
+  const t = createDisposableTracker<{ destroy(): void }>();
+  assert.throws(() => {
+    t.create(() => ({ destroy: () => destroyed.push('wNorm1') }));
+    t.create(() => ({ destroy: () => destroyed.push('wQKV') }));
+    t.create(() => { throw new Error('mid-allocation OOM'); });
+  }, /mid-allocation/);
+  assert.equal(t.alive, 2, 'only successfully created resources remain tracked');
+  t.release(); // what the bench does in its finally block
+  assert.deepEqual(destroyed.sort(), ['wNorm1', 'wQKV'], 'finally destroys every created resource');
+  assert.equal(t.alive, 0);
+});
+
+test('ST22 (V3.1.3): rejected 7B remains in the required suite (not dropped, not skipped)', () => {
+  const { stages, gate } = fullGateWith7BRejected();
+  const report = buildStagedDiagnosticExport(stages, gate, stagedEnv, { buildId: 'rl-suite' });
+  const names = report.payload.results.llmInference!.transformerBlocks.map(b => b.name);
+  assert.deepEqual(names.sort((a, b) => Number.parseFloat(a) - Number.parseFloat(b)), ['0.5B', '1B', '1.5B', '3B', '7B'],
+    '7B must still be present in the required suite');
+  const check7 = report.postExportAudit!.checks.find(c => c.id === 7)!;
+  assert.equal(check7.pass, true, 'check #7 (exact required names) still passes with rejected 7B present');
+  const check15 = report.postExportAudit!.checks.find(c => c.id === 15)!;
+  assert.equal(check15.pass, false, 'check #15 flags the required block aborted by the memory guard');
+});
+
+test('ST23 (V3.1.3): certification remains false when mandatory 7B is RESOURCE_LIMIT', () => {
+  const { gate } = fullGateWith7BRejected();
+  const gates = computeCertificationGates(gate);
+  assert.equal(gates.llmSuiteComplete, 'FAIL');
+  assert.equal(gates.overallCertified, false);
+  assert.notEqual(gates.certificationStatus, 'CERTIFIED');
+  assert.ok(gates.reasons.some(r => r.includes('RESOURCE_LIMIT')), gates.reasons.join('; '));
+  const rl = gate.transformerBlocks.find(b => b.config.name === '7B')!;
+  assert.equal(rl.resourceLimit!.attempted, true);
+  assert.equal(rl.resourceLimit!.status, 'RESOURCE_LIMIT');
+  // Control: with a measured 7B the same fixture certifies.
+  const { gate: gateOk } = fullGateWith7BMeasured();
+  const gatesOk = computeCertificationGates(gateOk);
+  assert.equal(gatesOk.llmSuiteComplete, 'PASS');
+  assert.equal(gatesOk.overallCertified, true);
+});
+
+test('ST24 (V3.1.3): no fake performance number is emitted for a rejected 7B', () => {
+  const b = buildBlockedTransformerBlock(BLOCK_7B, GUARD_7B_REASON);
+  assert.equal(b.blockLatencyMs, 0);
+  assert.equal(b.totalMs, 0);
+  assert.equal(b.estimatedPerOperationMs, 0);
+  assert.equal(b.throughput, null);
+  assert.equal(b.confidence, 'UNMEASURABLE');
+  assert.equal(b.workUnit, 'NONE');
+  assert.equal(b.repetitions, 1);
+  const { stages, gate } = fullGateWith7BRejected();
+  const report = buildStagedDiagnosticExport(stages, gate, stagedEnv, { buildId: 'rl-nofake' });
+  const parsed = JSON.parse(report.json) as {
+    results: { llmInference: { transformerBlocks: { name: string; status: string; blockLatencyMs: number; estimatedTokensPerSecond: number | null }[] } };
+  };
+  const row = parsed.results.llmInference.transformerBlocks.find(x => x.name === '7B')!;
+  assert.equal(row.status, 'RESOURCE_LIMIT');
+  assert.equal(row.blockLatencyMs, 0);
+  assert.equal(row.estimatedTokensPerSecond, null);
+  assert.equal(report.overallCertified, false);
+});
+
+test('ST25 (V3.1.3): controlled 7B guard abort is distinguishable from every crash kind', () => {
+  const guardKind = 'TRANSFORMER_SUITE_RESOURCE_LIMIT' as const;
+  assert.ok(INTERRUPTION_KINDS.includes(guardKind), 'new kind is a registered, first-class classification');
+  for (const other of ['JAVASCRIPT_EXCEPTION', 'UNHANDLED_REJECTION', 'WEBGPU_DEVICE_LOST', 'GPU_VALIDATION_ERROR', 'RESOURCE_LIMIT', 'MEMORY_LIMIT', 'APPLICATION_NAVIGATION', 'SERVICE_WORKER_RELOAD', 'PAGE_TERMINATED_OR_BROWSER_RELOADED', 'UNKNOWN']) {
+    assert.notEqual(guardKind, other, `must be distinguishable from ${other}`);
+  }
+
+  // A surviving checkpoint whose transformerBlocks record a guard abort is
+  // classified as the controlled abort — NOT PAGE_TERMINATED_OR_BROWSER_RELOADED.
+  resetForTests();
+  setStorageForTests(memStorage());
+  beginBenchmark('V3.1', 'full', undefined, 'testbuild');
+  checkpointCategory('transformerBlocks', [buildBlockedTransformerBlock(BLOCK_7B, GUARD_7B_REASON)]);
+  const aborted = classifyInterruption();
+  assert.equal(aborted.kind, 'TRANSFORMER_SUITE_RESOURCE_LIMIT');
+  assert.notEqual(aborted.kind, 'PAGE_TERMINATED_OR_BROWSER_RELOADED');
+  assert.notEqual(aborted.kind, 'JAVASCRIPT_EXCEPTION');
+  assert.ok(aborted.reason.includes('NOT a JavaScript exception'));
+
+  // Control: the same RUNNING checkpoint WITHOUT a guard abort classifies as
+  // the pre-existing page-termination kind.
+  resetForTests();
+  setStorageForTests(memStorage());
+  beginBenchmark('V3.1', 'full', undefined, 'testbuild');
+  checkpointCategory('transformerBlocks', [stagedBlock('7B')]);
+  const reload = classifyInterruption();
+  assert.equal(reload.kind, 'PAGE_TERMINATED_OR_BROWSER_RELOADED');
+});
+
+test('SG: computeParamCount kept verbatim — 7B slot pins exact pre-refactor values', () => {
+  const p = computeParamCount(BLOCK_7B);
+  assert.deepEqual(p, { fp16: 2_949_906_432, int8: 1_474_953_216, int4: 737_476_608 },
+    'param math must be byte-for-byte identical to the pre-refactor bench formula');
+  assert.equal(p.fp16, p.int8 * 2);
+  assert.equal(Math.ceil(p.int8 / 2), p.int4);
 });
