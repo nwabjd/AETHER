@@ -1095,19 +1095,18 @@ test('ST6 (V3.1.3): post-serialization audit path executes over parsed JSON (dat
   // embedded in the payload. Its checks always execute.
   assert.ok(report.postExportAudit && Array.isArray(report.postExportAudit.checks) && report.postExportAudit.checks.length > 0);
   assert.equal(typeof report.payload.postExportAudit.ok, 'boolean');
-  // Audit check #7 compares transformerBlocks names.sort() against the literal
-  // [0.5B,1B,1.5B,3B,7B], but lexicographic sort of the real names yields
-  // [0.5B,1.5B,1B,...] — so no real gate can pass #7 (pre-existing audit order
-  // quirk). We keep the audit authoritative and assert the export is honest:
-  assert.equal(report.postExportAudit.ok, false);
-  assert.ok(report.postExportAudit.failures.some(f => f.includes('#7 transformerBlocks')));
-  // A failed post-export audit MUST flip certification to FAILED.
-  assert.equal(report.certificationStatus, 'FAILED');
-  assert.equal(report.overallCertified, false);
+  // A data-complete suite MUST pass every audit check (#7 now uses numeric
+  // ordering, so the five transformer sizes in any input order are accepted)
+  // and certify end-to-end:
+  assert.equal(report.postExportAudit.ok, true, report.postExportAudit.failures.join('; '));
+  assert.ok(report.postExportAudit.failures.length === 0);
+  assert.ok(report.postExportAudit.checks.some(c => c.id === 7 && c.pass === true), 'check #7 must pass for the complete five-model suite');
+  assert.equal(report.certificationStatus, 'CERTIFIED');
+  assert.equal(report.overallCertified, true);
   const roundTrip = JSON.parse(report.json) as any;
   assert.equal(roundTrip.postExportAudit.ok, report.postExportAudit.ok);
-  assert.equal(roundTrip.certification.certificationStatus, 'FAILED');
-  assert.ok(roundTrip.certification.reasons.some((r: string) => r.includes('postExportAudit FAILED')));
+  assert.equal(roundTrip.certification.certificationStatus, 'CERTIFIED');
+  assert.ok(!roundTrip.certification.reasons.some((r: string) => r.includes('postExportAudit FAILED')));
 });
 
 test('ST7 (V3.1.3): staged subset fails audit → certificationStatus FAILED with reason', () => {
@@ -1203,4 +1202,56 @@ test('ST12 (V3.1.3): device lost during staged run → export shows deviceLost a
   assert.equal(report.payload.crashSafety.interrupted, true);
   assert.equal(report.certificationStatus, 'FAILED');
   assert.equal(report.overallCertified, false);
+});
+
+// ─── ST13–ST16: self-audit check #7 transformer-suite ordering ───────────────
+// check #7 must require EXACTLY {0.5B, 1B, 1.5B, 3B, 7B} regardless of input
+// order, using numeric (semantic) ordering instead of JS lexicographic sort,
+// and must reject missing / extra / duplicate / malformed names.
+
+function check7ForBlocks(blockNames: string[]) {
+  resetForTests();
+  const stages = fullStages();
+  const tb = stages.find(s => s.name === 'transformerBlocks')!;
+  tb.items = blockNames.map(n => stagedBlock(n));
+  const gate = assembleLLMGateFromStages(stages)!;
+  const report = buildStagedDiagnosticExport(stages, gate, stagedEnv, { buildId: 'blocks' });
+  const check = report.postExportAudit!.checks.find(c => c.id === 7)!;
+  return {
+    checkPass: check.pass,
+    detail: check.detail,
+    auditOk: report.postExportAudit!.ok,
+    certificationStatus: report.certificationStatus,
+  };
+}
+
+test('ST13 (V3.1.3): check #7 passes for the complete five-model suite in canonical order', () => {
+  const r = check7ForBlocks(['0.5B', '1B', '1.5B', '3B', '7B']);
+  assert.equal(r.checkPass, true, r.detail);
+  assert.equal(r.auditOk, true);
+  assert.equal(r.certificationStatus, 'CERTIFIED');
+});
+
+test('ST13b (V3.1.3): check #7 passes for the five names in reverse order', () => {
+  const r = check7ForBlocks(['7B', '3B', '1.5B', '1B', '0.5B']);
+  assert.equal(r.checkPass, true, r.detail);
+  assert.equal(r.auditOk, true);
+  assert.equal(r.certificationStatus, 'CERTIFIED');
+});
+
+test('ST14 (V3.1.3): check #7 rejects a missing transformer size', () => {
+  assert.equal(check7ForBlocks(['0.5B', '1B', '3B', '7B']).checkPass, false, 'missing 1.5B must fail');
+  assert.equal(check7ForBlocks(['0.5B', '1B', '1.5B', '3B']).checkPass, false, 'missing 7B must fail');
+});
+
+test('ST15 (V3.1.3): check #7 rejects extra and duplicate model sizes', () => {
+  assert.equal(check7ForBlocks(['0.5B', '1B', '1.5B', '3B', '7B', '10B']).checkPass, false, 'extra 10B must fail');
+  assert.equal(check7ForBlocks(['0.5B', '1B', '1B', '3B', '7B']).checkPass, false, 'duplicate 1B / missing 1.5B must fail');
+});
+
+test('ST16 (V3.1.3): check #7 rejects malformed model names and fails certification closed', () => {
+  const r = check7ForBlocks(['0.5B', '1B', '1.5B', '3B', 'foo']);
+  assert.equal(r.checkPass, false, r.detail);
+  assert.equal(r.auditOk, false);
+  assert.equal(r.certificationStatus, 'FAILED');
 });

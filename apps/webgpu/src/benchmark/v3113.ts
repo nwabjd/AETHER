@@ -563,7 +563,15 @@ export function runSelfAuditV3113(llm: LlmInferenceV3113 | null, timerResolution
   add(6, 'KV correctness checked for 128,512,1024', kvChecked.length === 3 && kvChecked.every(c => c.correctnessPassed), `checked=${kvChecked.length}, passed=${kvChecked.filter(c => c.correctnessPassed).length}`);
 
   const names = llm.transformerBlocks.map(b => b.name);
-  add(7, 'transformerBlocks include 0.5B,1B,1.5B,3B,7B', JSON.stringify(names.sort()) === JSON.stringify(['0.5B', '1B', '1.5B', '3B', '7B']), `names=${JSON.stringify(names)}`);
+  // Deterministic semantic ordering: JS lexicographic sort puts '1.5B' before
+  // '1B', so compare the uniform-scaled sizes numerically instead of via
+  // names.sort(). The exact-set equality still rejects missing, extra,
+  // duplicate, and malformed names.
+  const ordered = names
+    .map(name => ({ name, value: Number.parseFloat(name) }))
+    .sort((a, b) => a.value - b.value)
+    .map(x => x.name);
+  add(7, 'transformerBlocks include 0.5B,1B,1.5B,3B,7B', JSON.stringify(ordered) === JSON.stringify(REQUIRED_BLOCKS), `names=${JSON.stringify(names)}`);
 
   const gen = llm.tokenGeneration.map(t => `${t.prompt}->${t.generate}`);
   add(8, 'tokenGeneration contains 128->32, 256->64, 512->64', JSON.stringify(gen.sort()) === JSON.stringify(['128->32', '256->64', '512->64']), `cases=${JSON.stringify(gen)}`);
