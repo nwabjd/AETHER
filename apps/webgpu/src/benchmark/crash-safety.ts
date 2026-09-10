@@ -37,7 +37,7 @@ export type InterruptionKind =
   | 'APPLICATION_NAVIGATION'           // G
   | 'SERVICE_WORKER_RELOAD'            // H
   | 'PAGE_TERMINATED_OR_BROWSER_RELOADED' // I
-  | 'TRANSFORMER_SUITE_RESOURCE_LIMIT' // K — controlled 7B guard abort, NOT a crash
+  | 'TRANSFORMER_SUITE_RESOURCE_LIMIT' // K — controlled guard abort, NOT a crash
   | 'UNKNOWN';                         // J
 
 export const INTERRUPTION_KINDS: InterruptionKind[] = [
@@ -501,9 +501,9 @@ interface GuardAbortedBlockInfo {
 
 /**
  * Detect transformer blocks that were aborted BEFORE allocation by the safe
- * 7B memory guard (transformer-guard.ts). A controlled abort is a distinct,
- * first-class state — it must NEVER be misreported as a JavaScript exception,
- * a WebGPU device loss, or a generic page reload.
+ * transformer memory guard (transformer-guard.ts). A controlled abort is a
+ * distinct, first-class state — it must NEVER be misreported as a JavaScript
+ * exception, a WebGPU device loss, or a generic page reload.
  */
 function checkpointGuardAborted(checkpoint: Checkpoint | null): GuardAbortedBlockInfo | null {
   const blocks = checkpoint?.partialResults?.transformerBlocks;
@@ -546,7 +546,7 @@ export function classifyInterruption(cp: Checkpoint | null = null): Interruption
   if (guardAborted) {
     return {
       kind: 'TRANSFORMER_SUITE_RESOURCE_LIMIT',
-      reason: `Safe 7B memory guard aborted required block(s) ${guardAborted.names.join(', ')} BEFORE allocation (resourceLimit) — a controlled resource-limit abort, NOT a JavaScript exception, device loss, or random page reload. The page then terminated/reloaded before the run could finalize.`,
+      reason: `Safe transformer memory guard aborted required block(s) ${guardAborted.names.join(', ')} BEFORE allocation (resourceLimit) — a controlled resource-limit abort, NOT a JavaScript exception, device loss, or random page reload. The page then terminated/reloaded before the run could finalize.`,
       error: err ? err.error : null,
       stack: err?.stack ?? null,
       at: new Date().toISOString(),

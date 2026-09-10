@@ -1258,29 +1258,62 @@ test('ST16 (V3.1.3): check #7 rejects malformed model names and fails certificat
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-// V3.1.3 TEST SET SG — SAFE 7B MEMORY GUARD
-// Pins the fail-closed guard: real estimates, no fake 7B numbers, no
-// exceptions, finally-based GPU cleanup, 7B kept in the required suite, and
-// certification held false when the guard rejects the mandatory 7B block.
+// V3.1.3 TEST SET SG — SAFE TRANSFORMER MEMORY GUARD (TOTAL TRANSIENT)
+// Pins the fail-closed guard: real estimates covering GPU + host + staging,
+// no fake blocked numbers, no exceptions, finally-based GPU cleanup, 3B AND 7B
+// kept in the required suite, and certification held false when the guard
+// rejects any mandatory block. Evidence-based budget — NOT maxBufferSize.
 // ═══════════════════════════════════════════════════════════════════════════
 
 import {
   guardTransformerBlock, estimateTransformerBlockMemory, buildBlockedTransformerBlock,
-  createDisposableTracker, computeParamCount, TRANSFORMER_SUITE_SAFE_COMMIT_BYTES,
+  createDisposableTracker, computeParamCount, withLocalWeightHost,
+  TRANSFORMER_SUITE_SAFE_COMMIT_BYTES, TRANSFORMER_SUITE_SAFE_BROWSER_TRANSIENT_BYTES,
 } from '../src/benchmark/transformer-guard.ts';
 import { buildLlmInferenceV3113, runSelfAuditV3113 } from '../src/benchmark/v3113.ts';
 import type { TransformerBlockConfig } from '../src/benchmark/results-v3.ts';
 
+const CFG_05: TransformerBlockConfig = { name: '0.5B', hidden: 512, intermediate: 2048, layers: 12, heads: 8, kvHeads: 2, headDim: 64 };
+const CFG_1: TransformerBlockConfig = { name: '1B', hidden: 768, intermediate: 3072, layers: 12, heads: 12, kvHeads: 4, headDim: 64 };
+const CFG_15: TransformerBlockConfig = { name: '1.5B', hidden: 768, intermediate: 3072, layers: 24, heads: 12, kvHeads: 4, headDim: 64 };
+const BLOCK_3B: TransformerBlockConfig = { name: '3B', hidden: 1024, intermediate: 4096, layers: 24, heads: 16, kvHeads: 8, headDim: 64 };
 const BLOCK_7B: TransformerBlockConfig = { name: '7B', hidden: 2048, intermediate: 8192, layers: 32, heads: 32, kvHeads: 8, headDim: 64 };
+const BLOCK_3B_REASON = '3B transformer workload exceeds safe browser memory budget on this device';
 const GUARD_7B_REASON = '7B transformer workload exceeds safe browser memory budget on this device';
 
 const IPHONE_LIMITS = { maxBufferSize: 256 * 1024 * 1024, maxStorageBufferBindingSize: 128 * 1024 * 1024 };
+
+// Exact total-transient accounting (transformer-guard.ts: FP32, seq=1).
+// estimatedBrowserTransientBytes = estimatedGpuBytes + estimatedHostBytes
+// + estimatedStagingBytes. Pins the corrected model (this is what found the
+// 3B reload: the old guard counted only the ~48 MiB GPU commit, not host
+// mirrors + staging).
+const TMT = {
+  budgetBytes: 64 * 1024 * 1024,
+  c05: { gpu: 12_625_924, largest: 4_194_304, transient: 21_014_532 },
+  c1: { gpu: 28_376_068, largest: 9_437_184, transient: 47_250_436 },
+  c3: { gpu: 50_417_668, largest: 16_777_216, staging: 16_777_216, host: 16_777_216, hostRetainedLegacy: 50_343_936, transient: 83_972_100 },
+  c7: { gpu: 201_498_628, largest: 67_108_864, transient: 335_716_356 },
+};
 
 function fullGateWith7BRejected(): { stages: LLMDiagnosticStage[]; gate: LLMGateResult } {
   resetForTests();
   const stages = fullStages();
   const tb = stages.find(s => s.name === 'transformerBlocks')!;
   tb.items = ['0.5B', '1B', '1.5B', '3B'].map(stagedBlock).concat([buildBlockedTransformerBlock(BLOCK_7B, GUARD_7B_REASON)]);
+  const gate = assembleLLMGateFromStages(stages)!;
+  return { stages, gate };
+}
+
+// Reference fixture for the corrected guard: ONLY 0.5B/1B/1.5B may run; 3B and
+// 7B are both RESOURCE_LIMIT before allocation (3B was the Safari reload point).
+function fullGateWith3B7BRejected(): { stages: LLMDiagnosticStage[]; gate: LLMGateResult } {
+  resetForTests();
+  const stages = fullStages();
+  const tb = stages.find(s => s.name === 'transformerBlocks')!;
+  tb.items = ['0.5B', '1B', '1.5B'].map(stagedBlock)
+    .concat([buildBlockedTransformerBlock(BLOCK_3B, BLOCK_3B_REASON)])
+    .concat([buildBlockedTransformerBlock(BLOCK_7B, GUARD_7B_REASON)]);
   const gate = assembleLLMGateFromStages(stages)!;
   return { stages, gate };
 }
@@ -1292,23 +1325,25 @@ function fullGateWith7BMeasured(): { stages: LLMDiagnosticStage[]; gate: LLMGate
   return { stages, gate };
 }
 
-test('ST17 (V3.1.3): safe allocation path — 0.5B–3B pass the guard, 7B is rejected before allocation', () => {
-  const sizes: TransformerBlockConfig[] = [
-    { name: '0.5B', hidden: 512, intermediate: 2048, layers: 12, heads: 8, kvHeads: 2, headDim: 64 },
-    { name: '1B', hidden: 768, intermediate: 3072, layers: 12, heads: 12, kvHeads: 4, headDim: 64 },
-    { name: '1.5B', hidden: 768, intermediate: 3072, layers: 24, heads: 12, kvHeads: 4, headDim: 64 },
-    { name: '3B', hidden: 1024, intermediate: 4096, layers: 24, heads: 16, kvHeads: 8, headDim: 64 },
-  ];
-  for (const cfg of sizes) {
+test('ST17 (V3.1.3): safe allocation path — 0.5B/1B/1.5B run; 3B and 7B rejected before allocation', () => {
+  const safe: TransformerBlockConfig[] = [CFG_05, CFG_1, CFG_15];
+  for (const cfg of safe) {
     const g = guardTransformerBlock(cfg, IPHONE_LIMITS);
     assert.equal(g.ok, true, `${cfg.name} should run: ${g.reason}`);
     assert.equal(g.reason, null);
     assert.ok(g.estimate.deviceCommitBytes <= TRANSFORMER_SUITE_SAFE_COMMIT_BYTES);
+    assert.ok(g.estimate.estimatedBrowserTransientBytes <= TRANSFORMER_SUITE_SAFE_BROWSER_TRANSIENT_BYTES);
     assert.ok(g.estimate.deviceCommitBytes > 0 && g.estimate.hostCommitBytes > 0 && g.estimate.largestBufferBytes > 0);
   }
-  const g7 = guardTransformerBlock(BLOCK_7B, IPHONE_LIMITS);
-  assert.equal(g7.ok, false, '7B must be rejected on iPhone-class limits');
-  assert.ok(g7.reason!.includes('exceeds safe browser memory budget'));
+  // Corrected total-transient accounting rejects 3B (≈80 MiB transient was the
+  // Safari reload point) and 7B (≈320 MiB) BEFORE any allocation.
+  for (const cfg of [BLOCK_3B, BLOCK_7B]) {
+    const g = guardTransformerBlock(cfg, IPHONE_LIMITS);
+    assert.equal(g.ok, false, `${cfg.name} must be rejected on iPhone-class limits`);
+    assert.ok(g.reason!.includes('exceeds safe browser memory budget'));
+    assert.ok(g.estimate.estimatedBrowserTransientBytes > TRANSFORMER_SUITE_SAFE_BROWSER_TRANSIENT_BYTES,
+      `${cfg.name}: ${g.estimate.estimatedBrowserTransientBytes} B transient must exceed the budget`);
+  }
 });
 
 test('ST18 (V3.1.3): 7B rejected — estimate ≈192 MiB live, NEVER claimed safe from maxBufferSize', () => {
@@ -1441,6 +1476,222 @@ test('ST25 (V3.1.3): controlled 7B guard abort is distinguishable from every cra
   checkpointCategory('transformerBlocks', [stagedBlock('7B')]);
   const reload = classifyInterruption();
   assert.equal(reload.kind, 'PAGE_TERMINATED_OR_BROWSER_RELOADED');
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// V3.1.3 TEST SET TMT — TOTAL TRANSIENT MEMORY (3B FORENSIC)
+// Proves the corrected guard: 3B accounting includes GPU + host + staging,
+// the estimate is exact, the guard runs before allocation, rejected workloads
+// never allocate, blocked results carry no fake performance, they are
+// checkpointed as controlled aborts, the suite continues past RESOURCE_LIMIT,
+// required sizes are unchanged, certification fails closed, every allocation
+// path has cleanup, host mirrors are released ASAP, and every single buffer ≤
+// 256 MiB.
+// ═══════════════════════════════════════════════════════════════════════════
+
+test('TMT #1/#2 (V3.1.3): 3B accounting includes GPU + host + staging and the total is exact', () => {
+  const est = estimateTransformerBlockMemory(BLOCK_3B);
+  assert.equal(est.estimatedGpuBytes, TMT.c3.gpu, '3B GPU commit is all simultaneously-live GPUBuffers');
+  assert.equal(est.estimatedHostBytes, TMT.c3.host, '3B host peak = one release-host upload (largest single weight)');
+  assert.equal(est.estimatedStagingBytes, TMT.c3.staging, '3B staging peak = one mappedAtCreation copy (largest single weight)');
+  assert.equal(est.estimatedBrowserTransientBytes, TMT.c3.transient, '3B transient must be exactly 83,972,100 B (≈80.1 MiB)');
+  assert.equal(est.estimatedBrowserTransientBytes, est.estimatedGpuBytes + est.estimatedHostBytes + est.estimatedStagingBytes);
+  assert.equal(est.deviceCommitBytes, est.estimatedGpuBytes, 'deviceCommitBytes is the GPU component');
+
+  // Every size pins to the corrected model.
+  assert.deepEqual(
+    ['0.5B', '1B', '1.5B', '3B', '7B'].map(name =>
+      estimateTransformerBlockMemory([CFG_05, CFG_1, CFG_15, BLOCK_3B, BLOCK_7B].find(c => c.name === name)!).estimatedBrowserTransientBytes),
+    [TMT.c05.transient, TMT.c1.transient, TMT.c1.transient, TMT.c3.transient, TMT.c7.transient],
+  );
+  // The guard's own decision uses the corrected total, not the GPU-only number:
+  // 3B (≈80.1 MiB) is above the 64 MiB budget; 1B/1.5B (≈45.1 MiB) below it.
+  assert.equal(TRANSFORMER_SUITE_SAFE_BROWSER_TRANSIENT_BYTES, TMT.budgetBytes);
+  assert.ok(TMT.c3.transient > TMT.budgetBytes && TMT.c1.transient < TMT.budgetBytes);
+});
+
+test('TMT #3 (V3.1.3): the guard evaluates BEFORE allocation — pure decision, no GPU touched', () => {
+  for (const cfg of [CFG_05, CFG_1, CFG_15, BLOCK_3B, BLOCK_7B]) {
+    // guardTransformerBlock is pure: no device, no createBuffer, no storage —
+    // it can only return a decision. If it fails here it cannot be used as a
+    // pre-allocation gate.
+    const g = guardTransformerBlock(cfg, IPHONE_LIMITS);
+    assert.equal(typeof g.ok, 'boolean');
+    assert.ok(g.estimate.estimatedBrowserTransientBytes > 0);
+  }
+  // The reason string carries the full corrected accounting (GPU+host+staging).
+  const g3 = guardTransformerBlock(BLOCK_3B, IPHONE_LIMITS);
+  assert.ok(g3.reason!.includes('GPU'), g3.reason!);
+  assert.ok(g3.reason!.includes('host') && g3.reason!.includes('staging'), g3.reason!);
+});
+
+test('TMT #4/#5 (V3.1.3): unsafe 3B AND 7B return RESOURCE_LIMIT (attempted, before allocation)', () => {
+  for (const cfg of [BLOCK_3B, BLOCK_7B]) {
+    const g = guardTransformerBlock(cfg, IPHONE_LIMITS);
+    assert.equal(g.ok, false, `${cfg.name} must be rejected by the corrected transient budget`);
+    const b = buildBlockedTransformerBlock(cfg, g.reason!);
+    assert.equal(b.resourceLimit!.status, 'RESOURCE_LIMIT');
+    assert.equal(b.resourceLimit!.attempted, true);
+    assert.equal(b.resourceLimit!.reason, g.reason);
+    // Still rejected even with desktop-class per-buffer caps — the total
+    // transient budget is workload-specific, not derived from maxBufferSize.
+    const giant = guardTransformerBlock(cfg, { maxBufferSize: 2 * 1024 * 1024 * 1024, maxStorageBufferBindingSize: 2 * 1024 * 1024 * 1024 });
+    assert.equal(giant.ok, false, `${cfg.name} must stay rejected even when the per-buffer caps are huge`);
+  }
+});
+
+test('TMT #6 (V3.1.3): a rejected workload creates ZERO GPU/host allocations', () => {
+  for (const cfg of [BLOCK_3B, BLOCK_7B]) {
+    const g = guardTransformerBlock(cfg, IPHONE_LIMITS);
+    const b = buildBlockedTransformerBlock(cfg, g.reason!);
+    const raw = JSON.stringify(b);
+    // A blocked result is pure JSON data: no GPUBuffer, no destroy(), no
+    // mapped range, no ArrayBuffer, no device handle — nothing allocatable.
+    assert.ok(!raw.includes('createBuffer') && !raw.includes('destroy') && !raw.includes('getMappedRange'));
+    assert.ok(!raw.includes('ArrayBuffer'));
+    assert.ok(b.resourceLimit!.attempted && b.resourceLimit!.status === 'RESOURCE_LIMIT');
+  }
+});
+
+test('TMT #7/#8 (V3.1.3): blocked 3B/7B emit no fake latency and no fake throughput', () => {
+  for (const cfg of [BLOCK_3B, BLOCK_7B]) {
+    const g = guardTransformerBlock(cfg, IPHONE_LIMITS);
+    const b = buildBlockedTransformerBlock(cfg, g.reason!);
+    assert.equal(b.blockLatencyMs, 0, 'no fabricated latency');
+    assert.equal(b.totalMs, 0);
+    assert.equal(b.estimatedPerOperationMs, 0);
+    assert.equal(b.repetitions, 1);
+    assert.equal(b.throughput, null, 'no fabricated throughput');
+    assert.equal(b.workUnit, 'NONE');
+    assert.equal(b.confidence, 'UNMEASURABLE');
+  }
+  // Through the real export pipeline, for the block that reloaded Safari:
+  const f = fullGateWith3B7BRejected();
+  const report = buildStagedDiagnosticExport(f.stages, f.gate, stagedEnv, { buildId: 'tmt-nofake' });
+  const llm = report.payload.results.llmInference as unknown as {
+    transformerBlocks: { name: string; status: string; blockLatencyMs: number; estimatedTokensPerSecond: number | null }[];
+  };
+  const row = llm.transformerBlocks.find(x => x.name === '3B')!;
+  assert.equal(row.status, 'RESOURCE_LIMIT');
+  assert.equal(row.blockLatencyMs, 0);
+  assert.equal(row.estimatedTokensPerSecond, null);
+});
+
+test('TMT #9 (V3.1.3): resource-limit results are checkpointed and classified as a controlled abort', () => {
+  resetForTests();
+  setStorageForTests(memStorage());
+  beginBenchmark('V3.1', 'full', undefined, 'tmt-checkpoint');
+  checkpointCategory('transformerBlocks', [
+    buildBlockedTransformerBlock(BLOCK_3B, BLOCK_3B_REASON),
+    buildBlockedTransformerBlock(BLOCK_7B, GUARD_7B_REASON),
+  ]);
+  const partial = (getCheckpoint()?.partialResults as any)?.transformerBlocks as unknown[];
+  assert.equal(partial?.length, 2, 'transformerBlocks category is checkpointed immediately');
+  const names = partial.map((b: any) => b.config.name);
+  assert.deepEqual(names, ['3B', '7B']);
+  const info = classifyInterruption();
+  assert.equal(info.kind, 'TRANSFORMER_SUITE_RESOURCE_LIMIT');
+  assert.ok(info.reason.includes('3B') && info.reason.includes('7B'));
+  assert.notEqual(info.kind, 'PAGE_TERMINATED_OR_BROWSER_RELOADED');
+});
+
+test('TMT #10 (V3.1.3): FULL continues after RESOURCE_LIMIT — suite order preserved, blocked sizes not dropped', () => {
+  const sizes = [CFG_05, CFG_1, CFG_15, BLOCK_3B, BLOCK_7B];
+  const decided: string[] = [];
+  let allocations = 0;
+  for (const cfg of sizes) {
+    const g = guardTransformerBlock(cfg, IPHONE_LIMITS);
+    if (!g.ok) {
+      decided.push(`${cfg.name}:RESOURCE_LIMIT`);
+      continue; // benchSyntheticTransformerBlock continues to the next size
+    }
+    allocations++; // only the guard-allowed configs reach storageBuf
+    decided.push(`${cfg.name}:MEASURED`);
+  }
+  assert.equal(allocations, 3, 'only 0.5B/1B/1.5B may allocate');
+  assert.deepEqual(decided, ['0.5B:MEASURED', '1B:MEASURED', '1.5B:MEASURED', '3B:RESOURCE_LIMIT', '7B:RESOURCE_LIMIT'],
+    'flow reaches and records every required size in order instead of terminating at 3B');
+});
+
+test('TMT #11 (V3.1.3): required transformer sizes stay exactly 0.5B/1B/1.5B/3B/7B', () => {
+  const { stages, gate } = fullGateWith3B7BRejected();
+  const report = buildStagedDiagnosticExport(stages, gate, stagedEnv, { buildId: 'tmt-suite' });
+  const names = report.payload.results.llmInference!.transformerBlocks.map(b => b.name);
+  assert.deepEqual(names.sort((a, b) => Number.parseFloat(a) - Number.parseFloat(b)), ['0.5B', '1B', '1.5B', '3B', '7B']);
+  const check7 = report.postExportAudit!.checks.find(c => c.id === 7)!;
+  assert.equal(check7.pass, true);
+  const check15 = report.postExportAudit!.checks.find(c => c.id === 15)!;
+  assert.equal(check15.pass, false, 'check #15 flags resource-limited required blocks (3B AND 7B)');
+  assert.ok(check15.detail.includes('3B'), check15.detail);
+});
+
+test('TMT #12 (V3.1.3): certification stays false while required 3B/7B are RESOURCE_LIMIT (no threshold change)', () => {
+  const { gate } = fullGateWith3B7BRejected();
+  const gates = computeCertificationGates(gate);
+  assert.equal(gates.llmSuiteComplete, 'FAIL');
+  assert.equal(gates.overallCertified, false);
+  assert.notEqual(gates.certificationStatus, 'CERTIFIED');
+  const llmV = buildLlmInferenceV3113(gate);
+  const audit = runSelfAuditV3113(llmV, 1);
+  assert.equal(audit.ok, false, 'self-audit must fail closed');
+  assert.equal(audit.checks.find(c => c.id === 15)!.pass, false);
+  assert.ok(audit.failures.some(f => f.includes('3B')), audit.failures.join('; '));
+  assert.doesNotThrow(() => buildStagedDiagnosticExport(fullGateWith3B7BRejected().stages, gate, stagedEnv, { buildId: 'tmt-cert' }));
+  // Control: when every required block is measured the same harness certifies.
+  const { gate: gateOk } = fullGateWith7BMeasured();
+  const gatesOk = computeCertificationGates(gateOk);
+  assert.equal(gatesOk.llmSuiteComplete, 'PASS');
+  assert.equal(gatesOk.overallCertified, true);
+});
+
+test('TMT #13 (V3.1.3): every allocation path has cleanup — mid-loop failures release prior resources', () => {
+  const destroyed: string[] = [];
+  const t = createDisposableTracker<{ destroy(): void }>();
+  assert.throws(() => {
+    t.create(() => ({ destroy: () => destroyed.push('wNorm1') }));
+    t.create(() => ({ destroy: () => destroyed.push('wQKV') }));
+    t.create(() => { throw new Error('mid-allocation OOM'); });
+  }, /mid-allocation/);
+  assert.equal(t.alive, 2);
+  t.release();
+  assert.deepEqual(destroyed.sort(), ['wNorm1', 'wQKV']);
+  assert.equal(t.alive, 0);
+  // Release is idempotent — repeated finally calls cannot double-free.
+  assert.doesNotThrow(() => t.release());
+  assert.equal(t.alive, 0);
+  // If the UPLOAD itself throws after the host array is created, nothing GPU
+  // was minted (host array is scoped to withLocalWeightHost) so nothing leaks.
+  assert.throws(() => withLocalWeightHost(16, () => {}, () => { throw new Error('upload failed'); }), /upload failed/);
+});
+
+test('TMT #14 (V3.1.3): host mirrors are released ASAP — only the upload result ever escapes', () => {
+  let seenBytes = 0;
+  let seenValues = 0;
+  const result = withLocalWeightHost(4 * 1024, a => { seenBytes = a.byteLength; a.fill(0.5); }, a => {
+    seenValues = a.reduce((s, v) => s + v, 0);
+    return { id: 'gpu-buffer-only' }; // MUST be the only thing the caller keeps
+  });
+  assert.equal(seenBytes, 4 * 1024);
+  assert.equal(seenValues, 1024 * 0.5);
+  assert.deepEqual(result, { id: 'gpu-buffer-only' }, 'the host array cannot escape the upload call');
+  // 3B host peak is the LARGEST SINGLE upload (16 MiB), never the full retained
+  // mirror set (48 MiB legacy). This is what the guard's estimate now models.
+  assert.equal(estimateTransformerBlockMemory(BLOCK_3B).estimatedHostBytes, TMT.c3.host);
+  assert.notEqual(estimateTransformerBlockMemory(BLOCK_3B).hostCommitBytes, TMT.c3.host);
+  assert.equal(estimateTransformerBlockMemory(BLOCK_3B).hostCommitBytes, TMT.c3.hostRetainedLegacy);
+});
+
+test('TMT #15 (V3.1.3): every config\'s largest single buffer stays ≤ 256 MiB', () => {
+  const cap = 256 * 1024 * 1024;
+  for (const cfg of [CFG_05, CFG_1, CFG_15, BLOCK_3B, BLOCK_7B]) {
+    const est = estimateTransformerBlockMemory(cfg);
+    assert.ok(est.largestBufferBytes <= cap, `${cfg.name}: ${est.largestBufferBytes} B ≤ 256 MiB`);
+    assert.ok(est.largestBufferBytes <= IPHONE_LIMITS.maxBufferSize);
+    assert.ok(est.largestBufferBytes <= IPHONE_LIMITS.maxStorageBufferBindingSize);
+    assert.equal(est.estimatedHostBytes, est.largestBufferBytes, 'single-upload host peak');
+    assert.equal(est.estimatedStagingBytes, est.largestBufferBytes, 'single-upload staging peak');
+  }
+  assert.equal(estimateTransformerBlockMemory(BLOCK_7B).largestBufferBytes, 64 * 1024 * 1024);
 });
 
 test('SG: computeParamCount kept verbatim — 7B slot pins exact pre-refactor values', () => {

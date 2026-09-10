@@ -258,10 +258,11 @@ export function computeCertificationGates(
   const blockNames = new Set(gate.transformerBlocks.map(b => b.config.name));
   const missingBlocks = REQUIRED_BLOCKS.filter(n => !blockNames.has(n));
 
-  // Safe 7B memory guard (transformer-guard.ts): a REQUIRED block that was
-  // aborted before allocation (resourceLimit) is NOT a completed workload —
-  // the suite must never certify "complete" when 7B never actually ran. This
-  // is not a benchmark-threshold change; it keeps REQUIRED_BLOCKS untouched.
+  // Safe transformer memory guard (transformer-guard.ts): a REQUIRED block that
+  // was aborted before allocation (resourceLimit) is NOT a completed workload —
+  // the suite must never certify "complete" when a required block never
+  // actually ran. This is not a benchmark-threshold change; it keeps
+  // REQUIRED_BLOCKS untouched.
   const resourceLimitedRequired = gate.transformerBlocks.filter(
     b => b.resourceLimit !== undefined && REQUIRED_BLOCKS.includes(b.config.name)
   );
@@ -375,7 +376,7 @@ export interface TransformerBlockExport {
   memoryEstimateBytes: number;
   status: 'MEASURED' | 'UNSUPPORTED' | 'RESOURCE_LIMIT';
   notes: string;
-  /** Present when the safe 7B memory guard aborted this block BEFORE allocation. */
+  /** Present when the safe transformer memory guard aborted this block BEFORE allocation. */
   resourceLimit: TransformerResourceLimit | null;
 }
 

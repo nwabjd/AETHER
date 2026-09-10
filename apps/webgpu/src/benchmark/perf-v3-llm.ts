@@ -32,7 +32,7 @@ import {
 import type { ResumeContext } from './crash-safety.ts';
 import {
   computeParamCount, createDisposableTracker, guardTransformerBlock,
-  buildBlockedTransformerBlock,
+  buildBlockedTransformerBlock, withLocalWeightHost,
 } from './transformer-guard.ts';
 import type { TransformerBlockLimits } from './transformer-guard.ts';
 
@@ -441,12 +441,13 @@ export async function benchSyntheticTransformerBlock(onProgress?: (msg: string) 
   const epsBits = new ArrayBuffer(4); new Float32Array(epsBits)[0] = 1e-6;
   const configs = subset === 'small' ? TRANSFORMER_CONFIGS.slice(0, 2) : TRANSFORMER_CONFIGS;
 
-  // Safe 7B memory guard, evaluated BEFORE any allocation for every config.
-  // The only authoritative per-buffer caps are the device's real limits; total
-  // memory is NOT exposed by WebGPU, so safety is decided by comparing the
-  // workload's actual simultaneously-live device commit against the
-  // conservative per-run suite budget (transformer-guard.ts). A config the
-  // guard rejects is reported as RESOURCE_LIMIT and NEVER measured.
+  // Safe transformer memory guard, evaluated BEFORE any allocation for every
+  // config. The only authoritative per-buffer caps are the device's real
+  // limits; total memory is NOT exposed by WebGPU, so safety is decided by
+  // comparing the workload's TOTAL BROWSER TRANSIENT estimate (GPU + host +
+  // staging, see transformer-guard.ts) against a conservative, observed
+  // per-run budget. A config the guard rejects is reported as RESOURCE_LIMIT
+  // and NEVER measured and NEVER allocated.
   const limits: TransformerBlockLimits = {
     maxBufferSize: dev().limits.maxBufferSize,
     maxStorageBufferBindingSize: dev().limits.maxStorageBufferBindingSize,
@@ -459,9 +460,12 @@ export async function benchSyntheticTransformerBlock(onProgress?: (msg: string) 
     if (!guard.ok) {
       // Fail closed BEFORE anything dangerous is allocated. The run continues
       // to token generation / memory ladder / attention / self-audit; the
-      // certification gates see a required block that did NOT run.
+      // certification gates see a required block that did NOT run. The
+      // resource-limit result is checkpointed immediately so a later page
+      // death is classified as a controlled guard abort, not a crash.
       onProgress?.(`transformer block ${cfg.name} BLOCKED: ${guard.reason}`);
       out.push(buildBlockedTransformerBlock(cfg, guard.reason!));
+      checkpointCategory('transformerBlocks', out.slice());
       continue;
     }
 
@@ -481,24 +485,20 @@ export async function benchSyntheticTransformerBlock(onProgress?: (msg: string) 
     // before the next one starts.
     const tracked = createDisposableTracker<GPUBuffer>();
     try {
-      // Weight buffers
-      const wNorm1 = new Float32Array(H); wNorm1.fill(1);
-      const wQKV = new Float32Array(H * H * 3); fillRandom(wQKV);
-      const wO = new Float32Array(H * H); fillRandom(wO);
-      const wNorm2 = new Float32Array(H); wNorm2.fill(1);
-      const wUp = new Float32Array(H * I); fillRandom(wUp);
-      const wDown = new Float32Array(I * H); fillRandom(wDown);
-
-      const bufNorm1W = tracked.create(() => storageBuf(wNorm1.byteLength, wNorm1));
-      const bufQKVW = tracked.create(() => storageBuf(wQKV.byteLength, wQKV));
-      const bufOW = tracked.create(() => storageBuf(wO.byteLength, wO));
-      const bufNorm2W = tracked.create(() => storageBuf(wNorm2.byteLength, wNorm2));
-      const bufUpW = tracked.create(() => storageBuf(wUp.byteLength, wUp));
-      const bufDownW = tracked.create(() => storageBuf(wDown.byteLength, wDown));
+      // Weight buffers — uploaded through withLocalWeightHost so each host
+      // Float32Array exists ONLY during its upload and is released the moment
+      // the GPUBuffer is minted. The guard's transient accounting assumes this
+      // release policy (host peak = largest SINGLE weight, never all six).
+      const upload = (a: Float32Array) => storageBuf(a.byteLength, a);
+      const bufNorm1W = tracked.create(() => withLocalWeightHost(H * 4, a => { a.fill(1); }, upload));
+      const bufQKVW = tracked.create(() => withLocalWeightHost(H * H * 3 * 4, fillRandom, upload));
+      const bufOW = tracked.create(() => withLocalWeightHost(H * H * 4, fillRandom, upload));
+      const bufNorm2W = tracked.create(() => withLocalWeightHost(H * 4, a => { a.fill(1); }, upload));
+      const bufUpW = tracked.create(() => withLocalWeightHost(H * I * 4, fillRandom, upload));
+      const bufDownW = tracked.create(() => withLocalWeightHost(I * H * 4, fillRandom, upload));
 
       // Activation buffers
-      const input = new Float32Array(seq * H); fillRandom(input);
-      const bufInput = tracked.create(() => storageBuf(input.byteLength, input));
+      const bufInput = tracked.create(() => withLocalWeightHost(seq * H * 4, fillRandom, upload));
       const bufNorm1Out = tracked.create(() => storageBuf(seq * H * 4));
       const bufQKVOut = tracked.create(() => storageBuf(seq * H * 3 * 4));
       const bufScores = tracked.create(() => storageBuf(seq * seq * 4));
@@ -567,6 +567,9 @@ export async function benchSyntheticTransformerBlock(onProgress?: (msg: string) 
         blockLatencyMs: res.totalMs,
         ...res,
       });
+      // Checkpoint the blocks INCLUDING this measurement so a later page
+      // death after ANY block is classified from the last consistent state.
+      checkpointCategory('transformerBlocks', out.slice());
     } finally {
       // try/finally — EVERY GPU resource created for THIS block is destroyed
       // even if the block throws mid-way, and before the next config starts.

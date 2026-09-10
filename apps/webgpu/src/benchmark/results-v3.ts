@@ -83,7 +83,7 @@ export interface TransformerBlockConfig {
 }
 
 // Present when a transformer block was aborted BEFORE allocation by the safe
-// 7B memory guard (transformer-guard.ts). NEVER fabricated as a measured
+// transformer memory guard (transformer-guard.ts). NEVER fabricated as a measured
 // result — certification must treat a required block in this state as a
 // failed workload (attempted but not completed).
 export interface TransformerResourceLimit {
