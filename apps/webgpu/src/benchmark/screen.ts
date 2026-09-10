@@ -1928,6 +1928,8 @@ function renderDiagnostics(el: HTMLElement) {
 export function render(el: HTMLElement) {
   _container = el;
   _listenersInstalled = false;
+  (globalThis as any).AETHER_BUILD_ID = AETHER_BUILD_ID;
+  (globalThis as any).AETHER_COMMIT = AETHER_COMMIT;
   el.innerHTML = `
     <h2>GPU Compute Benchmark — Isolated Diagnostics</h2>
     <p style="color:var(--text-dim);margin-bottom:16px;font-size:13px">
