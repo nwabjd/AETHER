@@ -28,6 +28,8 @@ import {
 } from './crash-safety.ts';
 import type { ResumeContext, RuntimeErrorRecord, InterruptionKind } from './crash-safety.ts';
 import { createBenchmarkResult } from './results-v3.ts';
+import type { LLMDiagnosticStage } from './perf-v3-llm.ts';
+import { assembleLLMGateFromStages, buildStagedDiagnosticExport } from './staged-diagnostic-export.ts';
 
 // Force runtime inclusion of V3.1.3 sentinels (prevents tree-shaking)
 export const AETHER_V313_SENTINELS = {
@@ -59,6 +61,11 @@ export interface V3Environment {
 // Global store for the most recent LLM inference gate results, so the
 // combined V3.1.1 export can embed them under results.llmInference.
 export let _llmGateResults: LLMGateResult | null = null;
+
+// Most recent staged diagnostic (crash-safety scout run), so the staged
+// EXPORT LLM JSON / COPY JSON buttons serialize what was actually measured.
+let _stagedStages: LLMDiagnosticStage[] | null = null;
+let _stagedEnv: V3Environment | null = null;
 
 // Build the structured llmInference export object with the exact field
 // names required by the V3.1.1 spec (context, kvCacheBytes, status, etc.).
@@ -1110,9 +1117,118 @@ export async function runLLMDiagnosticFromUI(getDevice: () => GPUDevice, log: (m
     }
     log(`DIAG done: ${stages.filter(s => s.completed).length}/${stages.length} stages completed`, 'ok');
     log(`DIAG env: ${env.device} | maxBufferSize: ${env.maxBufferSize ? Math.round(env.maxBufferSize / 1048576) + ' MB' : 'UNAVAILABLE'} | timer: ${env.timerResolutionMs.toFixed(3)} ms`, 'info');
-    log('crash-safety: diagnostic complete. Export the LLM JSON to capture the full staged report.', 'info');
+    const gate = assembleLLMGateFromStages(stages);
+    _stagedStages = stages;
+    _stagedEnv = env;
+    renderStagedDiagnostic(stages, gate, env, log);
+    log('crash-safety: diagnostic complete. Press EXPORT LLM JSON (above) to capture the full staged report.', 'info');
   } catch (e) {
     log(`DIAG ERROR: ${(e as Error).message}`, 'err');
+  }
+}
+
+// ─── Staged diagnostic export UI (V3.1.3 crash-safety scout) ──────────────
+
+export function renderStagedDiagnostic(stages: LLMDiagnosticStage[], gate: LLMGateResult | null, env: V3Environment, log: (msg: string, kind?: string) => void) {
+  const mount = document.getElementById('perf-v3-llm-results');
+  if (!mount) return;
+  const completed = stages.filter(s => s.completed).length;
+  const rows = stages.map(s => {
+    const state = s.completed ? (s.error ? 'ERROR' : 'DONE') : 'SKIPPED';
+    const color = s.completed && !s.error ? 'var(--green)' : 'var(--red)';
+    return `<div class="staged-row" style="display:flex;justify-content:space-between;gap:8px;padding:5px 0;border-bottom:1px solid var(--border)">
+      <span style="font-size:12px">${esc(s.label)}</span>
+      <span style="font-size:12px;color:${color}"><b>${state}</b> ${Math.round(s.durationMs)}ms${s.error ? ` — ${esc(s.error)}` : ''}</span>
+    </div>`;
+  }).join('');
+  mount.innerHTML = `
+    <div class="card v3-dash" style="border-color:var(--border);margin-top:16px">
+      <div class="card-header">
+        <span class="card-title">AETHER V3.1.3 — STAGED DIAGNOSTIC ${completed}/${stages.length} STAGES COMPLETED</span>
+        <span class="badge badge-info">CRASH-SAFETY SCOUT</span>
+      </div>
+      <div style="font-size:12px;color:var(--text-dim);margin-bottom:6px">Short, breakable scout run — small workloads only, all GPU buffers released between stages.</div>
+      <div style="font-size:12px;margin-bottom:6px">Device: <b>${esc(env.adapterName)}</b> (${esc(env.adapterVendor)}) | Timer: ${env.timerResolutionMs.toFixed(3)} ms</div>
+      ${rows}
+      <div id="staged-export-status" style="font-size:12px;margin-top:12px"></div>
+      <div class="btn-row" style="margin-top:16px;flex-wrap:wrap">
+        <button class="btn" id="btn-export-staged-llm-json">EXPORT LLM JSON</button>
+        <button class="btn btn-outline" id="btn-copy-staged-llm-json">COPY JSON</button>
+      </div>
+    </div>
+  `;
+  mount.querySelector('#btn-export-staged-llm-json')?.addEventListener('click', () => exportStagedLLMJson(stages, gate, env));
+  mount.querySelector('#btn-copy-staged-llm-json')?.addEventListener('click', () => copyStagedLLMJson(stages, gate, env));
+  log('AETHER V3.1.3 STAGED DIAGNOSTIC COMPLETE — use EXPORT LLM JSON (above) to capture the staged report', 'ok');
+}
+
+function stagedExportOf(stages: LLMDiagnosticStage[], gate: LLMGateResult | null, env: V3Environment) {
+  const g = globalThis as { AETHER_BUILD_ID?: string; AETHER_COMMIT?: string };
+  return buildStagedDiagnosticExport(stages, gate, env, {
+    buildId: g.AETHER_BUILD_ID ?? null,
+    commit: g.AETHER_COMMIT ?? null,
+  });
+}
+
+function stagedFilename(): string {
+  const ts = new Date().toISOString().replace(/[:.]/g, '-');
+  return `AETHER-V3.1.3-STAGED-LLM-${ts}.json`;
+}
+
+function setStagedExportStatus(text: string, error: boolean) {
+  const el = document.getElementById('staged-export-status');
+  if (!el) return;
+  el.innerHTML = `<span style="color:${error ? 'var(--red)' : 'var(--green)'}">${esc(text)}</span>`;
+}
+
+function exportStagedLLMJson(stages: LLMDiagnosticStage[], gate: LLMGateResult | null, env: V3Environment) {
+  const report = stagedExportOf(stages, gate, env);
+  const name = stagedFilename();
+  try {
+    download(name, report.json, 'application/json');
+  } catch (e) {
+    setStagedExportStatus(`JSON EXPORT FAILED — ${esc((e as Error).message)}`, true);
+    return;
+  }
+  setStagedExportStatus(
+    `JSON EXPORT COMPLETE — ${name} | ${report.resultCount} results | ${report.certificationStatus}${report.postExportAudit.ok ? '' : ' (post-export audit FAILED -> FAILED)'} | build ${report.payload.buildId}`,
+    !report.postExportAudit.ok,
+  );
+}
+
+function copyStagedLLMJson(stages: LLMDiagnosticStage[], gate: LLMGateResult | null, env: V3Environment) {
+  const report = stagedExportOf(stages, gate, env);
+  const copied = copyText(report.json);
+  setStagedExportStatus(
+    copied
+      ? `JSON COPIED — ${report.resultCount} results | ${report.certificationStatus}${report.postExportAudit.ok ? '' : ' (post-export audit FAILED -> FAILED)'} | build ${report.payload.buildId}`
+      : 'JSON COPY FAILED — clipboard unavailable on this device',
+    !copied || !report.postExportAudit.ok,
+  );
+}
+
+function copyText(text: string): boolean {
+  if (navigator.clipboard && window.isSecureContext !== false) {
+    try {
+      navigator.clipboard.writeText(text).catch(() => {});
+      return true;
+    } catch {
+      // fall through to the textarea fallback
+    }
+  }
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    const ok = document.execCommand('copy');
+    document.body.removeChild(ta);
+    return ok;
+  } catch {
+    return false;
   }
 }
 
