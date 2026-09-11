@@ -1275,6 +1275,8 @@ import {
 import type { TransformerBlockGuardResult } from '../src/benchmark/transformer-guard.ts';
 import { AB_VARIANTS, MEASURE_AWAITS, planTransformerBlock } from '../src/benchmark/transformer-ab.ts';
 import type { ABBlockPlan } from '../src/benchmark/transformer-ab.ts';
+import { ALL_SEQUENCES, buildAndSimulateAll } from '../src/benchmark/scout-order-ab.ts';
+import type { SequenceId } from '../src/benchmark/scout-order-ab.ts';
 import { buildLlmInferenceV3113, runSelfAuditV3113 } from '../src/benchmark/v3113.ts';
 import type { TransformerBlockConfig } from '../src/benchmark/results-v3.ts';
 
@@ -2077,6 +2079,48 @@ test('AB3 (V3.1.3): destroy() is the LAST op of every allowed block — checkpoi
   assert.equal(b3.allowed, false, '3B blocked by single-config budget');
   const g7 = planTransformerBlock('current', BLOCK_7B, IPHONE_LIMITS);
   assert.equal(g7.allowed, false, '7B blocked by single-config budget');
+});
+
+test('SG1 (V3.1.3): scout-execution ordering — purchase-time ownership invariants hold in ALL candidate sequences', () => {
+  const all = buildAndSimulateAll();
+  for (const id of ALL_SEQUENCES) {
+    const { built, result } = all[id];
+    const m = result.metrics;
+    assert.equal(m.overlapOps, 0, `${id}: never simultaneously live scout chunk + transformer block (source: scout destroy at perf-v3-llm.ts:735, block release at ::613)`);
+    assert.equal(m.liveScoutAtTransformerStart, 0, `${id}: benchMemoryBudget destroys every buffer before returning so no scout chunk is live at first block alloc`);
+    assert.equal(m.guardBeforeEveryBlock, true, `${id}: guard evaluated before every block alloc (perf-v3-llm.ts:471)`);
+    if (built.real) {
+      assert.equal(m.awaitOpsBetweenScoutReturnAndFirstBlock, 0, `${id}: staged s4->s5 has zero GPU awaits between scout destroy and block alloc (only a sync releaseTrackedBuffers at :899)`);
+    }
+  }
+});
+
+test('SG2 (V3.1.3): real orderings are exactly FULL/quick (transformer-then-ladder) and staged B/C (ladder-then-transformer+cleanup)', () => {
+  const all = buildAndSimulateAll();
+  assert.equal(all.A.built.real, true);
+  assert.equal(all.B.built.real, true);
+  assert.equal(all.C.built.real, true);
+  assert.equal(all.D.built.real, false, 'D is hypothetical — current FULL has no release between transformer and ladder');
+  assert.equal(all.E.built.real, false, 'E is hypothetical — no microtask boundary in source');
+  assert.equal(all.F.built.real, false, 'F is hypothetical — no macrotask boundary in source');
+  // The staged order (B = C) is the ONLY real order with the ladder BEFORE the transformer suite.
+  const scoutFirst = (id: SequenceId) => {
+    const ops = all[id].built.ops;
+    return ops.findIndex(o => o.kind === 'SCOUT_ALLOC') < ops.findIndex(o => o.kind === 'BLOCK_ALLOC');
+  };
+  assert.equal(scoutFirst('A'), false, 'FULL/quick: transformer suite precedes the ladder (perf-v3-llm.ts:768-771 then 776-778)');
+  assert.equal(scoutFirst('B'), true, 'staged s4 memoryBudget precedes s5 transformerBlocks (perf-v3-llm.ts:893 then 903)');
+  assert.equal(scoutFirst('C'), true);
+  assert.equal(scoutFirst('D'), false, 'hypothetical transformer-then-ladder matches FULL');
+});
+
+test('SG3 (V3.1.3): scout peak concurrency is per-rung only; transformer blocks never overlap the ladder or each other', () => {
+  const all = buildAndSimulateAll();
+  for (const id of ALL_SEQUENCES) {
+    const m = all[id].result.metrics;
+    assert.ok(m.peakLiveScoutBytes <= 256 * 1024 * 1024, `${id}: scout peak live GPU bytes stays within the largest 'small' rung (256 MiB) — chunks destroyed per rung at :735`);
+    assert.ok(m.peakSimultaneousScoutAndBlockBytes <= Math.max(m.peakLiveScoutBytes, m.peakLiveBlockBytes), `${id}: peak simultaneous = max(scout pool, block pool), never their sum`);
+  }
 });
 
 test('CS T2 (V3.1.3): transformer forensic milestones persist and clear (finding #3 evidence store)', () => {
