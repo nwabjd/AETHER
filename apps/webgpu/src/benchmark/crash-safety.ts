@@ -111,6 +111,22 @@ export const CHECKPOINT_KEY = 'aether_v313_checkpoint';
 export const RUNTIME_ERROR_GLOBAL = 'AETHER_RUNTIME_ERROR';
 export const DEVICE_HEALTH_GLOBAL = 'AETHER_DEVICE_HEALTH';
 
+// ─── Transformer-block forensic milestones ────────────────────────────────
+// Fine-grained, best-effort ordinal log written to localStorage at each step
+// of the transformer-block bench. localStorage SYNCHRONOUSLY SURVIVES a page
+// reload that wipes JS memory, so when Safari kills the page the LAST milestone
+// written is the strongest evidence of exactly where it died (finding #3 —
+// the 1.5B reload left no other durable trace). Kept separate from the coarse
+// category checkpoint and from heartbeat: milestones are high-frequency and
+// forensic-only, never rendered, never certified.
+export const TRANSFORMER_MILESTONE_KEY = 'aether_v313_milestones';
+export const MAX_TRANSFORMER_MILESTONES = 256;
+
+export interface MilestoneRecord {
+  t: string;     // ISO timestamp
+  state: string; // e.g. '1.5B GUARD_PASS', '1.5B UPLOAD_W6', '1.5B MEASURE_DONE'
+}
+
 // iPhone-class WebGPU devices report maxBufferSize ≈ 256 MiB. Never create a
 // single GPUBuffer above the device limit (or this portability floor).
 export const MAX_SAFE_BUFFER_BYTES = 256 * 1024 * 1024;
@@ -446,6 +462,59 @@ export function elapsedMs(): number {
   return Math.max(Date.now() - new Date(_activeCheckpoint.startedAt).getTime(), 0);
 }
 
+// ─── Transformer-block forensic milestones (Phase 5 of the 1.5B forensics) ─
+
+/**
+ * Append one best-effort milestone. Never throws: forensics must not be able
+ * to break the benchmark (private browsing / quota / serialization failures
+ * are swallowed). The log is capped so a long run cannot grow it unboundedly.
+ */
+export function recordMilestone(state: string): void {
+  const s = resolveStorage();
+  if (!s) return;
+  try {
+    let arr: MilestoneRecord[] = [];
+    const raw = s.getItem(TRANSFORMER_MILESTONE_KEY);
+    if (raw) {
+      const parsed: unknown = JSON.parse(raw);
+      if (Array.isArray(parsed)) arr = parsed as MilestoneRecord[];
+    }
+    arr.push({ t: new Date().toISOString(), state });
+    if (arr.length > MAX_TRANSFORMER_MILESTONES) {
+      arr = arr.slice(arr.length - MAX_TRANSFORMER_MILESTONES);
+    }
+    s.setItem(TRANSFORMER_MILESTONE_KEY, JSON.stringify(arr));
+  } catch {
+    // ignore — diagnostics are best-effort
+  }
+}
+
+/** Read back the milestone log (ordered oldest → newest). */
+export function getMilestones(): MilestoneRecord[] {
+  const s = resolveStorage();
+  if (!s) return [];
+  try {
+    const raw = s.getItem(TRANSFORMER_MILESTONE_KEY);
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as MilestoneRecord[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Clear the milestone log. Kept separate so a forensics session can persist
+ * across a page reload until the next run intentionally starts. */
+export function clearMilestones(): void {
+  const s = resolveStorage();
+  if (!s) return;
+  try {
+    s.removeItem(TRANSFORMER_MILESTONE_KEY);
+  } catch {
+    // ignore
+  }
+}
+
 export function completeBenchmark(): void {
   if (!_activeCheckpoint) return;
   _activeCheckpoint.status = 'COMPLETED';
@@ -610,7 +679,10 @@ export function resetForTests(preserveStorage = false): void {
   _activeCheckpoint = null;
   _buffers.clear();
   stopHeartbeatTicker();
-  if (!preserveStorage) clearCheckpointStorage();
+  if (!preserveStorage) {
+    clearCheckpointStorage();
+    clearMilestones();
+  }
   try {
     delete (globalThis as Record<string, unknown>)[RUNTIME_ERROR_GLOBAL];
     delete (globalThis as Record<string, unknown>)[DEVICE_HEALTH_GLOBAL];

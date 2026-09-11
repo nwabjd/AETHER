@@ -28,11 +28,13 @@ import {
 } from './cpu-refs.ts';
 import {
   heartbeat, checkpointCategory, releaseTrackedBuffers, checkResourceFloor, trackBuffer,
+  recordMilestone,
 } from './crash-safety.ts';
 import type { ResumeContext } from './crash-safety.ts';
 import {
   computeParamCount, createDisposableTracker, guardTransformerBlock,
   buildBlockedTransformerBlock, withLocalWeightHost,
+  TRANSFORMER_SUITE_SAFE_BROWSER_TRANSIENT_BYTES,
 } from './transformer-guard.ts';
 import type { TransformerBlockLimits } from './transformer-guard.ts';
 
@@ -441,13 +443,21 @@ export async function benchSyntheticTransformerBlock(onProgress?: (msg: string) 
   const epsBits = new ArrayBuffer(4); new Float32Array(epsBits)[0] = 1e-6;
   const configs = subset === 'small' ? TRANSFORMER_CONFIGS.slice(0, 2) : TRANSFORMER_CONFIGS;
 
+  // Run-progressive accumulator (finding #3): the modeled browser transient of
+  // the transformer blocks that have ALREADY EXECUTED this run. Only blocks the
+  // guard actually let run add to it — a rejected block never allocated, so it
+  // contributed nothing and must not ratchet the counter. Feeds the guard's
+  // run-transient term so 1.5B is refused before allocation after 0.5B + 1B.
+  let runTransientBytes = 0;
+
   // Safe transformer memory guard, evaluated BEFORE any allocation for every
   // config. The only authoritative per-buffer caps are the device's real
   // limits; total memory is NOT exposed by WebGPU, so safety is decided by
   // comparing the workload's TOTAL BROWSER TRANSIENT estimate (GPU + host +
   // staging, see transformer-guard.ts) against a conservative, observed
-  // per-run budget. A config the guard rejects is reported as RESOURCE_LIMIT
-  // and NEVER measured and NEVER allocated.
+  // per-run budget AND, run-progressively, against the cumulative transient of
+  // already-executed blocks. A config the guard rejects is reported as
+  // RESOURCE_LIMIT and NEVER measured and NEVER allocated.
   const limits: TransformerBlockLimits = {
     maxBufferSize: dev().limits.maxBufferSize,
     maxStorageBufferBindingSize: dev().limits.maxStorageBufferBindingSize,
@@ -455,8 +465,11 @@ export async function benchSyntheticTransformerBlock(onProgress?: (msg: string) 
 
   for (const cfg of configs) {
     onProgress?.(`transformer block ${cfg.name} hidden=${cfg.hidden}`);
+    recordMilestone(`${cfg.name} ENTER`);
+    recordMilestone(`${cfg.name} GUARD_START`);
 
-    const guard = guardTransformerBlock(cfg, limits);
+    const guard = guardTransformerBlock(cfg, limits, TRANSFORMER_SUITE_SAFE_BROWSER_TRANSIENT_BYTES, runTransientBytes);
+    recordMilestone(`${cfg.name} ${guard.ok ? 'GUARD_PASS' : 'GUARD_BLOCK'}`);
     if (!guard.ok) {
       // Fail closed BEFORE anything dangerous is allocated. The run continues
       // to token generation / memory ladder / attention / self-audit; the
@@ -466,6 +479,7 @@ export async function benchSyntheticTransformerBlock(onProgress?: (msg: string) 
       onProgress?.(`transformer block ${cfg.name} BLOCKED: ${guard.reason}`);
       out.push(buildBlockedTransformerBlock(cfg, guard.reason!));
       checkpointCategory('transformerBlocks', out.slice());
+      recordMilestone(`${cfg.name} CHECKPOINTED`);
       continue;
     }
 
@@ -473,6 +487,7 @@ export async function benchSyntheticTransformerBlock(onProgress?: (msg: string) 
     const seq = 1; // single token decode
 
     // Pipelines
+    recordMilestone(`${cfg.name} PIPELINES`);
     const rmsPipeline = makePipeline(RMSNORM_WGSL, ['uniform', 'read-only-storage', 'read-only-storage', 'storage']);
     const matPipeline = makePipeline(MATMUL_WGSL, ['uniform', 'read-only-storage', 'read-only-storage', 'storage']);
     const attnPipeline = makePipeline(ATTN_FUSED_WGSL, ['uniform', 'read-only-storage', 'storage', 'storage']);
@@ -489,15 +504,23 @@ export async function benchSyntheticTransformerBlock(onProgress?: (msg: string) 
       // Float32Array exists ONLY during its upload and is released the moment
       // the GPUBuffer is minted. The guard's transient accounting assumes this
       // release policy (host peak = largest SINGLE weight, never all six).
+      recordMilestone(`${cfg.name} UPLOAD_START`);
       const upload = (a: Float32Array) => storageBuf(a.byteLength, a);
+      recordMilestone(`${cfg.name} HOST_ALLOC_AND_GPU_BUF 1`); // 1/6 — host array + staging + GPUBuffer share this single storageBuf call
       const bufNorm1W = tracked.create(() => withLocalWeightHost(H * 4, a => { a.fill(1); }, upload));
+      recordMilestone(`${cfg.name} UPLOAD_W2`); // wQKV
       const bufQKVW = tracked.create(() => withLocalWeightHost(H * H * 3 * 4, fillRandom, upload));
+      recordMilestone(`${cfg.name} UPLOAD_W3`); // wO
       const bufOW = tracked.create(() => withLocalWeightHost(H * H * 4, fillRandom, upload));
+      recordMilestone(`${cfg.name} UPLOAD_W4`); // wNorm2
       const bufNorm2W = tracked.create(() => withLocalWeightHost(H * 4, a => { a.fill(1); }, upload));
+      recordMilestone(`${cfg.name} UPLOAD_W5`); // wUp — tied for largest single weight (9.4 MiB at 1.5B)
       const bufUpW = tracked.create(() => withLocalWeightHost(H * I * 4, fillRandom, upload));
+      recordMilestone(`${cfg.name} UPLOAD_W6`); // wDown — tied for largest single weight
       const bufDownW = tracked.create(() => withLocalWeightHost(I * H * 4, fillRandom, upload));
 
       // Activation buffers
+      recordMilestone(`${cfg.name} ACT_UPLOAD`); // input activation (host-uploaded, then released)
       const bufInput = tracked.create(() => withLocalWeightHost(seq * H * 4, fillRandom, upload));
       const bufNorm1Out = tracked.create(() => storageBuf(seq * H * 4));
       const bufQKVOut = tracked.create(() => storageBuf(seq * H * 3 * 4));
@@ -520,6 +543,11 @@ export async function benchSyntheticTransformerBlock(onProgress?: (msg: string) 
       const uUp = tracked.create(() => uniformBuf(new Uint32Array([seq, I, H]).buffer));
       const uDown = tracked.create(() => uniformBuf(new Uint32Array([seq, H, I]).buffer));
 
+      recordMilestone(`${cfg.name} ALL_BUFFERS_CREATED`);
+      // The bench performs NO explicit GPU readback of output tensors — verify
+      // and stats are driven by device-side CompletionToken only — so there is
+      // deliberately no READBACK milestone (documented as N/A in the forensics).
+
       // Bind groups
       const bgRms1 = makeBg(rmsPipeline, ['uniform', 'read-only-storage', 'read-only-storage', 'storage'], [uRms1, bufInput, bufNorm1W, bufNorm1Out]);
       const bgQKV = makeBg(matPipeline, ['uniform', 'read-only-storage', 'read-only-storage', 'storage'], [uQKV, bufNorm1Out, bufQKVW, bufQKVOut]);
@@ -532,6 +560,8 @@ export async function benchSyntheticTransformerBlock(onProgress?: (msg: string) 
       const bgDown = makeBg(matPipeline, ['uniform', 'read-only-storage', 'read-only-storage', 'storage'], [uDown, bufGeluOut, bufDownW, bufMlpOut]);
       const bgAdd2 = makeBg(addPipeline, ['read-only-storage', 'read-only-storage', 'storage'], [bufRes1, bufMlpOut, bufOutput]);
 
+      recordMilestone(`${cfg.name} BIND_GROUP_READY`);
+      recordMilestone(`${cfg.name} DISPATCH_SUBMIT_START`);
       const m = await adaptiveMeasure(pass => {
         pass.setPipeline(rmsPipeline); pass.setBindGroup(0, bgRms1); pass.dispatchWorkgroups(seq, 1, 1);
         pass.setPipeline(matPipeline); pass.setBindGroup(0, bgQKV); pass.dispatchWorkgroups(seq, Math.ceil(H * 3 / 16), 1);
@@ -544,6 +574,7 @@ export async function benchSyntheticTransformerBlock(onProgress?: (msg: string) 
         pass.setPipeline(matPipeline); pass.setBindGroup(0, bgDown); pass.dispatchWorkgroups(seq, Math.ceil(H / 16), 1);
         pass.setPipeline(addPipeline); pass.setBindGroup(0, bgAdd2); pass.dispatchWorkgroups(Math.ceil((seq * H) / 256), 1, 1);
       });
+      recordMilestone(`${cfg.name} GPU_COMPLETION`);
 
       const params = computeParamCount(cfg);
       const totalFlops = (2 * H * H * 3 + 6 * H * H + 2 * H * I + 2 * I * H) * m.reps; // Simplified estimation
@@ -570,6 +601,12 @@ export async function benchSyntheticTransformerBlock(onProgress?: (msg: string) 
       // Checkpoint the blocks INCLUDING this measurement so a later page
       // death after ANY block is classified from the last consistent state.
       checkpointCategory('transformerBlocks', out.slice());
+      // Only a block that ACTUALLY RAN ratchets the run-progressive counter.
+      // 1.5B will be refused BEFORE allocation once 0.5B + 1B have run
+      // (modeled cumulative ≈68.3 MiB + this block's ≈45.1 MiB > 96 MiB cap).
+      runTransientBytes += guard.estimate.estimatedBrowserTransientBytes;
+      recordMilestone(`${cfg.name} CHECKPOINTED`);
+      recordMilestone(`${cfg.name} COMPLETE`);
     } finally {
       // try/finally — EVERY GPU resource created for THIS block is destroyed
       // even if the block throws mid-way, and before the next config starts.

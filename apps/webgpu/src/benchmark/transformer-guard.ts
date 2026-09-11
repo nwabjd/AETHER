@@ -17,6 +17,23 @@
 // The estimate was off by ~2.3× and 3B became the largest stage actually
 // executed, reloading Safari.
 //
+// Forensic finding #3 (iPhone 17 Pro / Safari, FULL V3.1.3 after the corrected
+// total-transient guard): the guard now rejects 3B AND 7B before allocation,
+// yet the page STILL terminated — at the synthetic 1.5B block. Single-config
+// accounting measures 1.5B at only ≈45.1 MiB (< 64 MiB budget) so the guard
+// PASSED it and the run went on to allocate and measure it. Critically, the
+// 1B and 1.5B footprints are byte-for-byte IDENTICAL (hidden=768,
+// intermediate=3072; they differ only in `layers`, which the block bench never
+// allocates), so NO single-config byte budget can ever distinguish 1B (which
+// runs) from 1.5B (which killed Safari). The field data therefore cannot be
+// explained by any per-block estimate — it is a RUN-PROGRESSIVE effect: by the
+// time 1.5B is attempted, 0.5B + 1B have already executed (cumulative modeled
+// transient ≈68.3 MiB) and the process/GPU heap has not returned released
+// memory to the OS. The dead 1.5B attempt sits at a modeled cumulative of
+// ≈115.6 MiB, inside the same ~112 MiB crash band as the old 3B death. The
+// fix is a run-progressive cumulative cap evaluated BEFORE any 1.5B
+// allocation (see TRANSFORMER_SUITE_RUN_TRANSIENT_CAP_BYTES).
+//
 // Every individual 3B/7B buffer is BELOW the device's per-buffer
 // maxBufferSize, which is exactly why a per-buffer check alone can never prove
 // a block is safe: maxBufferSize reports the largest SINGLE allocation, not
@@ -45,11 +62,15 @@
 //   sizes through 1.5B (true peak ≈ 66 MiB under the old retained-host code)
 //   ran successfully; 3B (true peak ≈ 112 MiB) terminated the page. 64 MiB
 //   sits below the largest workload that ever ran safely and far below the
-//   observed crash onset, while the post-restructure workload estimates land
-//   comfortably on both sides:
-//   0.5B     ≈ 20 MiB  transient — runs
-//   1B/1.5B  ≈ 45 MiB  transient — runs
-//   3B       ≈ 80 MiB  transient — blocked (would need ~50 MiB device + ~17
+//   observed crash onset. Single-config estimates land comfortably on both
+//   sides, but finding #3 proved the single-config budget CANNOT protect the
+//   1.5B stage on its own (1B == 1.5B footprint) — a RUN-PROGRESSIVE cap on
+//   the cumulative modeled transient of already-executed blocks is required.
+//   0.5B     ≈ 20 MiB  transient — runs; cumulative after 0.5B ≈ 20 MiB
+//   1B/1.5B  ≈ 45 MiB  transient per block — 1B runs (cumulative ≈ 68.3 MiB);
+//                        1.5B does NOT run (cumulative would reach ≈115.6 MiB)
+//   3B       ≈ 80 MiB  transient — blocked (single-config ≥ 64 MiB AND
+//                        run-progressive; would need ~50 MiB device + ~17
 //                        MiB staging sustained; marginal on iOS)
 //   7B       ≈ 320 MiB transient — blocked
 
@@ -74,6 +95,28 @@ export const TRANSFORMER_SUITE_SAFE_BROWSER_TRANSIENT_BYTES = 64 * 1024 * 1024; 
  */
 export const TRANSFORMER_SUITE_SAFE_COMMIT_BYTES = 128 * 1024 * 1024; // 128 MiB (device commit ≈ 48 MiB for 3B — under-counted the real transient)
 
+/**
+ * Conservative RUN-PROGRESSIVE cap on the CUMULATIVE modeled browser transient
+ * of the transformer blocks that have ALREADY EXECUTED in this FULL run, plus
+ * the block being decided, in the units of `estimatedBrowserTransientBytes`.
+ *
+ * Finding #3: 1B and 1.5B have byte-identical footprints, so the single-config
+ * budget (64 MiB) cannot distinguish them — yet the field shows 1B runs and a
+ * 1.5B attempt reloads Safari. The only measured difference is cumulative
+ * pressure: by the time 1.5B is attempted, 0.5B + 1B have already executed
+ * (modeled cumulative ≈68.3 MiB) and the browser/GPU process has not returned
+ * all released memory to the OS.
+ *
+ * Evidence band (current release-host code, FULL V3.1.3 order):
+ *   survived: cumulative through 1B  = 68,264,968 B (≈65.1 MiB)
+ *   fatal:    cumulative at 1.5B     = 115,515,404 B (≈110.2 MiB) — the observed
+ *             reload; also brackets the old 3B crash onset (≈112 MiB peak)
+ * 96 MiB sits strictly between the largest observed safe cumulative and the
+ * smallest observed fatal cumulative. It is NOT tuned to make a benchmark
+ * pass — it reproduces the observed field behavior fail-closed.
+ */
+export const TRANSFORMER_SUITE_RUN_TRANSIENT_CAP_BYTES = 96 * 1024 * 1024; // 96 MiB
+
 export const REASON_BUDGET_EXCEEDED = (
   name: string,
   gpuBytes: number,
@@ -84,6 +127,16 @@ export const REASON_BUDGET_EXCEEDED = (
 ): string =>
   `${name} transformer workload exceeds safe browser memory budget on this device ` +
   `(estimated browser transient ≈ GPU ${miB(gpuBytes)} + host ${miB(hostBytes)} + staging ${miB(stagingBytes)} = ${miB(totalBytes)} > budget ${miB(budgetBytes)})`;
+
+export const REASON_RUN_CUMULATIVE_EXCEEDED = (
+  name: string,
+  priorBytes: number,
+  thisBytes: number,
+  totalBytes: number,
+  capBytes: number,
+): string =>
+  `${name} transformer workload exceeds safe browser memory budget on this device ` +
+  `(run-progressive browser transient: already-executed blocks ${miB(priorBytes)} + this block ${miB(thisBytes)} = ${miB(totalBytes)} > run cumulative safe cap ${miB(capBytes)})`;
 
 export const REASON_BUFFER_CAP = (name: string, largestBytes: number, capName: string, capBytes: number): string =>
   `${name} transformer workload exceeds ${capName} (largest weight buffer ${miB(largestBytes)} > ${miB(capBytes)})`;
@@ -103,10 +156,23 @@ export interface TransformerBlockMemoryEstimate {
   estimatedBrowserTransientBytes: number; // = gpu + host + staging — conservative workload-specific safety estimate
 }
 
+export interface TransformerBlockRunCumulative {
+  priorBytes: number;   // modeled transient of the blocks that ALREADY RAN this FULL run
+  thisBytes: number;    // the block being decided
+  totalBytes: number;   // prior + this
+  capBytes: number;     // TRANSFORMER_SUITE_RUN_TRANSIENT_CAP_BYTES
+}
+
 export interface TransformerBlockGuardResult {
   ok: boolean;
   reason: string | null;
   estimate: TransformerBlockMemoryEstimate;
+  /**
+   * Present when the guard evaluated the run-progressive cumulative term
+   * (always on a budget-pass; also on a cumulative-cap rejection). Null when
+   * the block was rejected by a per-buffer or single-config check instead.
+   */
+  cumulative: TransformerBlockRunCumulative | null;
 }
 
 /**
@@ -202,15 +268,24 @@ export function withLocalWeightHost<T>(bytes: number, init: (a: Float32Array) =>
  * Fail-closed guard. Evaluated BEFORE any GPU allocation. `ok === false` means
  * the block MUST NOT run: report `RESOURCE_LIMIT`, never a measured number.
  *
+ * `runTransientBytes` is the modeled browser transient of the transformer
+ * blocks that ALREADY EXECUTED in this run (the bench accumulates the estimate
+ * of every block it actually measured). It is the run-progressive input that
+ * finding #3 proved necessary: 1B and 1.5B have identical single-config
+ * footprints, so only the cumulative term can refuse 1.5B after 0.5B + 1B.
+ *
  * Checks, in order:
  *   1. largest single buffer vs device maxBufferSize
  *   2. largest single buffer vs device maxStorageBufferBindingSize
  *   3. total browser transient (GPU + host + staging) vs conservative budget
+ *   4. RUN-PROGRESSIVE cumulative (already-executed + this block) vs
+ *      TRANSFORMER_SUITE_RUN_TRANSIENT_CAP_BYTES
  */
 export function guardTransformerBlock(
   cfg: TransformerBlockConfig,
   limits: TransformerBlockLimits,
   transientBudgetBytes: number = TRANSFORMER_SUITE_SAFE_BROWSER_TRANSIENT_BYTES,
+  runTransientBytes: number = 0,
 ): TransformerBlockGuardResult {
   const estimate = estimateTransformerBlockMemory(cfg);
   if (estimate.largestBufferBytes > limits.maxBufferSize) {
@@ -218,6 +293,7 @@ export function guardTransformerBlock(
       ok: false,
       reason: REASON_BUFFER_CAP(cfg.name, estimate.largestBufferBytes, 'device maxBufferSize', limits.maxBufferSize),
       estimate,
+      cumulative: null,
     };
   }
   if (limits.maxStorageBufferBindingSize != null && estimate.largestBufferBytes > limits.maxStorageBufferBindingSize) {
@@ -225,6 +301,7 @@ export function guardTransformerBlock(
       ok: false,
       reason: REASON_BUFFER_CAP(cfg.name, estimate.largestBufferBytes, 'device maxStorageBufferBindingSize', limits.maxStorageBufferBindingSize),
       estimate,
+      cumulative: null,
     };
   }
   if (estimate.estimatedBrowserTransientBytes > transientBudgetBytes) {
@@ -239,9 +316,30 @@ export function guardTransformerBlock(
         transientBudgetBytes,
       ),
       estimate,
+      cumulative: null,
     };
   }
-  return { ok: true, reason: null, estimate };
+  const cumulative: TransformerBlockRunCumulative = {
+    priorBytes: runTransientBytes,
+    thisBytes: estimate.estimatedBrowserTransientBytes,
+    totalBytes: runTransientBytes + estimate.estimatedBrowserTransientBytes,
+    capBytes: TRANSFORMER_SUITE_RUN_TRANSIENT_CAP_BYTES,
+  };
+  if (cumulative.totalBytes > TRANSFORMER_SUITE_RUN_TRANSIENT_CAP_BYTES) {
+    return {
+      ok: false,
+      reason: REASON_RUN_CUMULATIVE_EXCEEDED(
+        cfg.name,
+        cumulative.priorBytes,
+        cumulative.thisBytes,
+        cumulative.totalBytes,
+        cumulative.capBytes,
+      ),
+      estimate,
+      cumulative,
+    };
+  }
+  return { ok: true, reason: null, estimate, cumulative };
 }
 
 /**

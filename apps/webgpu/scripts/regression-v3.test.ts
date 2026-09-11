@@ -670,6 +670,7 @@ import {
   trackBuffer, releaseTrackedBuffers, trackedBufferCount,
   deviceMaxBufferBytes, effectiveMaxBufferBytes, checkResourceFloor,
   installGlobalErrorCapture, setStorageForTests, resetForTests,
+  recordMilestone, getMilestones, clearMilestones,
   INTERRUPTION_KINDS,
 } from '../src/benchmark/crash-safety.ts';
 import { finalizeCertificationWithInterruption } from '../src/benchmark/v3113.ts';
@@ -1269,7 +1270,9 @@ import {
   guardTransformerBlock, estimateTransformerBlockMemory, buildBlockedTransformerBlock,
   createDisposableTracker, computeParamCount, withLocalWeightHost,
   TRANSFORMER_SUITE_SAFE_COMMIT_BYTES, TRANSFORMER_SUITE_SAFE_BROWSER_TRANSIENT_BYTES,
+  TRANSFORMER_SUITE_RUN_TRANSIENT_CAP_BYTES,
 } from '../src/benchmark/transformer-guard.ts';
+import type { TransformerBlockGuardResult } from '../src/benchmark/transformer-guard.ts';
 import { buildLlmInferenceV3113, runSelfAuditV3113 } from '../src/benchmark/v3113.ts';
 import type { TransformerBlockConfig } from '../src/benchmark/results-v3.ts';
 
@@ -1290,11 +1293,36 @@ const IPHONE_LIMITS = { maxBufferSize: 256 * 1024 * 1024, maxStorageBufferBindin
 // mirrors + staging).
 const TMT = {
   budgetBytes: 64 * 1024 * 1024,
+  runCapBytes: 96 * 1024 * 1024,
   c05: { gpu: 12_625_924, largest: 4_194_304, transient: 21_014_532 },
   c1: { gpu: 28_376_068, largest: 9_437_184, transient: 47_250_436 },
+  // 1.5B and 1B are byte-identical in footprint (hidden=768, intermediate=3072,
+  // differ only in layers=24 vs 12 — the block bench never allocates layers).
+  c15: { gpu: 28_376_068, largest: 9_437_184, transient: 47_250_436 },
   c3: { gpu: 50_417_668, largest: 16_777_216, staging: 16_777_216, host: 16_777_216, hostRetainedLegacy: 50_343_936, transient: 83_972_100 },
   c7: { gpu: 201_498_628, largest: 67_108_864, transient: 335_716_356 },
+  // Run-progressive cumulative (finding #3): modeled transient of blocks that
+  // ALREADY EXECUTED plus the block being decided.
+  cumAfter0_5: 21_014_532,
+  cumAfter1: 68_264_968,          // 0.5B + 1B — the largest cumulative observed safe
+  cumAt1_5: 115_515_404,          // +1.5B — the cumulative at the observed reload
+  // 1.5B param counts (computeParamCount; label is 1.5B but only 175.6M
+  // parameters are represented — the documented ~8.5x label/config mismatch).
+  c15Params: { fp16: 351_215_616, int8: 175_607_808, int4: 87_803_904, total: 175_607_808, perLayer: 6_292_992 },
 };
+
+// Mirrors benchSyntheticTransformerBlock's guard flow: the accumulator starts
+// at 0 and only ratchets when a block is actually allowed to run.
+function decideRun(configs: TransformerBlockConfig[]): TransformerBlockGuardResult[] {
+  let runTransientBytes = 0;
+  const decisions: TransformerBlockGuardResult[] = [];
+  for (const cfg of configs) {
+    const g = guardTransformerBlock(cfg, IPHONE_LIMITS, TRANSFORMER_SUITE_SAFE_BROWSER_TRANSIENT_BYTES, runTransientBytes);
+    decisions.push(g);
+    if (g.ok) runTransientBytes += g.estimate.estimatedBrowserTransientBytes;
+  }
+  return decisions;
+}
 
 function fullGateWith7BRejected(): { stages: LLMDiagnosticStage[]; gate: LLMGateResult } {
   resetForTests();
@@ -1318,6 +1346,24 @@ function fullGateWith3B7BRejected(): { stages: LLMDiagnosticStage[]; gate: LLMGa
   return { stages, gate };
 }
 
+// Reference fixture for finding #3 / the run-progressive cap: ONLY 0.5B/1B may
+// run in a FULL run; 1.5B is refused by the cumulative term before allocation,
+// 3B AND 7B by the single-config transient budget. This is what the REAL bench
+// produces now (verify with decideRun / the ST17 rewrite).
+function fullGateWith15B3B7BRejected(): { stages: LLMDiagnosticStage[]; gate: LLMGateResult } {
+  resetForTests();
+  const stages = fullStages();
+  const tb = stages.find(s => s.name === 'transformerBlocks')!;
+  const g15 = guardTransformerBlock(CFG_15, IPHONE_LIMITS, TMT.budgetBytes, TMT.cumAfter1);
+  assert.equal(g15.ok, false, '1.5B must be rejected by the run-progressive cap after 0.5B+1B');
+  tb.items = ['0.5B', '1B'].map(stagedBlock)
+    .concat([buildBlockedTransformerBlock(CFG_15, g15.reason!)])
+    .concat([buildBlockedTransformerBlock(BLOCK_3B, BLOCK_3B_REASON)])
+    .concat([buildBlockedTransformerBlock(BLOCK_7B, GUARD_7B_REASON)]);
+  const gate = assembleLLMGateFromStages(stages)!;
+  return { stages, gate };
+}
+
 function fullGateWith7BMeasured(): { stages: LLMDiagnosticStage[]; gate: LLMGateResult } {
   resetForTests();
   const stages = fullStages();
@@ -1325,24 +1371,47 @@ function fullGateWith7BMeasured(): { stages: LLMDiagnosticStage[]; gate: LLMGate
   return { stages, gate };
 }
 
-test('ST17 (V3.1.3): safe allocation path — 0.5B/1B/1.5B run; 3B and 7B rejected before allocation', () => {
-  const safe: TransformerBlockConfig[] = [CFG_05, CFG_1, CFG_15];
-  for (const cfg of safe) {
-    const g = guardTransformerBlock(cfg, IPHONE_LIMITS);
-    assert.equal(g.ok, true, `${cfg.name} should run: ${g.reason}`);
+test('ST17 (V3.1.3): safe allocation path — 0.5B/1B run; 1.5B (run-progressive) / 3B / 7B rejected before allocation', () => {
+  // FULL-run flow exactly as benchSyntheticTransformerBlock evaluates it:
+  // the accumulator carries the modeled transient of blocks that already ran.
+  const decisions = decideRun([CFG_05, CFG_1, CFG_15, BLOCK_3B, BLOCK_7B]);
+  const byName = Object.fromEntries(['0.5B', '1B', '1.5B', '3B', '7B'].map((n, i) => [n, decisions[i]]));
+
+  for (const name of ['0.5B', '1B']) {
+    const g = byName[name];
+    assert.equal(g.ok, true, `${name} should run in FULL-run context`);
     assert.equal(g.reason, null);
+    assert.ok(g.cumulative, `${name} always evaluates the run-progressive term`);
+    assert.ok(g.cumulative!.totalBytes <= g.cumulative!.capBytes, `${name} cumulative stays within the run cap`);
     assert.ok(g.estimate.deviceCommitBytes <= TRANSFORMER_SUITE_SAFE_COMMIT_BYTES);
     assert.ok(g.estimate.estimatedBrowserTransientBytes <= TRANSFORMER_SUITE_SAFE_BROWSER_TRANSIENT_BYTES);
     assert.ok(g.estimate.deviceCommitBytes > 0 && g.estimate.hostCommitBytes > 0 && g.estimate.largestBufferBytes > 0);
   }
-  // Corrected total-transient accounting rejects 3B (≈80 MiB transient was the
-  // Safari reload point) and 7B (≈320 MiB) BEFORE any allocation.
-  for (const cfg of [BLOCK_3B, BLOCK_7B]) {
-    const g = guardTransformerBlock(cfg, IPHONE_LIMITS);
-    assert.equal(g.ok, false, `${cfg.name} must be rejected on iPhone-class limits`);
+
+  // 1.5B: single-config transient (≈45.1 MiB) is UNDER the 64 MiB budget, so
+  // the pre-#3 guard PASSED it and Safari reloaded. The run-progressive cap is
+  // exactly what refuses it now — BEFORE any allocation.
+  const g15 = byName['1.5B'];
+  assert.equal(g15.ok, false, '1.5B must be rejected in FULL-run context (run-progressive cumulative)');
+  assert.ok(g15.reason!.includes('exceeds safe browser memory budget'), g15.reason!);
+  assert.ok(g15.reason!.includes('run-progressive browser transient'), g15.reason!);
+  assert.equal(g15.cumulative!.priorBytes, TMT.cumAfter1);
+  assert.equal(g15.cumulative!.thisBytes, TMT.c15.transient);
+  assert.equal(g15.cumulative!.totalBytes, TMT.cumAt1_5);
+  assert.equal(g15.cumulative!.capBytes, TRANSFORMER_SUITE_RUN_TRANSIENT_CAP_BYTES);
+  assert.ok(g15.cumulative!.totalBytes > g15.cumulative!.capBytes);
+  assert.ok(g15.estimate.estimatedBrowserTransientBytes < TRANSFORMER_SUITE_SAFE_BROWSER_TRANSIENT_BYTES,
+    '1.5B is rejected by the CUMULATIVE term, not the single-config budget');
+
+  // 3B/7B are rejected by the single-config transient budget (≈80.1 / ≈320.2
+  // MiB), exactly as before — the cumulative term is not why they fail.
+  for (const name of ['3B', '7B']) {
+    const g = byName[name];
+    assert.equal(g.ok, false, `${name} must be rejected on iPhone-class limits`);
+    assert.equal(g.cumulative, null, `${name} is rejected by the single-config budget, so cumulative is null`);
     assert.ok(g.reason!.includes('exceeds safe browser memory budget'));
     assert.ok(g.estimate.estimatedBrowserTransientBytes > TRANSFORMER_SUITE_SAFE_BROWSER_TRANSIENT_BYTES,
-      `${cfg.name}: ${g.estimate.estimatedBrowserTransientBytes} B transient must exceed the budget`);
+      `${name}: ${g.estimate.estimatedBrowserTransientBytes} B transient must exceed the budget`);
   }
 });
 
@@ -1597,20 +1666,21 @@ test('TMT #9 (V3.1.3): resource-limit results are checkpointed and classified as
 
 test('TMT #10 (V3.1.3): FULL continues after RESOURCE_LIMIT — suite order preserved, blocked sizes not dropped', () => {
   const sizes = [CFG_05, CFG_1, CFG_15, BLOCK_3B, BLOCK_7B];
+  const decisions = decideRun(sizes);
   const decided: string[] = [];
   let allocations = 0;
-  for (const cfg of sizes) {
-    const g = guardTransformerBlock(cfg, IPHONE_LIMITS);
+  for (let i = 0; i < sizes.length; i++) {
+    const g = decisions[i];
     if (!g.ok) {
-      decided.push(`${cfg.name}:RESOURCE_LIMIT`);
+      decided.push(`${sizes[i].name}:RESOURCE_LIMIT`);
       continue; // benchSyntheticTransformerBlock continues to the next size
     }
     allocations++; // only the guard-allowed configs reach storageBuf
-    decided.push(`${cfg.name}:MEASURED`);
+    decided.push(`${sizes[i].name}:MEASURED`);
   }
-  assert.equal(allocations, 3, 'only 0.5B/1B/1.5B may allocate');
-  assert.deepEqual(decided, ['0.5B:MEASURED', '1B:MEASURED', '1.5B:MEASURED', '3B:RESOURCE_LIMIT', '7B:RESOURCE_LIMIT'],
-    'flow reaches and records every required size in order instead of terminating at 3B');
+  assert.equal(allocations, 2, 'only 0.5B/1B may allocate — 1.5B is refused by the run-progressive cap');
+  assert.deepEqual(decided, ['0.5B:MEASURED', '1B:MEASURED', '1.5B:RESOURCE_LIMIT', '3B:RESOURCE_LIMIT', '7B:RESOURCE_LIMIT'],
+    'every required size is reached and recorded in order instead of terminating at 1.5B');
 });
 
 test('TMT #11 (V3.1.3): required transformer sizes stay exactly 0.5B/1B/1.5B/3B/7B', () => {
@@ -1692,6 +1762,140 @@ test('TMT #15 (V3.1.3): every config\'s largest single buffer stays ≤ 256 MiB'
     assert.equal(est.estimatedStagingBytes, est.largestBufferBytes, 'single-upload staging peak');
   }
   assert.equal(estimateTransformerBlockMemory(BLOCK_7B).largestBufferBytes, 64 * 1024 * 1024);
+});
+
+test('TMT #16 (V3.1.3): exact 1.5B dimensions and parameter counts — label/config mismatch documented', () => {
+  // Dims come straight from the suite config (perf-v3-llm.ts).
+  assert.deepEqual(
+    { hidden: CFG_15.hidden, intermediate: CFG_15.intermediate, layers: CFG_15.layers },
+    { hidden: 768, intermediate: 3072, layers: 24 },
+  );
+  // computeParamCount (kept verbatim — phase 9 forbids changing it).
+  const p = computeParamCount(CFG_15);
+  assert.deepEqual(p, {
+    fp16: TMT.c15Params.fp16,
+    int8: TMT.c15Params.int8,
+    int4: TMT.c15Params.int4,
+  });
+  assert.equal(p.int8, TMT.c15Params.total, 'the "1.5B" slot represents exactly 175,607,808 parameters');
+  // Embedding + per-layer math.
+  assert.equal(32000 * 768, 24_576_000);
+  assert.equal(TMT.c15Params.total - 24_576_000, 24 * TMT.c15Params.perLayer);
+  // The bench's single-block weight set is LARGER than computeParamCount's
+  // per-layer Q+K+V because the bench fuses QKV as H×3H (no GQA) while the
+  // param count uses kvHeads-split K/V.
+  const blockElems = 768 + 768 * 768 * 3 + 768 * 768 + 768 + 768 * 3072 + 3072 * 768; // norms + fused QKV + O + up + down
+  assert.equal(blockElems, 7_079_424, 'bench block fp32 weight elements');
+  assert.ok(blockElems * 4 > TMT.c15Params.perLayer * 4 * 1.1, 'fused-QKV block weights exceed the GQA param-count per-layer');
+});
+
+test('TMT #17 (V3.1.3): 1.5B footprint is byte-identical to 1B — only the run-progressive term can refuse 1.5B', () => {
+  const e1 = estimateTransformerBlockMemory(CFG_1);
+  const e15 = estimateTransformerBlockMemory(CFG_15);
+  assert.equal(TRANSFORMER_SUITE_RUN_TRANSIENT_CAP_BYTES, TMT.runCapBytes, 'the run cap constant is pinned at 96 MiB');
+  assert.equal(e1.estimatedGpuBytes, e15.estimatedGpuBytes);
+  assert.equal(e1.estimatedBrowserTransientBytes, e15.estimatedBrowserTransientBytes);
+  assert.equal(e1.estimatedBrowserTransientBytes, TMT.c15.transient);
+  assert.equal(e15.estimatedBrowserTransientBytes, TMT.c15.transient);
+  // Standalone (runTransient = 0) the guard PASSES both — identical bytes, so a
+  // single-config byte budget can NEVER distinguish them (the finding #3 trap).
+  const g1 = guardTransformerBlock(CFG_1, IPHONE_LIMITS);
+  const g15 = guardTransformerBlock(CFG_15, IPHONE_LIMITS);
+  assert.equal(g1.ok, true);
+  assert.equal(g15.ok, true, 'standalone 1.5B is below the 64 MiB budget — pre-#3 the guard PASSED it');
+  // In FULL-run context only CFG_15 is refused, by the cumulative term alone.
+  const g1r = guardTransformerBlock(CFG_1, IPHONE_LIMITS, TMT.budgetBytes, TMT.cumAfter0_5);
+  const g15r = guardTransformerBlock(CFG_15, IPHONE_LIMITS, TMT.budgetBytes, TMT.cumAfter1);
+  assert.equal(g1r.ok, true, '1B still runs after 0.5B (cumulative 68.3 MiB ≤ 96 MiB cap)');
+  assert.equal(g15r.ok, false, '1.5B refused after 0.5B+1B (cumulative 115.5 MiB > 96 MiB cap)');
+  assert.equal(g15r.cumulative!.thisBytes, TMT.c15.transient, 'the cumulative term uses this block as-is');
+});
+
+test('TMT #18 (V3.1.3): 1.5B RESOURCE_LIMIT flows through export with zero fake performance', () => {
+  const { stages, gate } = fullGateWith15B3B7BRejected();
+  const report = buildStagedDiagnosticExport(stages, gate, stagedEnv, { buildId: 'tmt-15b' });
+  const llm = report.payload.results.llmInference as unknown as {
+    transformerBlocks: { name: string; status: string; blockLatencyMs: number; estimatedTokensPerSecond: number | null }[];
+  };
+  const names = llm.transformerBlocks.map(b => b.name).sort((a, b) => Number.parseFloat(a) - Number.parseFloat(b));
+  assert.deepEqual(names, ['0.5B', '1B', '1.5B', '3B', '7B'], '1.5B stays in the required suite');
+  const row = llm.transformerBlocks.find(x => x.name === '1.5B')!;
+  assert.equal(row.status, 'RESOURCE_LIMIT');
+  assert.equal(row.blockLatencyMs, 0);
+  assert.equal(row.estimatedTokensPerSecond, null);
+  const parsed = JSON.parse(report.json) as { results: { llmInference: { transformerBlocks: { name: string; status: string }[] } } };
+  const rowJson = parsed.results.llmInference.transformerBlocks.find(x => x.name === '1.5B')!;
+  assert.equal(rowJson.status, 'RESOURCE_LIMIT');
+});
+
+test('TMT #19 (V3.1.3): the run-progressive guard cannot be bypassed — no path re-passes a refused 1.5B', () => {
+  // (a) Huge device per-buffer caps cannot excuse the cumulative term:
+  const giant = guardTransformerBlock(CFG_15, { maxBufferSize: 2 * 1024 * 1024 * 1024, maxStorageBufferBindingSize: 2 * 1024 * 1024 * 1024 }, TMT.budgetBytes, TMT.cumAfter1);
+  assert.equal(giant.ok, false, '1.5B stays refused even with massive per-buffer caps — cumulative is independent');
+  assert.equal(giant.reason!.includes('run-progressive browser transient'), true, giant.reason!);
+  // (b) The bench accumulator only grows for blocks that actually ran — so a
+  // refused 1.5B can never ratchet the counter and a later call cannot be
+  // silently re-passed with the same accumulator state:
+  let acc = 0;
+  const g05 = guardTransformerBlock(CFG_05, IPHONE_LIMITS, TMT.budgetBytes, acc);
+  if (g05.ok) acc += g05.estimate.estimatedBrowserTransientBytes;
+  const g1b = guardTransformerBlock(CFG_1, IPHONE_LIMITS, TMT.budgetBytes, acc);
+  if (g1b.ok) acc += g1b.estimate.estimatedBrowserTransientBytes;
+  const refused = guardTransformerBlock(CFG_15, IPHONE_LIMITS, TMT.budgetBytes, acc);
+  assert.equal(refused.ok, false);
+  assert.equal(acc, TMT.cumAfter1, 'a refused block does not ratchet the accumulator');
+  const reDecide = guardTransformerBlock(CFG_15, IPHONE_LIMITS, TMT.budgetBytes, acc);
+  assert.equal(reDecide.ok, false, 're-deciding with the same honest accumulator still refuses 1.5B');
+  // (c) guardTransformerBlock is pure (no device/storage/mutable state), so
+  // the guard path cannot be "reset" — the bench's single choke point is the
+  // only authority and always passes the accumulated runTransientBytes.
+  assert.equal(typeof guardTransformerBlock(CFG_05, IPHONE_LIMITS, TMT.budgetBytes, 0).cumulative, 'object');
+});
+
+test('TMT #20 (V3.1.3): certification, audit, and checkpoint reflect 1.5B RESOURCE_LIMIT (fail closed)', () => {
+  const { stages, gate } = fullGateWith15B3B7BRejected();
+  const gates = computeCertificationGates(gate);
+  assert.equal(gates.llmSuiteComplete, 'FAIL');
+  assert.equal(gates.overallCertified, false);
+  assert.notEqual(gates.certificationStatus, 'CERTIFIED');
+  assert.ok(gates.reasons.some(r => r.includes('1.5B')), gates.reasons.join('; '));
+  const llmV = buildLlmInferenceV3113(gate);
+  const audit = runSelfAuditV3113(llmV, 1);
+  assert.equal(audit.ok, false, 'self-audit must fail closed with 1.5B RESOURCE_LIMIT');
+  const check15 = audit.checks.find(c => c.id === 15)!;
+  assert.equal(check15.pass, false);
+  assert.ok(check15.detail.includes('1.5B'), check15.detail);
+  assert.ok(audit.failures.some(f => f.includes('1.5B')), audit.failures.join('; '));
+  // Checkpoint records the controlled abort (classifier, not a crash).
+  resetForTests();
+  setStorageForTests(memStorage());
+  beginBenchmark('V3.1', 'full', undefined, 'tmt-15b-cp');
+  const g15 = guardTransformerBlock(CFG_15, IPHONE_LIMITS, TMT.budgetBytes, TMT.cumAfter1);
+  checkpointCategory('transformerBlocks', [buildBlockedTransformerBlock(CFG_15, g15.reason!)]);
+  const info = classifyInterruption();
+  assert.equal(info.kind, 'TRANSFORMER_SUITE_RESOURCE_LIMIT');
+  assert.notEqual(info.kind, 'PAGE_TERMINATED_OR_BROWSER_RELOADED');
+});
+
+test('CS T2 (V3.1.3): transformer forensic milestones persist and clear (finding #3 evidence store)', () => {
+  setStorageForTests(memStorage());
+  resetForTests();
+  assert.deepEqual(getMilestones(), [], 'fresh run has no milestones');
+  recordMilestone('1.5B ENTER');
+  recordMilestone('1.5B GUARD_PASS');
+  recordMilestone('1.5B UPLOAD_W6');
+  const ms = getMilestones();
+  assert.equal(ms.length, 3);
+  assert.equal(ms[0].state, '1.5B ENTER');
+  assert.equal(ms[2].state, '1.5B UPLOAD_W6');
+  assert.ok(ms.every(m => typeof m.t === 'string' && !Number.isNaN(Date.parse(m.t))), 'every milestone carries a valid ISO timestamp');
+  // Monotonic ordering: the log is read back oldest → newest.
+  assert.ok(Date.parse(ms[0].t) <= Date.parse(ms[1].t) && Date.parse(ms[1].t) <= Date.parse(ms[2].t));
+  // resetForTests() (a new run) clears the forensic log so cross-run evidence
+  // is never conflated.
+  resetForTests();
+  assert.deepEqual(getMilestones(), [], 'a fresh run starts with an empty milestone log');
+  clearMilestones();
 });
 
 test('SG: computeParamCount kept verbatim — 7B slot pins exact pre-refactor values', () => {
