@@ -1877,6 +1877,72 @@ test('TMT #20 (V3.1.3): certification, audit, and checkpoint reflect 1.5B RESOUR
   assert.notEqual(info.kind, 'PAGE_TERMINATED_OR_BROWSER_RELOADED');
 });
 
+test('BP (V3.1.3): 96 MiB run-cap boundary — strict > rule, deterministic, accumulator monotonic/no-reset', () => {
+  // Required by the forensic review (item: "boundary 96 MiB behavior").
+  // capBytes = 100_663_296 (96 MiB); CFG_05 estimate = 21_014_532.
+  // cap - estimate = 79_648_764, so the three probe priors are exact totals of
+  // cap-1 / cap / cap+1 — the strict-> rule makes cap itself ALLOWED.
+  const CAP = TRANSFORMER_SUITE_RUN_TRANSIENT_CAP_BYTES;
+  const EST = TMT.c05.transient;
+  assert.equal(CAP, TMT.runCapBytes);
+  assert.equal(EST, 21_014_532);
+  assert.equal(CAP - EST, 79_648_764);
+
+  // (a) Single-config budget rule is strict > : est == budget passes.
+  const exactBudget = guardTransformerBlock(CFG_05, IPHONE_LIMITS, EST, 0);
+  assert.equal(exactBudget.ok, true, 'est exactly equal to the budget must PASS (rule is est > budget)');
+  const belowBudget = guardTransformerBlock(CFG_05, IPHONE_LIMITS, EST - 1, 0);
+  assert.equal(belowBudget.ok, false, 'est one byte over the budget must FAIL');
+  assert.ok(belowBudget.reason!.includes('exceeds safe browser memory budget'));
+  assert.equal(belowBudget.cumulative, null, 'a single-config budget reject carries no cumulative term');
+
+  // (b) Cumulative rule is strict > : total == cap passes, total == cap+1 fails.
+  for (const prior of [CAP - EST - 1, CAP - EST]) {
+    const wantTotal = prior + EST;
+    const g = guardTransformerBlock(CFG_05, IPHONE_LIMITS, TRANSFORMER_SUITE_SAFE_BROWSER_TRANSIENT_BYTES, prior);
+    assert.equal(g.ok, true, `cumulative total ${wantTotal} (${wantTotal >= CAP ? '== cap' : 'cap-1'}) must PASS`);
+    assert.equal(g.cumulative!.totalBytes, wantTotal);
+    assert.ok(g.cumulative!.totalBytes <= g.cumulative!.capBytes);
+  }
+  const over = guardTransformerBlock(CFG_05, IPHONE_LIMITS, TRANSFORMER_SUITE_SAFE_BROWSER_TRANSIENT_BYTES, CAP - EST + 1);
+  assert.equal(over.ok, false, 'cumulative total cap+1 must FAIL');
+  assert.equal(over.cumulative!.totalBytes, CAP + 1);
+  assert.equal(over.cumulative!.priorBytes, CAP - EST + 1);
+  assert.equal(over.cumulative!.thisBytes, EST);
+  assert.ok(over.cumulative!.totalBytes > over.cumulative!.capBytes);
+  assert.ok(over.reason!.includes('run-progressive browser transient'), over.reason!);
+
+  // (c) Deterministic: identical inputs yield an identical decision.
+  const again = guardTransformerBlock(CFG_05, IPHONE_LIMITS, TRANSFORMER_SUITE_SAFE_BROWSER_TRANSIENT_BYTES, CAP - EST + 1);
+  assert.deepEqual(again.cumulative, over.cumulative);
+  assert.equal(again.reason, over.reason);
+
+  // (d) FULL-run accumulator trace: rejected configs neither increment nor reset
+  // the accumulator; it is monotonic non-decreasing across the whole suite.
+  const priors: number[] = [];
+  let acc = 0;
+  for (const cfg of [CFG_05, CFG_1, CFG_15, BLOCK_3B, BLOCK_7B]) {
+    priors.push(acc);
+    const g = guardTransformerBlock(cfg, IPHONE_LIMITS, TRANSFORMER_SUITE_SAFE_BROWSER_TRANSIENT_BYTES, acc);
+    if (g.ok) acc += g.estimate.estimatedBrowserTransientBytes;
+  }
+  assert.deepEqual(priors, [0, TMT.cumAfter0_5, TMT.cumAfter1, TMT.cumAfter1, TMT.cumAfter1],
+    'prior is 0 first, then ratchets ONLY on RUN; 1.5B/3B/7B rejects leave it untouched');
+  assert.equal(acc, TMT.cumAfter1, 'final accumulator equals the largest observed safe cumulative (68,264,968)');
+
+  // (e) Integer safety: every modeled byte count and the cap itself stay within
+  // exact integer range, so cumulative addition can never silently overflow.
+  const ests = [TMT.c05.transient, TMT.c1.transient, TMT.c15.transient, TMT.c3.transient, TMT.c7.transient];
+  assert.ok(ests.concat([CAP, TMT.budgetBytes]).every(Number.isSafeInteger));
+  for (const cfg of [CFG_05, CFG_1, CFG_15, BLOCK_3B, BLOCK_7B]) {
+    const e = estimateTransformerBlockMemory(cfg);
+    assert.ok(Number.isSafeInteger(e.estimatedBrowserTransientBytes));
+    assert.ok(Number.isSafeInteger(e.deviceCommitBytes));
+    assert.ok(Number.isSafeInteger(e.hostCommitBytes));
+    assert.ok(Number.isSafeInteger(e.largestBufferBytes));
+  }
+});
+
 test('CS T2 (V3.1.3): transformer forensic milestones persist and clear (finding #3 evidence store)', () => {
   setStorageForTests(memStorage());
   resetForTests();
