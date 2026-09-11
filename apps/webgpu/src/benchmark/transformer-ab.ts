@@ -31,7 +31,8 @@ import {
   estimateTransformerBlockMemory,
   guardTransformerBlock,
 } from './transformer-guard.ts';
-import type { TransformerBlockConfig, TransformerBlockLimits } from './results-v3.ts';
+import type { TransformerBlockLimits } from './transformer-guard.ts';
+import type { TransformerBlockConfig } from './results-v3.ts';
 
 export type ABVariant = 'baseline' | 'current' | 'current-minimal';
 
