@@ -1943,6 +1943,66 @@ test('BP (V3.1.3): 96 MiB run-cap boundary — strict > rule, deterministic, acc
   }
 });
 
+test('TR1 (V3.1.3): guard evaluation performs ZERO allocations — pure arithmetic, no device, no heap', () => {
+  // Required regression-candidate test: a safety guard must never ADD memory.
+  // Instrument the constructors the bench actually uses for heap allocations and
+  // prove guardTransformerBlock + estimateTransformerBlockMemory = pure math.
+  const counts = { ab: 0, f32: 0, u8: 0, u32: 0 };
+  const orig = {
+    ab: globalThis.ArrayBuffer, f32: globalThis.Float32Array,
+    u8: globalThis.Uint8Array, u32: globalThis.Uint32Array,
+  };
+  class CountAB extends orig.ab { constructor(...a: any[]) { counts.ab++; super(...a); } }
+  class CountF32 extends orig.f32 { constructor(...a: any[]) { counts.f32++; super(...a); } }
+  class CountU8 extends orig.u8 { constructor(...a: any[]) { counts.u8++; super(...a); } }
+  class CountU32 extends orig.u32 { constructor(...a: any[]) { counts.u32++; super(...a); } }
+  (globalThis as Record<string, unknown>).ArrayBuffer = CountAB;
+  (globalThis as Record<string, unknown>).Float32Array = CountF32;
+  (globalThis as Record<string, unknown>).Uint8Array = CountU8;
+  (globalThis as Record<string, unknown>).Uint32Array = CountU32;
+  try {
+    for (const cfg of [CFG_05, CFG_1, CFG_15, BLOCK_3B, BLOCK_7B]) {
+      const g = guardTransformerBlock(cfg, IPHONE_LIMITS, TRANSFORMER_SUITE_SAFE_BROWSER_TRANSIENT_BYTES, 68_264_968);
+      assert.equal(typeof g.ok, 'boolean');
+      assert.ok(g.estimate.estimatedBrowserTransientBytes > 0);
+    }
+  } finally {
+    (globalThis as Record<string, unknown>).ArrayBuffer = orig.ab;
+    (globalThis as Record<string, unknown>).Float32Array = orig.f32;
+    (globalThis as Record<string, unknown>).Uint8Array = orig.u8;
+    (globalThis as Record<string, unknown>).Uint32Array = orig.u32;
+  }
+  assert.deepEqual(counts, { ab: 0, f32: 0, u8: 0, u32: 0 },
+    'guardTransformerBlock must not construct ArrayBuffer/Float32Array/Uint8Array/Uint32Array');
+  // Structurally device-free: the guard only receives plain numeric limits — it
+  // has no device argument, so it cannot create buffers/pipelines/bind groups.
+  const g = guardTransformerBlock(CFG_15, IPHONE_LIMITS, TRANSFORMER_SUITE_SAFE_BROWSER_TRANSIENT_BYTES, 0);
+  assert.equal(g.ok, true);
+  assert.equal(g.estimate.deviceCommitBytes, 28_376_068);
+});
+
+test('TR2 (V3.1.3): resource tracker destroys every buffer and retains NOTHING after release', () => {
+  // Required regression-candidate test: a safety tracker must not keep GPU
+  // resources alive after the block finishes. release() must call destroy() on
+  // each tracked resource and drop all references (alive -> 0).
+  const destroyed: string[] = [];
+  const t = createDisposableTracker<{ name: string; destroy(): void }>();
+  t.create(() => ({ name: 'wUp', destroy: () => destroyed.push('wUp') }));
+  t.create(() => ({ name: 'act', destroy: () => destroyed.push('act') }));
+  assert.equal(t.alive, 2);
+  const n = t.release();
+  assert.equal(n, 2, 'release reports every tracked resource destroyed');
+  assert.equal(t.alive, 0, 'after release the tracker retains zero resources');
+  assert.deepEqual(destroyed.sort(), ['act', 'wUp']);
+  // Post-release creates behave identically (fresh group) — the pattern the
+  // bench uses per config, so block N can never retain block N-1's buffers.
+  t.create(() => ({ name: 'next', destroy: () => destroyed.push('next') }));
+  assert.equal(t.alive, 1);
+  t.release();
+  assert.equal(t.alive, 0);
+  assert.deepEqual(destroyed.sort(), ['act', 'next', 'wUp']);
+});
+
 test('CS T2 (V3.1.3): transformer forensic milestones persist and clear (finding #3 evidence store)', () => {
   setStorageForTests(memStorage());
   resetForTests();
