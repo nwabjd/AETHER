@@ -1273,6 +1273,8 @@ import {
   TRANSFORMER_SUITE_RUN_TRANSIENT_CAP_BYTES,
 } from '../src/benchmark/transformer-guard.ts';
 import type { TransformerBlockGuardResult } from '../src/benchmark/transformer-guard.ts';
+import { AB_VARIANTS, MEASURE_AWAITS, planTransformerBlock } from '../src/benchmark/transformer-ab.ts';
+import type { ABBlockPlan } from '../src/benchmark/transformer-ab.ts';
 import { buildLlmInferenceV3113, runSelfAuditV3113 } from '../src/benchmark/v3113.ts';
 import type { TransformerBlockConfig } from '../src/benchmark/results-v3.ts';
 
@@ -2001,6 +2003,80 @@ test('TR2 (V3.1.3): resource tracker destroys every buffer and retains NOTHING a
   t.release();
   assert.equal(t.alive, 0);
   assert.deepEqual(destroyed.sort(), ['act', 'next', 'wUp']);
+});
+
+test('AB1 (V3.1.3): baseline vs current vs current-minimal — GPU bytes, staging, and async lifetime are IDENTICAL', () => {
+  // Pre-device A/B isolation (finding: guard instrumentation changes supervision
+  // ops, NOT nominal allocation size nor resource lifetime).
+  for (const cfg of [CFG_05, CFG_1]) {
+    const plans = AB_VARIANTS.map(v => planTransformerBlock(v, cfg, IPHONE_LIMITS));
+    const gpu = new Set(plans.map(p => p.deviceBytes));
+    assert.equal(gpu.size, 1, `${cfg.name}: deviceCommit identical across variants`);
+    assert.equal(plans[0].deviceBytes, estimateTransformerBlockMemory(cfg).deviceCommitBytes);
+    const staging = new Set(plans.map(p => p.stagingPeakBytes));
+    assert.equal(staging.size, 1, `${cfg.name}: staging peak identical (largest single upload)`);
+    const waits = new Set(plans.map(p => p.asyncWaits));
+    assert.equal(waits.size, 1, `${cfg.name}: async GPU-completion await count identical`);
+    assert.equal(plans[1].asyncWaits, MEASURE_AWAITS);
+    // Host peak: baseline holds ALL six weights + input; current/minimal hold
+    // ONE host array per upload (largest single weight). Strictly LOWER.
+    assert.ok(plans[0].hostPeakBytes > plans[1].hostPeakBytes, `${cfg.name}: baseline host peak ${plans[0].hostPeakBytes} > current ${plans[1].hostPeakBytes}`);
+    assert.equal(plans[1].hostPeakBytes, plans[2].hostPeakBytes, `${cfg.name}: current == minimal host peak`);
+  }
+});
+
+test('AB2 (V3.1.3): supervision-op lattice — minimal ⊂ current, baseline has NO guard/tracker/milestone/checkpoint', () => {
+  const kinds = (p: ABBlockPlan) => new Set(p.ops.map(o => o.kind));
+  // PROGRESS existed in baseline too (per-config onProgress pre-dates the guard).
+  // The guard commits added GUARD_OP/MILESTONE/CHECKPOINT/RUN_ACCUM only.
+  const guardAdded = ['GUARD_OP', 'MILESTONE', 'CHECKPOINT', 'RUN_ACCUM'];
+  for (const cfg of [CFG_05, CFG_1]) {
+    const b = kinds(planTransformerBlock('baseline', cfg, IPHONE_LIMITS));
+    const m = kinds(planTransformerBlock('current-minimal', cfg, IPHONE_LIMITS));
+    const c = kinds(planTransformerBlock('current', cfg, IPHONE_LIMITS));
+    assert.equal(b.has('PROGRESS'), true, 'baseline emitted per-config progress too');
+    for (const k of guardAdded) {
+      assert.equal(b.has(k), false, `baseline has no ${k}`);
+    }
+    assert.equal(m.has('GUARD_OP'), true, 'minimal keeps the pure guard');
+    assert.equal(m.has('MILESTONE'), false, 'minimal has no milestones');
+    assert.equal(m.has('CHECKPOINT'), false, 'minimal has no per-block checkpoint');
+    assert.equal(m.has('PROGRESS'), false, 'minimal has no DOM/UI progress');
+    assert.equal(m.has('RUN_ACCUM'), false, 'minimal has no run-progressive accumulator');
+    for (const k of ['MILESTONE', 'CHECKPOINT', 'GUARD_OP', 'ENTER', 'GUARD_START', 'RUN_ACCUM', 'PROGRESS']) {
+      assert.equal(c.has(k), true, `current has ${k}`);
+    }
+  }
+});
+
+test('AB3 (V3.1.3): destroy() is the LAST op of every allowed block — checkpoint/milestone NEVER after destroy', () => {
+  for (const cfg of [CFG_05, CFG_1]) {
+    for (const v of AB_VARIANTS) {
+      const p = planTransformerBlock(v, cfg, IPHONE_LIMITS);
+      assert.equal(p.allowed, true);
+      const last = p.ops[p.ops.length - 1];
+      assert.equal(last.kind, 'DESTROY', `${v} ${cfg.name}: destroy last`);
+      assert.equal(p.destroyCount, 25, `${v} ${cfg.name}: 25 GPUBuffer destroy calls`);
+      const destroyIdx = p.ops.length - 1;
+      for (let i = 0; i < p.ops.length; i++) {
+        const o = p.ops[i];
+        if (o.async) assert.ok(i < destroyIdx, `${v} ${cfg.name}: async op ${o.kind} precedes destroy`);
+      }
+    }
+  }
+  // Blocked path: current emits NO GPU ops and current-minimal emits none either.
+  const c15 = planTransformerBlock('current', CFG_15, IPHONE_LIMITS, 68_264_968);
+  assert.equal(c15.allowed, false, '1.5B blocked by run-progressive cumulative cap');
+  assert.equal(c15.ops.some(o => o.kind === 'DESTROY'), false, 'blocked plan performs zero GPU allocation/destroy');
+  const m15 = planTransformerBlock('current-minimal', CFG_15, IPHONE_LIMITS, 68_264_968);
+  assert.equal(m15.allowed, false);
+  assert.equal(m15.ops.filter(o => o.kind === 'PROGRESS' || o.kind === 'MILESTONE' || o.kind === 'CHECKPOINT').length, 0);
+  const b15 = planTransformerBlock('baseline', CFG_15, IPHONE_LIMITS);
+  assert.equal(b15.allowed, true, 'pre-guard baseline cannot block 1.5B');
+  const b3 = planTransformerBlock('current', BLOCK_3B, IPHONE_LIMITS);
+  assert.equal(b3.allowed, false, '3B blocked by single-config budget');
+  const g7 = planTransformerBlock('current', BLOCK_7B, IPHONE_LIMITS);
+  assert.equal(g7.allowed, false, '7B blocked by single-config budget');
 });
 
 test('CS T2 (V3.1.3): transformer forensic milestones persist and clear (finding #3 evidence store)', () => {
