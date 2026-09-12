@@ -25,6 +25,11 @@
 // import cycles; it only reads structural types from results-v3.ts and works
 // with a plain Record for partial results.
 
+// Observer-only forensic mirror: every crash-safety write is duplicated into a
+// durable `aether_v313_forensic_runs` archive (see forensic-history.ts). The
+// import direction is one-way (forensic-history never imports this module).
+import * as Forensic from './forensic-history.ts';
+
 // ─── Interruption classification (A–J) ────────────────────────────────────
 
 export type InterruptionKind =
@@ -418,6 +423,21 @@ export function beginBenchmark(runtime: 'V3' | 'V3.1', mode: 'quick' | 'full', o
   _deviceHealth = { lost: false };
   releaseTrackedBuffers();
   persistCheckpoint();
+  ForensciMirrorBegin();
+}
+
+/** Forensic archive mirror — one begin per run. Never throws. */
+function ForensciMirrorBegin(): void {
+  try {
+    if (!_activeCheckpoint) return;
+    Forensic.beginForensicRun({
+      runtime: _activeCheckpoint.runtime,
+      buildId: _activeCheckpoint.buildId,
+      phase: 'RUNNING',
+    });
+  } catch {
+    // forensic mirror is best-effort only
+  }
 }
 
 export function getCheckpoint(): Checkpoint | null {
@@ -440,6 +460,31 @@ export function checkpointCategory(category: string, data: unknown): void {
   }
   _activeCheckpoint.lastHeartbeat = new Date().toISOString();
   persistCheckpoint();
+  ForensicCategoryMirror();
+}
+
+/** Forensic archive mirror — category-level progress (compact partial summary). */
+function ForensicCategoryMirror(): void {
+  try {
+    if (!_activeCheckpoint) return;
+    const partial: Record<string, { count: number }> = {};
+    for (const key of Object.keys(_activeCheckpoint.partialResults)) {
+      const val = _activeCheckpoint.partialResults[key];
+      partial[key] = { count: Array.isArray(val) ? val.length : 1 };
+    }
+    Forensic.updateForensicRun({
+      status: 'RUNNING',
+      completedCategories: _activeCheckpoint.completedCategories.slice(),
+      currentPhase: _activeCheckpoint.currentPhase,
+      currentCategory: _activeCheckpoint.currentCategory,
+      lastHeartbeat: _activeCheckpoint.lastHeartbeat,
+      deviceHealth: getDeviceHealth(),
+      partialResults: partial,
+      partialResultKeys: Object.keys(partial),
+    });
+  } catch {
+    // forensic mirror is best-effort only
+  }
 }
 
 export interface HeartbeatState {
@@ -487,6 +532,16 @@ export function recordMilestone(state: string): void {
   } catch {
     // ignore — diagnostics are best-effort
   }
+  ForensicMilestoneMirror(state);
+}
+
+/** Forensic archive mirror — one milestone write per run. Never throws. */
+function ForensicMilestoneMirror(state: string): void {
+  try {
+    Forensic.appendForensicMilestone(state);
+  } catch {
+    // forensic mirror is best-effort only
+  }
 }
 
 /** Read back the milestone log (ordered oldest → newest). */
@@ -521,6 +576,11 @@ export function completeBenchmark(): void {
   _activeCheckpoint.certificationStatus = null;
   _activeCheckpoint.lastHeartbeat = new Date().toISOString();
   persistCheckpoint();
+  try {
+    Forensic.finalizeForensicRun({ status: 'COMPLETED', deviceHealth: getDeviceHealth() });
+  } catch {
+    // forensic mirror is best-effort only
+  }
   releaseTrackedBuffers();
 }
 
@@ -537,6 +597,19 @@ export function finalizeInterrupted(kind: InterruptionKind, reason: string, erro
   };
   _activeCheckpoint.lastHeartbeat = new Date().toISOString();
   persistCheckpoint();
+  try {
+    const inter = _activeCheckpoint.interruption;
+    Forensic.finalizeForensicRun({
+      status: 'INTERRUPTED',
+      interruption: inter
+        ? { kind: inter.kind, reason: inter.reason, error: inter.error, stack: inter.stack, at: inter.at }
+        : undefined,
+      error: error,
+      deviceHealth: getDeviceHealth(),
+    });
+  } catch {
+    // forensic mirror is best-effort only
+  }
   releaseTrackedBuffers();
 }
 
@@ -679,6 +752,7 @@ export function resetForTests(preserveStorage = false): void {
   _activeCheckpoint = null;
   _buffers.clear();
   stopHeartbeatTicker();
+  Forensic.resetForensicActive();
   if (!preserveStorage) {
     clearCheckpointStorage();
     clearMilestones();

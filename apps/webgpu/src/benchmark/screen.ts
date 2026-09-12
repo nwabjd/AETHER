@@ -1579,9 +1579,14 @@ function renderCrashSafetyBanner() {
         <button class="btn" id="btn-resume-run">RESUME INTERRUPTED RUN</button>
         <button class="btn btn-outline" id="btn-new-run">START NEW RUN</button>
         <button class="btn btn-outline" id="btn-clear-run">CLEAR (DISCARD)</button>
+        <button class="btn btn-outline" id="btn-forensics">VIEW FORENSICS</button>
       </div>
     </div>
   `;
+  box.querySelector('#btn-forensics')?.addEventListener('click', () => {
+    // Navigate to the read-only #forensics route; main.ts mounts the viewer.
+    window.location.hash = '#forensics';
+  });
   box.querySelector('#btn-resume-run')?.addEventListener('click', () => {
     renderCrashSafetyBanner();
     runPerfV31(cp.mode, 'resume');

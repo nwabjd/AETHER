@@ -10,6 +10,7 @@ import * as TensorBench from './screens/tensor-bench';
 import * as WebGPUDiag from './screens/webgpu-diagnostics';
 import * as GPUBench from './benchmark/screen';
 import * as Forensics from './screens/forensics';
+import { recoverOrphanedForensicRuns } from './benchmark/forensic-history';
 import { purgeLegacyServiceWorkers, resetAetherCache } from './sw-purge';
 
 const screens = [
@@ -74,9 +75,26 @@ function init() {
 
   // Handle hash changes
   window.addEventListener('hashchange', () => {
+    if (window.location.hash === '#forensics') {
+      mountForensics();
+      return;
+    }
     const id = getScreenIdFromHash();
     if (id !== currentScreen) navigateTo(id);
   });
+}
+
+/** In-session mount of the forensic viewer (no benchmark UI / GPU init). */
+function mountForensics() {
+  const app = document.getElementById('app')!;
+  try {
+    recoverOrphanedForensicRuns();
+  } catch {
+    // recovery must never break navigation
+  }
+  Forensics.render(app);
+  // Sentinel: any later hash change leaves the viewer via navigateTo.
+  currentScreen = '__forensics__';
 }
 
 function renderResetComplete() {
@@ -121,6 +139,15 @@ async function boot() {
 
   // One-time cleanup BEFORE any UI initializes (purge stale service workers).
   await purgeLegacyServiceWorkers();
+
+  // Forensics: durable archive boot check — any RUNNING run left behind by a
+  // terminated/reloaded page is recovered into the history (never touches the
+  // benchmark or the legacy checkpoint/milestone keys).
+  try {
+    recoverOrphanedForensicRuns();
+  } catch {
+    // recovery must never break boot
+  }
 
   init();
 }
