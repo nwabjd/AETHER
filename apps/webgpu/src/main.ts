@@ -9,6 +9,7 @@ import * as Diagnostics from './screens/diagnostics';
 import * as TensorBench from './screens/tensor-bench';
 import * as WebGPUDiag from './screens/webgpu-diagnostics';
 import * as GPUBench from './benchmark/screen';
+import * as Forensics from './screens/forensics';
 import { purgeLegacyServiceWorkers, resetAetherCache } from './sw-purge';
 
 const screens = [
@@ -99,6 +100,22 @@ async function boot() {
   if (window.location.hash === '#reset') {
     await resetAetherCache();
     renderResetComplete();
+    return;
+  }
+
+  // Special read-only forensic route: renders ONLY a localStorage evidence
+  // viewer. Runs before init()/purge so no benchmark UI, GPU init, service
+  // worker purge, or cache touching ever executes. localStorage is read only.
+  if (window.location.hash === '#forensics') {
+    const app = document.getElementById('app')!;
+    Forensics.render(app);
+    const leaveForensics = () => {
+      if (window.location.hash !== '#forensics') {
+        window.removeEventListener('hashchange', leaveForensics);
+        init();
+      }
+    };
+    window.addEventListener('hashchange', leaveForensics);
     return;
   }
 
