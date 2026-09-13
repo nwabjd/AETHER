@@ -74,6 +74,25 @@ nav button.active {
   -webkit-overflow-scrolling: touch;
 }
 
+/* ── Forensic History: shell-level scroll container ───────────────────────
+   The forensic viewer is mounted directly into the height-locked #app shell
+   (html,body have overflow:hidden). It therefore needs its own flex scroll
+   region, matching the .screen mechanics used by every normal view, while
+   keeping the viewer's existing inner padding (no extra .screen padding so
+   the visual spacing stays identical). Focusable (-1) so Page Down/Up scroll
+   the forensic content immediately. */
+.forensic-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  -webkit-overflow-scrolling: touch;
+}
+
+.forensic-scroll:focus {
+  outline: none;
+}
+
 .screen h2 {
   font-size: 20px;
   font-weight: 600;

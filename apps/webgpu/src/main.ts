@@ -84,15 +84,32 @@ function init() {
   });
 }
 
+/** Mount host for the forensic viewer: a shell-level flex scroll region. The
+ *  viewer mounts directly into #app, so it gets its own scroll container (the
+ *  same mechanics as .screen) instead of being clipped by the height-locked,
+ *  overflow-hidden app shell. Focused programmatically so Page Down/Up scroll
+ *  the forensic content immediately. */
+function mountForensicsHost(): HTMLElement {
+  const app = document.getElementById('app')!;
+  app.innerHTML = '<div class="forensic-scroll" id="forensic-scroll" tabindex="-1"></div>';
+  const host = document.getElementById('forensic-scroll')!;
+  try {
+    host.focus({ preventScroll: true });
+  } catch {
+    // focus is a keyboard-scroll nicety; ignore failures
+  }
+  return host;
+}
+
 /** In-session mount of the forensic viewer (no benchmark UI / GPU init). */
 function mountForensics() {
-  const app = document.getElementById('app')!;
+  const host = mountForensicsHost();
   try {
     recoverOrphanedForensicRuns();
   } catch {
     // recovery must never break navigation
   }
-  Forensics.render(app);
+  Forensics.render(host);
   // Sentinel: any later hash change leaves the viewer via navigateTo.
   currentScreen = '__forensics__';
 }
@@ -125,8 +142,8 @@ async function boot() {
   // viewer. Runs before init()/purge so no benchmark UI, GPU init, service
   // worker purge, or cache touching ever executes. localStorage is read only.
   if (window.location.hash === '#forensics') {
-    const app = document.getElementById('app')!;
-    Forensics.render(app);
+    const host = mountForensicsHost();
+    Forensics.render(host);
     const leaveForensics = () => {
       if (window.location.hash !== '#forensics') {
         window.removeEventListener('hashchange', leaveForensics);
