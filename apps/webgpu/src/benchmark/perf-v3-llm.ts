@@ -479,6 +479,12 @@ export async function benchSyntheticTransformerBlock(onProgress?: (msg: string) 
       onProgress?.(`transformer block ${cfg.name} BLOCKED: ${guard.reason}`);
       out.push(buildBlockedTransformerBlock(cfg, guard.reason!));
       checkpointCategory('transformerBlocks', out.slice());
+      // Explicit guard-block milestone (additive, alongside the pre-existing
+      // CHECKPOINTED below): a stale RUNNING archive can now name the
+      // guard-blocked configs directly from the forensic milestone mirror and
+      // reclassify the run as a controlled resource-limit abort instead of a
+      // generic page reload. Synchronous + best-effort, like every milestone.
+      recordMilestone(`${cfg.name} GUARD_BLOCK CHECKPOINTED`);
       recordMilestone(`${cfg.name} CHECKPOINTED`);
       continue;
     }

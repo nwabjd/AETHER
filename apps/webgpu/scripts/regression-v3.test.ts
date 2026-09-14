@@ -674,6 +674,7 @@ import {
   INTERRUPTION_KINDS,
 } from '../src/benchmark/crash-safety.ts';
 import { finalizeCertificationWithInterruption } from '../src/benchmark/v3113.ts';
+import { classifyPersistedInterruption, guardAbortedNamesFromMilestoneStates } from '../src/benchmark/interruption-classifier.ts';
 import type { V3Result, LLMGateResult, LLMReadiness } from '../src/benchmark/results-v3.ts';
 
 function memStorage(): { getItem(k: string): string | null; setItem(k: string, v: string): void; removeItem(k: string): void } {
@@ -2150,4 +2151,35 @@ test('SG: computeParamCount kept verbatim — 7B slot pins exact pre-refactor va
     'param math must be byte-for-byte identical to the pre-refactor bench formula');
   assert.equal(p.fp16, p.int8 * 2);
   assert.equal(Math.ceil(p.int8 / 2), p.int4);
+});
+
+test('CS U1 (V3.1.3): banner and archive classifiers agree on identical guard-abort evidence (unified ladder)', () => {
+  resetForTests();
+  setStorageForTests(memStorage());
+  beginBenchmark('V3.1', 'full', undefined, 'testbuild');
+  checkpointCategory('transformerBlocks', [buildBlockedTransformerBlock(BLOCK_7B, GUARD_7B_REASON)]);
+  const live = classifyInterruption();
+  assert.equal(live.kind, 'TRANSFORMER_SUITE_RESOURCE_LIMIT');
+  // A stale archive record carrying the SAME evidence (RUNNING + guard-aborted
+  // 7B) must reach the identical decision via the shared classifier.
+  const archived = classifyPersistedInterruption({
+    status: 'RUNNING',
+    interruption: null,
+    deviceHealth: { lost: false },
+    guardAbortedBlockNames: ['7B'],
+    at: new Date().toISOString(),
+  });
+  assert.equal(archived.kind, live.kind);
+  assert.equal(archived.reason, live.reason);
+  assert.equal(live.reason.includes('NOT a JavaScript exception'), true);
+});
+
+test('CS U2 (V3.1.3): the explicit GUARD_BLOCK CHECKPOINTED milestone form is the exact additive sequence the guarded path emits', () => {
+  // The guarded path in perf-v3-llm.ts emits, per blocked config in order:
+  //   `${name} GUARD_BLOCK` → `${name} GUARD_BLOCK CHECKPOINTED` → `${name} CHECKPOINTED`
+  // and the archive recovers ONE de-duplicated block name from both forms.
+  const sequence = ['7B ENTER', '7B GUARD_START', '7B GUARD_BLOCK', '7B GUARD_BLOCK CHECKPOINTED', '7B CHECKPOINTED'];
+  assert.deepEqual(guardAbortedNamesFromMilestoneStates(sequence), ['7B']);
+  const legacy = ['7B GUARD_START', '7B GUARD_BLOCK', '7B CHECKPOINTED'];
+  assert.deepEqual(guardAbortedNamesFromMilestoneStates(legacy), ['7B'], 'legacy archives carry the bare GUARD_BLOCK form');
 });

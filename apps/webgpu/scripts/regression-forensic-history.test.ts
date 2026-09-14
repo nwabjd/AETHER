@@ -22,6 +22,11 @@ import {
   FORENSIC_RUNS_KEY, MAX_ARCHIVE_BYTES,
   type ForensicRunRecord,
 } from '../src/benchmark/forensic-history.ts';
+import {
+  classifyPersistedInterruption,
+  guardAbortedNamesFromMilestoneStates,
+  GUARD_BLOCK_MILESTONE_RE,
+} from '../src/benchmark/interruption-classifier.ts';
 
 type TStorage = {
   getItem(k: string): string | null;
@@ -407,4 +412,118 @@ test('FH T22: getForensicStorageStatus counts active/incomplete/completed correc
   assert.equal(st.maxRuns, 16);
   assert.equal(st.maxMilestonesPerRun, 256);
   assert.ok(st.archiveBytes > 0);
+});
+
+// ─── Classification unification (guard-block milestone evidence) ─────────
+
+test('FH T23: stale RUNNING with guard-block milestone evidence recovers as TRANSFORMER_SUITE_RESOURCE_LIMIT (FULL gate)', () => {
+  resetForensicActive();
+  const store = memStorage();
+  setForensicStorageForTests(store);
+  const orphan = makeRecord('orphan-guard', {
+    status: 'RUNNING', sessionId: 'some-other-page', deviceHealth: { lost: false },
+    partialResults: { transformerBlocks: { count: 5 } },
+    milestones: [
+      { t: iso(), state: '0.5B ENTER' },
+      { t: iso(), state: '0.5B GUARD_PASS' },
+      { t: iso(), state: '0.5B CHECKPOINTED' },
+      { t: iso(), state: '1B ENTER' },
+      { t: iso(), state: '1B GUARD_PASS' },
+      { t: iso(), state: '1B CHECKPOINTED' },
+      { t: iso(), state: '7B GUARD_BLOCK' },
+      { t: iso(), state: '7B GUARD_BLOCK CHECKPOINTED' },
+      { t: iso(), state: '7B CHECKPOINTED' },
+    ],
+  });
+  store.setItem(FORENSIC_RUNS_KEY, JSON.stringify([orphan]));
+  assert.equal(recoverOrphanedForensicRuns(), 1);
+  const run = getLatestForensicRun()!;
+  assert.equal(run.status, 'INTERRUPTED');
+  assert.equal(run.interruption?.kind, 'TRANSFORMER_SUITE_RESOURCE_LIMIT');
+  assert.ok(run.interruption?.reason.includes('7B'));
+  assert.ok(run.interruption?.reason.includes('NOT a JavaScript exception'));
+  assert.ok(run.recoveredAt);
+});
+
+test('FH T24: legacy archive (old 7B GUARD_BLOCK form only) still classifies as TRANSFORMER_SUITE_RESOURCE_LIMIT', () => {
+  resetForensicActive();
+  const store = memStorage();
+  setForensicStorageForTests(store);
+  const orphan = makeRecord('orphan-legacy', {
+    status: 'RUNNING', sessionId: 'some-other-page', deviceHealth: { lost: false },
+    partialResults: { transformerBlocks: { count: 5 } },
+    milestones: [{ t: iso(), state: '7B GUARD_BLOCK' }, { t: iso(), state: '7B CHECKPOINTED' }],
+  });
+  store.setItem(FORENSIC_RUNS_KEY, JSON.stringify([orphan]));
+  assert.equal(recoverOrphanedForensicRuns(), 1);
+  const run = getLatestForensicRun()!;
+  assert.equal(run.interruption?.kind, 'TRANSFORMER_SUITE_RESOURCE_LIMIT');
+  assert.ok(run.interruption?.reason.includes('7B'));
+});
+
+test('FH T25: QUICK-class evidence (transformerBlocks count < 3) never fabricates a guard abort', () => {
+  resetForensicActive();
+  const store = memStorage();
+  setForensicStorageForTests(store);
+  const orphan = makeRecord('orphan-quick', {
+    status: 'RUNNING', sessionId: 'some-other-page', deviceHealth: { lost: false },
+    partialResults: { transformerBlocks: { count: 2 } },
+    // Even a stray guard-block milestone cannot override the count gate.
+    milestones: [
+      { t: iso(), state: '0.5B GUARD_PASS' },
+      { t: iso(), state: '1B GUARD_PASS' },
+      { t: iso(), state: '7B GUARD_BLOCK' },
+      { t: iso(), state: '7B GUARD_BLOCK CHECKPOINTED' },
+      { t: iso(), state: '7B CHECKPOINTED' },
+    ],
+  });
+  store.setItem(FORENSIC_RUNS_KEY, JSON.stringify([orphan]));
+  assert.equal(recoverOrphanedForensicRuns(), 1);
+  const run = getLatestForensicRun()!;
+  assert.equal(run.interruption?.kind, 'PAGE_TERMINATED_OR_BROWSER_RELOADED');
+});
+
+test('FH T26: guard-abort name extraction matches both milestone forms, de-duplicates, ignores non-block states', () => {
+  assert.deepEqual(
+    guardAbortedNamesFromMilestoneStates(['1.5B GUARD_BLOCK', '3B GUARD_BLOCK CHECKPOINTED', '7B GUARD_BLOCK', '7B GUARD_BLOCK CHECKPOINTED']),
+    ['1.5B', '3B', '7B'],
+    'both GUARD_BLOCK forms count; 7B de-duplicated; order preserved'
+  );
+  assert.deepEqual(
+    guardAbortedNamesFromMilestoneStates(['0.5B ENTER', '0.5B GUARD_PASS', '0.5B CHECKPOINTED', '7B MEASURE_DONE']),
+    [],
+    'GUARD_PASS / CHECKPOINTED / MEASURE_DONE states never match'
+  );
+  assert.equal(GUARD_BLOCK_MILESTONE_RE.test('7B GUARD_BLOCK'), true);
+  assert.equal(GUARD_BLOCK_MILESTONE_RE.test('7B GUARD_BLOCK CHECKPOINTED'), true);
+  assert.equal(GUARD_BLOCK_MILESTONE_RE.test('7B CHECKPOINTED'), false);
+  assert.equal(GUARD_BLOCK_MILESTONE_RE.test('7B GUARD_PASS'), false);
+});
+
+test('FH T27: shared classifier ladder — persisted interruption wins, device loss beats guard names, RUNNING alone = PAGE_TERMINATED', () => {
+  const verbatim = classifyPersistedInterruption({
+    status: 'RUNNING',
+    interruption: { kind: 'JAVASCRIPT_EXCEPTION', reason: 'boom', error: null, stack: null, at: 't0' },
+    deviceHealth: { lost: true },
+    guardAbortedBlockNames: ['7B'],
+  });
+  assert.equal(verbatim.kind, 'JAVASCRIPT_EXCEPTION');
+  assert.equal(verbatim.reason, 'boom');
+  assert.equal(verbatim.at, 't0');
+
+  const devLost = classifyPersistedInterruption({
+    status: 'RUNNING', deviceHealth: { lost: true, reason: 'destroyed', message: 'mid-run' }, guardAbortedBlockNames: ['7B'],
+  });
+  assert.equal(devLost.kind, 'WEBGPU_DEVICE_LOST');
+  assert.ok(devLost.reason.includes('GPU device lost'));
+
+  const guard = classifyPersistedInterruption({ status: 'RUNNING', guardAbortedBlockNames: ['7B'] });
+  assert.equal(guard.kind, 'TRANSFORMER_SUITE_RESOURCE_LIMIT');
+  assert.ok(guard.reason.includes('7B'));
+
+  const reload = classifyPersistedInterruption({ status: 'RUNNING' });
+  assert.equal(reload.kind, 'PAGE_TERMINATED_OR_BROWSER_RELOADED');
+
+  const unknown = classifyPersistedInterruption({});
+  assert.equal(unknown.kind, 'UNKNOWN');
 });

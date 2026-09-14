@@ -30,6 +30,12 @@
 // import direction is one-way (forensic-history never imports this module).
 import * as Forensic from './forensic-history.ts';
 
+// Shared, pure decision ladder for "how did the previous run end" — used by the
+// resume banner (here), the archive orphan-recovery path (forensic-history.ts),
+// and the #forensics viewer so every surface classifies identical evidence
+// identically. The classifier imports nothing from this module.
+import { classifyPersistedInterruption } from './interruption-classifier.ts';
+
 // ─── Interruption classification (A–J) ────────────────────────────────────
 
 export type InterruptionKind =
@@ -664,57 +670,28 @@ function checkpointGuardAborted(checkpoint: Checkpoint | null): GuardAbortedBloc
  * run ended using the strongest evidence available. If only a RUNNING
  * checkpoint survives with no JS error and no device-loss record, classify
  * `PAGE_TERMINATED_OR_BROWSER_RELOADED` — NOT a fabricated JS exception.
+ *
+ * The decision ladder is delegated to the shared, pure classifier so the
+ * banner and the forensic archive recover identical evidence identically.
  */
 export function classifyInterruption(cp: Checkpoint | null = null): InterruptionInfo {
   const checkpoint = cp ?? loadCheckpoint();
-  if (checkpoint?.interruption) {
-    return checkpoint.interruption;
-  }
   const err = getRuntimeError();
-  if (_deviceHealth.lost) {
-    return {
-      kind: 'WEBGPU_DEVICE_LOST',
-      reason: _deviceHealth.reason ?? 'device lost',
-      error: _deviceHealth.message ?? null,
-      stack: null,
-      at: new Date().toISOString(),
-    };
-  }
-  // DISTINCT controlled-abort classification: the run reached the 7B block,
-  // the guard rejected it before allocation (resourceLimit recorded in the
-  // checkpointed transformerBlocks), and the page later died or was reloaded
-  // before a JavaScript handler could finalize. This is NOT a JS/driver crash.
   const guardAborted = checkpointGuardAborted(checkpoint);
-  if (guardAborted) {
-    return {
-      kind: 'TRANSFORMER_SUITE_RESOURCE_LIMIT',
-      reason: `Safe transformer memory guard aborted required block(s) ${guardAborted.names.join(', ')} BEFORE allocation (resourceLimit) — a controlled resource-limit abort, NOT a JavaScript exception, device loss, or random page reload. The page then terminated/reloaded before the run could finalize.`,
-      error: err ? err.error : null,
-      stack: err?.stack ?? null,
-      at: new Date().toISOString(),
-    };
-  }
-  if (checkpoint && checkpoint.status === 'RUNNING') {
-    // No JS handler survived long enough to write INTERRUPTED.
-    return {
-      kind: 'PAGE_TERMINATED_OR_BROWSER_RELOADED',
-      reason: 'The page was terminated or reloaded during the benchmark with no surviving JavaScript handler. No checkpoint was finalized — data above is the last consistent state.',
-      error: err ? err.error : null,
-      stack: err?.stack ?? null,
-      at: new Date().toISOString(),
-    };
-  }
-  if (err) {
-    const msg = `${err.error} ${err.stack ?? ''}`.toLowerCase();
-    if (msg.includes('validation')) {
-      return { kind: 'GPU_VALIDATION_ERROR', reason: err.error, error: err.error, stack: err.stack, at: err.timestamp };
-    }
-    if (msg.includes('limit') && (msg.includes('alloc') || msg.includes('buffer') || msg.includes('memory'))) {
-      return { kind: 'RESOURCE_LIMIT', reason: err.error, error: err.error, stack: err.stack, at: err.timestamp };
-    }
-    return { kind: 'JAVASCRIPT_EXCEPTION', reason: err.error, error: err.error, stack: err.stack, at: err.timestamp };
-  }
-  return { kind: 'UNKNOWN', reason: 'No crash evidence recorded.', error: null, stack: null, at: new Date().toISOString() };
+  const classified = classifyPersistedInterruption({
+    status: checkpoint?.status ?? null,
+    interruption: checkpoint?.interruption ?? null,
+    deviceHealth: _deviceHealth,
+    guardAbortedBlockNames: guardAborted?.names ?? [],
+    runtimeError: err ? { error: err.error, stack: err.stack, timestamp: err.timestamp } : null,
+  });
+  return {
+    kind: classified.kind as InterruptionKind,
+    reason: classified.reason,
+    error: classified.error,
+    stack: classified.stack,
+    at: classified.at,
+  };
 }
 
 function recordRuntimeErrorRecord(kind: InterruptionKind, error: string, where: string | null, stack: string | null): InterruptionInfo | null {

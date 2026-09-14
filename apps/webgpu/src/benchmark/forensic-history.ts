@@ -14,6 +14,11 @@
 
 export const FORENSIC_RUNS_KEY = 'aether_v313_forensic_runs';
 
+// Shared, pure interruption classifier (see interruption-classifier.ts). The
+// recovery path uses the exact same decision ladder as the resume banner so a
+// stale RUNNING record and the live checkpoint can never disagree.
+import { classifyPersistedInterruption, guardAbortedNamesFromMilestoneStates } from './interruption-classifier.ts';
+
 export const FORENSIC_RUNTIME_ID = 'AETHER_V3_1_3_RUNTIME';
 export const FORENSIC_BENCHMARK_VERSION = 'V3.1.3';
 export const FORENSIC_RUNTIME_SCHEMA_VERSION = '3.1.3';
@@ -406,20 +411,37 @@ export function recoverOrphanedForensicRuns(): number {
   for (const r of arch.runs) {
     if (r.status !== 'RUNNING') continue;
     if (r.sessionId === _sessionId) continue;
-    let kind = 'PAGE_TERMINATED_OR_BROWSER_RELOADED';
-    let reason =
-      'Previous run was left RUNNING when the page terminated or reloaded; recovered by the forensic history layer on page load.';
-    if (r.deviceHealth?.lost) {
-      kind = 'WEBGPU_DEVICE_LOST';
-      reason = `GPU device lost recovered from persisted forensic device health: ${r.deviceHealth.reason ?? ''}${r.deviceHealth.message ? ` — ${r.deviceHealth.message}` : ''}`.trim();
+
+    // Guard-abort evidence is read from the forensic MILESTONE mirror — the
+    // archive only persists partialResults as `{count}`, never the blocked
+    // block records themselves. Corroboration gate: FULL runs checkpoint all
+    // five required blocks (count >= 3 implies blocked 1.5B/3B/7B entries were
+    // persisted beside the passing 0.5B/1B); QUICK runs stop at the two
+    // guard-passing blocks (count = 2). This keeps a resource-limit
+    // classification honest for FULL evidence and prevents QUICK false alarms.
+    let guardNames: string[] = [];
+    const blockCount = r.partialResults?.transformerBlocks?.count ?? 0;
+    if (blockCount >= 3) {
+      guardNames = guardAbortedNamesFromMilestoneStates(r.milestones.map((m) => m.state));
     }
+
+    // Same decision ladder as the resume banner (classifyInterruption): a
+    // persisted interruption wins, then device loss, then a controlled guard
+    // abort, then a stale RUNNING record, then a recorded error. A historical
+    // record that already carries an interruption keeps it verbatim.
+    const classified = classifyPersistedInterruption({
+      status: r.status,
+      interruption: r.interruption,
+      deviceHealth: r.deviceHealth,
+      guardAbortedBlockNames: guardNames,
+      runtimeError: r.error ? { error: r.error, stack: null } : null,
+      at: r.lastUpdatedAt,
+    });
     const recoveredAt = iso();
     const existing = r.interruption;
     const interruption: ForensicInterruption = existing
       ? { ...existing, recoveredAt }
-      : { kind, reason, error: null, stack: null, at: r.lastUpdatedAt, recoveredAt };
-    if (!existing) r.interruption = interruption;
-    else r.interruption = existing;
+      : { kind: classified.kind, reason: classified.reason, error: classified.error, stack: classified.stack, at: classified.at, recoveredAt };
     r.interruption = interruption;
     r.status = 'INTERRUPTED';
     r.recoveredAt = recoveredAt;
