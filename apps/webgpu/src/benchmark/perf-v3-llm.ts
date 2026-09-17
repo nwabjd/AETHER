@@ -702,6 +702,10 @@ export async function benchMemoryBudget(onProgress?: (msg: string) => void, subs
     let allocMs = 0, writeMs = 0;
     const fill = new Float32Array(256).fill(42.0);
 
+    // Forensic G2: durable rung-entry milestone — emitted BEFORE any GPU
+    // allocation/work for this rung so a mid-rung termination is pinning.
+    recordMilestone(`MEMORY_BUDGET ${targetMB}MB ENTER`);
+
     while (allocated < targetBytes) {
       const thisChunk = Math.min(chunkBytes, targetBytes - allocated);
       const t0 = performance.now();
@@ -739,6 +743,10 @@ export async function benchMemoryBudget(onProgress?: (msg: string) => void, subs
       numBuffers: bufs.length, allocMs, writeMs, failureReason,
     });
     for (const b of bufs) b.destroy();
+
+    // Forensic G2: durable rung-completion milestone — only after the rung
+    // succeeded AND its result-record + destroy cleanup have finished.
+    if (success) recordMilestone(`MEMORY_BUDGET ${targetMB}MB CHECKPOINTED`);
   }
   return out;
 }
